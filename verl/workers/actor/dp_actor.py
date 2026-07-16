@@ -21,7 +21,6 @@ import os
 from typing import Tuple
 
 import torch
-from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -41,6 +40,18 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _load_flash_attn_padding():
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ImportError as exc:
+        raise ImportError(
+            "flash-attn is required when use_remove_padding=True. "
+            "Install flash-attn or set actor.use_remove_padding=false."
+        ) from exc
+
+    return index_first_axis, pad_input, rearrange, unpad_input
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -49,6 +60,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
+        self._flash_attn_padding = _load_flash_attn_padding() if self.use_remove_padding else None
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
         self.compute_entropy_from_logits = (
@@ -79,6 +91,7 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
             if self.use_remove_padding:
+                index_first_axis, pad_input, rearrange, unpad_input = self._flash_attn_padding
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 

@@ -41,34 +41,100 @@ class HFRollout(BaseRollout):
         self.config = config
         self.module = module
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def generate_sequences(
+        self,
+        prompts: DataProto,
+        pad_to=None,
+        max_tokens=None,
+        n=None,
+        **kwargs,
+    ) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_minibatch(p) for p in batch_prompts]
+        if batch_size == 0:
+            raise ValueError("HF rollout requires at least one prompt")
+
+        micro_batch_size = int(self.config.get("micro_batch_size", batch_size))
+        if micro_batch_size <= 0:
+            raise ValueError(f"micro_batch_size must be positive, got {micro_batch_size}")
+
+        batch_prompts = [
+            prompts[start : start + micro_batch_size]
+            for start in range(0, batch_size, micro_batch_size)
+        ]
+        output = [
+            self._generate_minibatch(
+                minibatch,
+                pad_to=pad_to,
+                max_tokens=max_tokens,
+                n=n,
+                **kwargs,
+            )
+            for minibatch in batch_prompts
+        ]
         output = DataProto.concat(output)
         return output
 
     @torch.no_grad()
-    def _generate_minibatch(self, prompts: DataProto) -> DataProto:
-        # make sampling args can be overriden by inputs
-        do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
-        is_validate = prompts.meta_info.get("validate", False)
+    def _generate_minibatch(
+        self,
+        prompts: DataProto,
+        pad_to=None,
+        max_tokens=None,
+        n=None,
+        **generation_overrides,
+    ) -> DataProto:
+        generation_overrides = dict(generation_overrides)
 
-        temperature = prompts.meta_info.get("temperature", self.config.temperature)
-        response_length = prompts.meta_info.get("response_length", self.config.response_length)
-        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
+        def resolve(name, default):
+            if name in generation_overrides:
+                return generation_overrides.pop(name)
+            return prompts.meta_info.get(name, default)
+
+        do_sample = resolve("do_sample", self.config.get("do_sample", True))
+        is_validate = resolve("validate", False)
+
+        temperature = resolve("temperature", self.config.get("temperature", 1.0))
+        response_length = max_tokens
+        if response_length is None:
+            response_length = prompts.meta_info.get(
+                "max_tokens",
+                resolve("response_length", self.config.response_length),
+            )
+        response_length = int(response_length)
+        if response_length <= 0:
+            raise ValueError(f"max_tokens must be positive, got {response_length}")
+
+        target_response_length = pad_to
+        if target_response_length is None:
+            target_response_length = prompts.meta_info.get("pad_to", response_length)
+        target_response_length = int(target_response_length)
+        if target_response_length < response_length:
+            raise ValueError(
+                f"pad_to ({target_response_length}) must be greater than or equal to "
+                f"max_tokens ({response_length})"
+            )
+
+        num_return_sequences = n
+        if num_return_sequences is None:
+            num_return_sequences = prompts.meta_info.get("n", self.config.get("n", 1))
+        num_return_sequences = int(num_return_sequences)
+        if num_return_sequences <= 0:
+            raise ValueError(f"n must be positive, got {num_return_sequences}")
+
+        top_p = resolve("top_p", self.config.get("top_p", 1.0))
+        top_k = max(0, resolve("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
 
         if not do_sample:
             # do_sample==False -> greedy decoding
-            kwargs = {
+            generation_config_kwargs = {
                 "do_sample": False,
                 "num_beams": 1,
+                "num_return_sequences": 1,
             }
+            num_return_sequences = 1
         elif is_validate:
             # do validate and do sample -> use val_kwargs
-            kwargs = {
+            generation_config_kwargs = {
                 "do_sample": True,
                 "num_beams": 1,
                 "top_k": max(0, self.config.val_kwargs.top_k),  # to be compatible with vllm
@@ -76,19 +142,25 @@ class HFRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "num_return_sequences": 1,  # if validate, already repeat in ray_trainer
             }
+            num_return_sequences = 1
         else:
             # do_sample -> use rollout config
-            kwargs = {
+            generation_config_kwargs = {
                 "do_sample": True,
                 "num_beams": 1,
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                "num_return_sequences": self.config.n,
+                "num_return_sequences": num_return_sequences,
             }
 
+        # Keep the explicit rollout contract authoritative over HF aliases.
+        generation_overrides.pop("num_return_sequences", None)
+        generation_overrides.pop("max_new_tokens", None)
+        generation_config_kwargs.update(generation_overrides)
+
         # make config according to generate mode
-        generation_config = GenerationConfig(**kwargs)
+        generation_config = GenerationConfig(**generation_config_kwargs)
 
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         prompt_length = idx.size(1)
@@ -99,43 +171,73 @@ class HFRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
         pad_token_id = prompts.meta_info["pad_token_id"]
 
+        was_training = self.module.training
         self.module.eval()
         param_ctx = contextlib.nullcontext()
 
         if isinstance(self.module, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        with param_ctx, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output = self.module.generate(
-                input_ids=idx,
-                attention_mask=attention_mask,
-                do_sample=do_sample,
-                max_new_tokens=response_length,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                generation_config=generation_config,
-                output_scores=False,  # this is potentially very large
-                return_dict_in_generate=True,
-                use_cache=True,
-            )
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if idx.device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+        try:
+            with param_ctx, autocast_ctx:
+                output = self.module.generate(
+                    input_ids=idx,
+                    attention_mask=attention_mask,
+                    do_sample=do_sample,
+                    max_new_tokens=response_length,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                    generation_config=generation_config,
+                    output_scores=False,  # this is potentially very large
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
+        finally:
+            self.module.train(was_training)
 
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
+        expected_batch_size = idx.size(0) * num_return_sequences
+        if generated_batch_size != expected_batch_size:
+            raise RuntimeError(
+                "HF generate returned an unexpected batch size: "
+                f"expected {expected_batch_size}, got {generated_batch_size}"
+            )
+
+        generated_response_length = seq.shape[1] - prompt_length
+        if generated_response_length < 0 or generated_response_length > response_length:
+            raise RuntimeError(
+                "HF generate violated max_tokens: "
+                f"expected at most {response_length} response tokens, "
+                f"got {generated_response_length}"
+            )
 
         # huggingface generate will stop generating when all the batch reaches [EOS].
-        # We have to pad to response_length
-        sequence_length = prompt_length + self.config.response_length
+        # We have to pad to the call-level tensor contract.
+        sequence_length = prompt_length + target_response_length
         delta_length = sequence_length - seq.shape[1]
 
         if delta_length > 0:
-            delta_tokens = torch.ones(size=(generated_batch_size, delta_length), device=seq.device, dtype=seq.dtype)
-            delta_tokens = pad_token_id * delta_tokens
+            delta_tokens = torch.full(
+                size=(generated_batch_size, delta_length),
+                fill_value=pad_token_id,
+                device=seq.device,
+                dtype=seq.dtype,
+            )
             seq = torch.cat((seq, delta_tokens), dim=1)
-        assert seq.shape[1] == sequence_length
+        if seq.shape[1] != sequence_length:
+            raise RuntimeError(
+                "HF generate returned more tokens than the response tensor contract: "
+                f"expected sequence length {sequence_length}, got {seq.shape[1]}"
+            )
 
         # make necessary reputations if num_return_sequences > 1
-        num_return_sequences = kwargs.get("num_return_sequences", 1)
         if num_return_sequences > 1:
             position_ids = position_ids.repeat_interleave(num_return_sequences, dim=0)
             attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
@@ -151,7 +253,16 @@ class HFRollout(BaseRollout):
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
         response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        generated_token_mask = torch.arange(response_length, device=response.device) < generated_response_length
+        response_attention_mask = response_attention_mask * generated_token_mask.unsqueeze(0).to(attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        if not (seq.shape == attention_mask.shape == position_ids.shape):
+            raise RuntimeError(
+                "HF rollout tensors must have matching shapes, got "
+                f"input_ids={tuple(seq.shape)}, attention_mask={tuple(attention_mask.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
 
         batch = TensorDict(
             {
@@ -164,8 +275,9 @@ class HFRollout(BaseRollout):
             batch_size=generated_batch_size,
         )
 
-        # empty cache before compute old_log_prob
-        torch.cuda.empty_cache()
+        # Emptying the CUDA cache is useful before old-log-prob computation, but
+        # must not initialize or touch CUDA for CPU-only rollout tests.
+        if seq.device.type == "cuda":
+            torch.cuda.empty_cache()
 
-        self.module.train()
         return DataProto(batch=batch)
