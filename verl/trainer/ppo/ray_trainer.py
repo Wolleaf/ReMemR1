@@ -62,9 +62,33 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.reproducibility import (
+    ROLLOUT_GLOBAL_STEP_KEY,
+    make_rollout_coordinate_tensors,
+)
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
 WorkerType = Type[Worker]
+
+
+def _attach_recurrent_rollout_coordinates(
+    gen_batch: DataProto,
+    *,
+    global_step: int,
+    trajectories_per_sample: int,
+    sample_offset: int = 0,
+) -> int:
+    """Attach stable coordinates after the trainer's interleaved trajectory expansion."""
+
+    coordinates = make_rollout_coordinate_tensors(
+        len(gen_batch),
+        trajectories_per_sample,
+        sample_offset=sample_offset,
+    )
+    for key, value in coordinates.items():
+        gen_batch.batch[key] = value
+    gen_batch.meta_info[ROLLOUT_GLOBAL_STEP_KEY] = global_step
+    return len(gen_batch) // trajectories_per_sample
 
 
 class Role(Enum):
@@ -640,6 +664,7 @@ class RayPPOTrainer:
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        recurrent_sample_offset = 0
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -689,6 +714,16 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
+            if (
+                self.config.recurrent.enable
+                and self.config.actor_rollout_ref.rollout.get("seed") is not None
+            ):
+                recurrent_sample_offset += _attach_recurrent_rollout_coordinates(
+                    test_gen_batch,
+                    global_step=self.global_steps,
+                    trajectories_per_sample=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                    sample_offset=recurrent_sample_offset,
+                )
 
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
             ######
@@ -1121,6 +1156,12 @@ class RayPPOTrainer:
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                            if self.config.actor_rollout_ref.rollout.get("seed") is not None:
+                                _attach_recurrent_rollout_coordinates(
+                                    gen_batch,
+                                    global_step=self.global_steps,
+                                    trajectories_per_sample=self.config.actor_rollout_ref.rollout.n,
+                                )
 
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop_revisit(gen_batch, timing_raw)
 

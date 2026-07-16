@@ -29,6 +29,10 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
+from verl.utils.chat_template import (
+    apply_chat_template_without_native_thinking,
+    chat_template_token_length_without_native_thinking,
+)
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
@@ -123,7 +127,12 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                lambda doc: chat_template_token_length_without_native_thinking(
+                    tokenizer,
+                    doc[prompt_key],
+                    add_generation_prompt=True,
+                )
+                <= self.max_prompt_length,
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
@@ -172,7 +181,12 @@ class RLHFDataset(Dataset):
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
-            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = apply_chat_template_without_native_thinking(
+                self.processor,
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
             multi_modal_data = {}
 
             images = None
@@ -201,7 +215,12 @@ class RLHFDataset(Dataset):
             row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = apply_chat_template_without_native_thinking(
+                self.tokenizer,
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
@@ -242,12 +261,19 @@ class RLHFDataset(Dataset):
                 raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
             elif self.truncation == "right":
                 raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
-            elif self.truncation == "middle":
+            elif self.truncation == "center":
                 left_half = self.max_prompt_length // 2
                 right_half = self.max_prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
             elif self.truncation == "error":
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+
+        if self.processor is None:
+            valid_input_ids = input_ids[0][attention_mask[0].bool()].tolist()
+            if raw_prompt_ids != valid_input_ids:
+                raise RuntimeError(
+                    "raw_prompt_ids diverged from the tensor prompt after truncation"
+                )
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
         # encode prompts without chat template

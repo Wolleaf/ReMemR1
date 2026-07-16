@@ -272,7 +272,10 @@ Qwen3.5 checkpoint 是统一 conditional-generation checkpoint，语言主干混
 
 ### 4.2 Thinking 的两种含义
 
-所有 Qwen chat-template 调用显式设置 `enable_thinking=False`，避免 Qwen 原生思考模式改变 prompt 或输出协议。
+所有 Qwen chat-template 调用显式设置 `enable_thinking=False`，避免 Qwen 原生思考模式生成思考内容。
+固定 revision 的 0.8B/2B/4B tokenizer 实测都会在 assistant generation prompt 末尾保留
+`<think>\n\n</think>\n\n`。这是官方模板用于 non-thinking 模式的**空哨兵**，不是模型生成的
+thinking 内容；必须保留，不能为了追求字面上“没有 `<think>`”而从 token 序列中手工删除。
 
 但 ReMemR1 任务协议自身的输出标签 `<thinking>`、`<update>`、`<recall>`，
 以及 prompt 中的 `<memory>`/`<recalled_memory>` 包装仍按仓库语义保留。论文称其为
@@ -280,7 +283,8 @@ memory/callback，当前实现使用 update/recall；关闭的是 Qwen 原生 th
 
 需要做 snapshot test，覆盖 0.8B、2B、4B：
 
-- 无 Qwen 原生 thinking 前缀；
+- 每次调用都显式传入 `enable_thinking=False`；允许固定官方模板的空 `<think></think>` 哨兵，
+  但任何非空、未闭合或额外的原生 `<think>` payload 都失败；
 - 任务标签仍完整；
 - train、rollout、eval 使用完全相同的 template contract。
 

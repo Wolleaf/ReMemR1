@@ -18,6 +18,8 @@ The main entry point to run the PPO algorithm
 import logging
 import os
 import warnings
+import json
+import importlib.metadata
 from typing import Union
 
 import psutil
@@ -111,6 +113,7 @@ class ActorRolloutRefWorker(Worker):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self.model_build_metadata = {}
 
         self._is_offload_param = False
         self._is_offload_optimizer = False
@@ -159,14 +162,36 @@ class ActorRolloutRefWorker(Worker):
         enable_gradient_checkpointing=False,
         trust_remote_code=False,
         use_liger=False,
+        model_revision=None,
+        attention_implementation="sdpa",
+        lora_config=None,
+        model_init_seed=None,
         role="actor",
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
 
+        from verl.models.lora_contract import (
+            LORA_ALPHA,
+            LORA_BIAS,
+            LORA_DROPOUT,
+            LORA_R,
+            assert_injected_lora_targets,
+            assert_only_lora_parameters_trainable,
+            inject_lora_adapter,
+            resolve_lora_target_manifest,
+            trainable_optimizer_parameters,
+        )
+        from verl.models.qwen35 import (
+            QWEN35_CONDITIONAL_MODEL_TYPE,
+            QWEN35_TEXT_MODEL_TYPE,
+            inspect_qwen35_config,
+            load_qwen35_text_model,
+        )
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.reproducibility import seed_process
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -174,21 +199,51 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = copy_to_local(model_path)
 
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        if model_init_seed is not None:
+            seed_process(int(model_init_seed))
 
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.float32 if role == "actor" else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        lora_enabled = role == "actor" and bool(
+            lora_config is not None and lora_config.get("enabled", False)
+        )
+        if lora_enabled and torch_dtype != torch.float32:
+            raise ValueError(
+                "LoRA actor original/master parameters must remain FP32; "
+                f"got {torch_dtype}"
+            )
 
-        # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        config_load_kwargs = {"trust_remote_code": trust_remote_code}
+        if model_revision is not None:
+            config_load_kwargs["revision"] = model_revision
+        source_model_config = AutoConfig.from_pretrained(local_path, **config_load_kwargs)
+        is_qwen35 = getattr(source_model_config, "model_type", None) in {
+            QWEN35_CONDITIONAL_MODEL_TYPE,
+            QWEN35_TEXT_MODEL_TYPE,
+        }
+        if is_qwen35:
+            inspect_qwen35_config(source_model_config)
+        if is_qwen35 and role == "ref" and torch_dtype != torch.bfloat16:
+            raise ValueError(f"Qwen3.5 reference model must load in BF16, got {torch_dtype}")
 
-        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        if is_qwen35 and trust_remote_code:
+            raise ValueError("Qwen3.5 reproduction requires trust_remote_code=false")
+        tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
+        if model_revision is not None:
+            tokenizer_kwargs["revision"] = model_revision
+        self.tokenizer = hf_tokenizer(local_path, **tokenizer_kwargs)
+        # The reproduction is text-only; loading a unified vision processor can
+        # accidentally route text data through multimodal dataset code.
+        self.processor = None if is_qwen35 else hf_processor(local_path, **tokenizer_kwargs)
+
+        self.generation_config = get_generation_config(
+            local_path,
+            trust_remote_code=trust_remote_code,
+            revision=model_revision,
+        )
 
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
@@ -196,29 +251,62 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.tokenizer.pad_token_id,
         }
         override_config_kwargs.update(override_model_config)
-        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        update_model_config(source_model_config, override_config_kwargs=override_config_kwargs)
+        text_config = getattr(source_model_config, "text_config", None)
+        if text_config is not None:
+            update_model_config(text_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
-            print(f"Model config after override: {actor_model_config}")
+            print(f"Model config after override: {source_model_config}")
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
-        init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh)
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not source_model_config.tie_word_embeddings,
+            mesh=self.device_mesh,
+        )
+
+        build_metadata = {
+            "role": role,
+            "base_model": str(model_path),
+            "revision": model_revision,
+            "model_init_seed": model_init_seed,
+            "attention_implementation": attention_implementation,
+            "model_dtype": str(torch_dtype),
+            "qwen35_text_only": is_qwen35,
+            "torch_version": str(torch.__version__),
+        }
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                actor_module_class = AutoModelForVision2Seq
+            if is_qwen35:
+                qwen35_result = load_qwen35_text_model(
+                    local_path,
+                    revision=model_revision,
+                    attn_implementation=attention_implementation,
+                    dtype=torch_dtype,
+                    config=source_model_config,
+                )
+                actor_module = qwen35_result.model
+                build_metadata["qwen35_mapping"] = qwen35_result.metadata.to_dict()
             else:
-                actor_module_class = AutoModelForCausalLM
+                model_load_kwargs = {
+                    "pretrained_model_name_or_path": local_path,
+                    "dtype": torch_dtype,
+                    "config": source_model_config,
+                    "attn_implementation": attention_implementation,
+                    "trust_remote_code": trust_remote_code,
+                }
+                if model_revision is not None:
+                    model_load_kwargs["revision"] = model_revision
+                actor_module = AutoModelForCausalLM.from_pretrained(**model_load_kwargs)
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
-            )
+            actor_model_config = actor_module.config
 
             if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
+                if is_qwen35:
+                    raise ValueError(
+                        "Qwen3.5 reproduction does not support the Qwen2 remove-padding/"
+                        "Ulysses monkey patch; use_remove_padding=false and SP=1 are required"
+                    )
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
 
                 apply_monkey_patch(model=actor_module, ulysses_sp_size=self.ulysses_sequence_parallel_size)
@@ -228,6 +316,42 @@ class ActorRolloutRefWorker(Worker):
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
                 _apply_liger_kernel_to_instance(model=actor_module)
+
+            if lora_enabled:
+                configured_lora = {
+                    "rank": int(lora_config.get("rank", LORA_R)),
+                    "alpha": int(lora_config.get("alpha", LORA_ALPHA)),
+                    "dropout": float(lora_config.get("dropout", LORA_DROPOUT)),
+                    "bias": str(lora_config.get("bias", LORA_BIAS)),
+                }
+                expected_lora = {
+                    "rank": LORA_R,
+                    "alpha": LORA_ALPHA,
+                    "dropout": LORA_DROPOUT,
+                    "bias": LORA_BIAS,
+                }
+                if configured_lora != expected_lora:
+                    raise ValueError(
+                        f"LoRA config must match the reproduction contract: {expected_lora}, "
+                        f"got {configured_lora}"
+                    )
+                text_model_prefix = lora_config.get("text_model_prefix", "model")
+                if is_qwen35 and text_model_prefix != "model":
+                    raise ValueError(
+                        "Qwen3.5 text all-linear LoRA requires text_model_prefix='model'"
+                    )
+                target_manifest = resolve_lora_target_manifest(
+                    actor_module,
+                    text_model_prefix=text_model_prefix,
+                )
+                actor_module = inject_lora_adapter(actor_module, target_manifest)
+                assert_injected_lora_targets(actor_module, target_manifest)
+                trainable_manifest = assert_only_lora_parameters_trainable(actor_module)
+                build_metadata["lora_target_manifest"] = target_manifest.to_dict()
+                build_metadata["trainable_parameters"] = trainable_manifest.to_dict()
+                build_metadata["peft_version"] = importlib.metadata.version("peft")
+            else:
+                build_metadata["lora_target_manifest"] = None
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -254,7 +378,23 @@ class ActorRolloutRefWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", None))
+        if lora_enabled and param_dtype != torch.bfloat16:
+            raise ValueError(
+                "LoRA actor mixed-precision forward/backward must use BF16 param_dtype; "
+                f"got {param_dtype}"
+            )
+
+        root_only = bool(fsdp_config.get("root_only", False))
+        use_orig_params = bool(fsdp_config.get("use_orig_params", False))
+        if lora_enabled and not root_only:
+            raise ValueError("LoRA PPO requires root-only FSDP for the HF rollout contract")
+        if lora_enabled and not use_orig_params:
+            raise ValueError("LoRA PPO requires FSDP use_orig_params=true")
+
+        auto_wrap_policy = None if root_only else get_fsdp_wrap_policy(
+            module=actor_module,
+            config=fsdp_config.get("wrap_policy", None),
+        )
 
         if self._is_rollout and self.config.rollout.name == "hf":
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
@@ -265,15 +405,24 @@ class ActorRolloutRefWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        param_offload = bool(fsdp_config.get("param_offload", False))
+        cpu_offload = CPUOffload(offload_params=True) if param_offload else None
+        build_metadata["fsdp"] = {
+            "root_only": root_only,
+            "use_orig_params": use_orig_params,
+            "param_offload": param_offload,
+            "optimizer_offload": bool(fsdp_config.get("optimizer_offload", False)),
+            "param_dtype": str(param_dtype),
+            "reduce_dtype": str(reduce_dtype),
+            "buffer_dtype": str(buffer_dtype),
+        }
+        self.model_build_metadata[role] = build_metadata
+
         actor_module_fsdp = FSDP(
             actor_module,
             cpu_offload=cpu_offload,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -289,8 +438,12 @@ class ActorRolloutRefWorker(Worker):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
+            optimizer_parameters = trainable_optimizer_parameters(actor_module_fsdp)
+            build_metadata["optimizer_trainable_numel"] = sum(
+                parameter.numel() for parameter in optimizer_parameters
+            )
             actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
+                optimizer_parameters,
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
@@ -317,6 +470,9 @@ class ActorRolloutRefWorker(Worker):
             actor_optimizer = None
             actor_lr_scheduler = None
 
+        if self.rank == 0:
+            print("Model build metadata:\n" + json.dumps(build_metadata, indent=2, sort_keys=True))
+
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
     def _build_rollout(self, trust_remote_code=False):
@@ -329,6 +485,13 @@ class ActorRolloutRefWorker(Worker):
         rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
         rollout_name = self.config.rollout.name
         if rollout_name == "hf":
+            from verl.models.qwen35 import QWEN35_TEXT_MODEL_TYPE
+
+            if (
+                getattr(self.actor_model_config, "model_type", None) == QWEN35_TEXT_MODEL_TYPE
+                and int(self.config.rollout.get("micro_batch_size", 1)) != 1
+            ):
+                raise ValueError("Qwen3.5 recurrent HF rollout requires micro_batch_size=1")
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager.base import BaseShardingManager
 
@@ -442,6 +605,10 @@ class ActorRolloutRefWorker(Worker):
                 enable_gradient_checkpointing=self.config.model.get("enable_gradient_checkpointing", False),
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
+                model_revision=self.config.model.get("revision"),
+                attention_implementation=self.config.model.get("attn_implementation", "sdpa"),
+                lora_config=self.config.actor.get("lora") if self._is_actor else None,
+                model_init_seed=self.config.model.get("model_init_seed"),
                 role="actor",
             )
 
@@ -474,6 +641,10 @@ class ActorRolloutRefWorker(Worker):
                 use_remove_padding=use_remove_padding,
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
+                model_revision=self.config.model.get("revision"),
+                attention_implementation=self.config.model.get("attn_implementation", "sdpa"),
+                lora_config=None,
+                model_init_seed=self.config.model.get("model_init_seed"),
                 role="ref",
             )[0]
             OmegaConf.set_struct(self.config.ref, True)
@@ -510,7 +681,8 @@ class ActorRolloutRefWorker(Worker):
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            if estimated_flops > 0 and promised_flops not in (0, float("inf")):
+                metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
             metrics["perf/max_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
@@ -543,9 +715,11 @@ class ActorRolloutRefWorker(Worker):
 
         assert self._is_rollout
 
+        generation_eos = getattr(self.generation_config, "eos_token_id", None)
+        generation_pad = getattr(self.generation_config, "pad_token_id", None)
         meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
+            "eos_token_id": generation_eos if generation_eos is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": generation_pad if generation_pad is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
         with self.rollout_sharding_manager:

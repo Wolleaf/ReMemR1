@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import sys
 import types
@@ -61,6 +62,7 @@ class FakeModel(torch.nn.Module):
         self.adapter_enabled = True
         self.inside_summon = False
         self.emit_eos = True
+        self.sample_from_rng = False
 
     def generate(
         self,
@@ -70,6 +72,7 @@ class FakeModel(torch.nn.Module):
         eos_token_id,
         pad_token_id,
         generation_config,
+        do_sample,
         **kwargs,
     ):
         del attention_mask, pad_token_id, kwargs
@@ -88,12 +91,24 @@ class FakeModel(torch.nn.Module):
 
         prompts = input_ids.repeat_interleave(n, dim=0)
         generated_length = min(max_new_tokens, 2)
-        generated = torch.full(
-            (prompts.shape[0], generated_length),
-            5,
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
+        if self.sample_from_rng and do_sample:
+            generated_length = max_new_tokens
+            weights = torch.ones(
+                (prompts.shape[0] * generated_length, 997),
+                device=input_ids.device,
+            )
+            generated = torch.multinomial(weights, num_samples=1).reshape(
+                prompts.shape[0],
+                generated_length,
+            ) + 10
+            generated = generated.to(input_ids.dtype)
+        else:
+            generated = torch.full(
+                (prompts.shape[0], generated_length),
+                5,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
         if self.emit_eos:
             generated[:, -1] = eos_token_id
         return types.SimpleNamespace(sequences=torch.cat([prompts, generated], dim=1))
@@ -127,6 +142,18 @@ def hf_module(monkeypatch):
 
     torch_functional_module.get_response_mask = get_response_mask
 
+    reproducibility_name = "_hf_rollout_reproducibility_contract_test"
+    reproducibility_source = (
+        Path(__file__).parents[2] / "verl" / "utils" / "reproducibility.py"
+    )
+    reproducibility_spec = importlib.util.spec_from_file_location(
+        reproducibility_name,
+        reproducibility_source,
+    )
+    reproducibility_module = importlib.util.module_from_spec(reproducibility_spec)
+    monkeypatch.setitem(sys.modules, reproducibility_name, reproducibility_module)
+    reproducibility_spec.loader.exec_module(reproducibility_module)
+
     stubs = {
         "tensordict": tensordict_module,
         "transformers": transformers_module,
@@ -135,6 +162,7 @@ def hf_module(monkeypatch):
         "verl.workers.rollout": rollout_package,
         "verl.workers.rollout.base": base_module,
         "verl.utils": utils_package,
+        "verl.utils.reproducibility": reproducibility_module,
         "verl.utils.torch_functional": torch_functional_module,
     }
     for name, module in stubs.items():
@@ -179,6 +207,34 @@ def make_prompts(module, batch_size, prompt_length=3):
         batch=FakeTensorDict(tensors, batch_size=batch_size),
         meta_info={"eos_token_id": 9, "pad_token_id": 0},
     )
+
+
+def add_seed_coordinates(
+    module,
+    prompts,
+    *,
+    global_step=1,
+    sample_index=0,
+    trajectory_index=0,
+    turn_index=0,
+):
+    prompts.meta_info[module.ROLLOUT_GLOBAL_STEP_KEY] = global_step
+    prompts.batch[module.ROLLOUT_SAMPLE_INDEX_KEY] = torch.full(
+        (len(prompts.batch["input_ids"]),),
+        sample_index,
+        dtype=torch.long,
+    )
+    prompts.batch[module.ROLLOUT_TRAJECTORY_INDEX_KEY] = torch.full(
+        (len(prompts.batch["input_ids"]),),
+        trajectory_index,
+        dtype=torch.long,
+    )
+    prompts.batch[module.ROLLOUT_TURN_INDEX_KEY] = torch.full(
+        (len(prompts.batch["input_ids"]),),
+        turn_index,
+        dtype=torch.long,
+    )
+    return prompts
 
 
 def test_call_overrides_and_cpu_shapes(hf_module, monkeypatch):
@@ -310,3 +366,130 @@ def test_fsdp_summon_context_keeps_adapter_enabled(hf_module, monkeypatch):
     assert model.calls[0]["inside_summon"]
     assert model.calls[0]["adapter_enabled"]
     assert model.adapter_enabled
+
+
+def test_seeded_generate_uses_private_generator_and_matches_bc_token_hash(hf_module):
+    config = make_config(micro_batch_size=1, seed=2924589348)
+    model_b = FakeModel()
+    model_b.sample_from_rng = True
+    model_b.emit_eos = False
+    prompts_b = add_seed_coordinates(
+        hf_module,
+        make_prompts(hf_module, batch_size=1),
+        global_step=7,
+        sample_index=2,
+        trajectory_index=5,
+        turn_index=1,
+    )
+
+    torch.manual_seed(1234)
+    global_state = torch.random.get_rng_state().clone()
+    output_b = hf_module.HFRollout(model_b, config).generate_sequences(
+        prompts_b,
+        pad_to=16,
+        max_tokens=16,
+        n=1,
+    )
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+
+    model_c = FakeModel()
+    model_c.sample_from_rng = True
+    model_c.emit_eos = False
+    prompts_c = add_seed_coordinates(
+        hf_module,
+        make_prompts(hf_module, batch_size=1),
+        global_step=7,
+        sample_index=2,
+        trajectory_index=5,
+        turn_index=1,
+    )
+    torch.manual_seed(9999)
+    output_c = hf_module.HFRollout(model_c, config).generate_sequences(
+        prompts_c,
+        pad_to=16,
+        max_tokens=16,
+        n=1,
+    )
+
+    token_hash_b = hashlib.sha256(
+        output_b.batch["responses"].numpy().tobytes()
+    ).hexdigest()
+    token_hash_c = hashlib.sha256(
+        output_c.batch["responses"].numpy().tobytes()
+    ).hexdigest()
+    assert token_hash_b == token_hash_c
+
+
+def test_different_rollout_coordinates_use_different_rng_streams(hf_module):
+    config = make_config(micro_batch_size=1, seed=2924589348)
+
+    def generate_for(*, trajectory_index, turn_index):
+        model = FakeModel()
+        model.sample_from_rng = True
+        model.emit_eos = False
+        prompts = add_seed_coordinates(
+            hf_module,
+            make_prompts(hf_module, batch_size=1),
+            global_step=7,
+            sample_index=2,
+            trajectory_index=trajectory_index,
+            turn_index=turn_index,
+        )
+        return hf_module.HFRollout(model, config).generate_sequences(
+            prompts,
+            pad_to=16,
+            max_tokens=16,
+            n=1,
+        ).batch["responses"]
+
+    trajectory_tokens = generate_for(trajectory_index=6, turn_index=1)
+    next_turn_tokens = generate_for(trajectory_index=5, turn_index=2)
+    baseline_tokens = generate_for(trajectory_index=5, turn_index=1)
+
+    assert not torch.equal(trajectory_tokens, baseline_tokens)
+    assert not torch.equal(next_turn_tokens, baseline_tokens)
+    assert hf_module.derive_rollout_generation_seed(
+        config.seed, 7, 2, 6, 1
+    ) != hf_module.derive_rollout_generation_seed(config.seed, 7, 2, 5, 1)
+
+
+def test_seed_contract_fails_closed_without_single_prompt_microbatch(hf_module):
+    model = FakeModel()
+    prompts = add_seed_coordinates(
+        hf_module,
+        make_prompts(hf_module, batch_size=2),
+    )
+    rollout = hf_module.HFRollout(
+        model,
+        make_config(micro_batch_size=2, seed=2924589348),
+    )
+
+    with pytest.raises(ValueError, match="micro_batch_size=1"):
+        rollout.generate_sequences(prompts, max_tokens=2, n=1)
+
+    assert model.calls == []
+
+
+def test_seeded_greedy_generation_does_not_consume_rng(hf_module):
+    model = FakeModel()
+    model.sample_from_rng = True
+    prompts = add_seed_coordinates(
+        hf_module,
+        make_prompts(hf_module, batch_size=1),
+    )
+    rollout = hf_module.HFRollout(
+        model,
+        make_config(micro_batch_size=1, seed=2924589348),
+    )
+
+    torch.manual_seed(314)
+    global_state = torch.random.get_rng_state().clone()
+    result = rollout.generate_sequences(
+        prompts,
+        max_tokens=2,
+        n=8,
+        do_sample=False,
+    )
+
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+    assert result.batch.batch_size == torch.Size([1])

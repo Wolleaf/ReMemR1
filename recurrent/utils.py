@@ -16,6 +16,7 @@ import torch
 import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
+from verl.utils.chat_template import apply_chat_template_without_native_thinking
 from tensordict import TensorDict # this will initilize CUDA! make sure your CUDA_VISIBLE_DEVICES is set!
 from typing import List
 import datetime
@@ -113,15 +114,16 @@ class TokenTemplate:
         return torch.cat(formatted_parts)
 
 def chat_template(tokenizer, system=False) -> str:
+    messages = []
     if system:
-        return tokenizer.apply_chat_template([{'role':'system','content':'{system}'},
-                                              {'role':'user','content':'{message}'}],
-                                                    add_generation_prompt=True,
-                                                    tokenize=False)
-    else:
-        return tokenizer.apply_chat_template([{'role':'user','content':'{message}'}],
-                                                    add_generation_prompt=True, 
-                                                    tokenize=False)
+        messages.append({'role': 'system', 'content': '{system}'})
+    messages.append({'role': 'user', 'content': '{message}'})
+    return apply_chat_template_without_native_thinking(
+        tokenizer,
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
 
 def graceful_padding(bsz: int, group_nums: int) -> tuple[torch.Tensor, torch.Tensor]:
     """

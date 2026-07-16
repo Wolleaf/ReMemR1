@@ -51,11 +51,19 @@ def update_model_config(module_config, override_config_kwargs):
         setattr(module_config, key, val)
 
 
-def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False) -> Dict:
+def get_huggingface_actor_config(
+    model_name: str,
+    override_config_kwargs=None,
+    trust_remote_code=False,
+    revision=None,
+) -> Dict:
     if override_config_kwargs is None:
         override_config_kwargs = {}
     assert isinstance(override_config_kwargs, Dict), f"override_config_kwargs must be a dict, got {type(override_config_kwargs)}"
-    module_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    config_kwargs = {"trust_remote_code": trust_remote_code}
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    module_config = AutoConfig.from_pretrained(model_name, **config_kwargs)
     update_model_config(module_config, override_config_kwargs)
 
     return module_config
@@ -64,14 +72,19 @@ def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, t
 def get_generation_config(
     model: str,
     trust_remote_code: bool = False,
+    revision=None,
 ) -> Optional[GenerationConfig]:
+    config_kwargs = {}
+    if revision is not None:
+        config_kwargs["revision"] = revision
     try:
-        return GenerationConfig.from_pretrained(model)
+        return GenerationConfig.from_pretrained(model, **config_kwargs)
     except OSError:  # Not found
         try:
             config = get_huggingface_actor_config(
                 model,
                 trust_remote_code=trust_remote_code,
+                revision=revision,
             )
             return GenerationConfig.from_model_config(config)
         except OSError:  # Not found

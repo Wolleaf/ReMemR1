@@ -65,10 +65,48 @@ def main(config):
     run_ppo(config)
 
 
+def apply_reproduction_seed_contract(config):
+    """Derive and validate every formal seed from one run seed."""
+
+    reproduction = config.get("reproduction")
+    if reproduction is None or reproduction.get("run_seed") is None:
+        return None
+
+    from omegaconf import open_dict
+
+    from verl.utils.reproducibility import ReproductionSeeds, validate_seed
+
+    seeds = ReproductionSeeds.from_run_seed(reproduction.run_seed)
+    derived = seeds.to_dict()
+    for field in ("data", "model_init", "rollout"):
+        config_field = f"{field}_seed"
+        configured = reproduction.get(config_field)
+        if configured is not None:
+            configured = validate_seed(
+                configured,
+                name=f"reproduction.{config_field}",
+            )
+        if configured is not None and configured != derived[field]:
+            raise ValueError(
+                f"reproduction.{config_field}={configured} does not match "
+                f"run_seed-derived value {derived[field]}"
+            )
+
+    with open_dict(config):
+        config.reproduction.data_seed = seeds.data
+        config.reproduction.model_init_seed = seeds.model_init
+        config.reproduction.rollout_seed = seeds.rollout
+        config.data.seed = seeds.data
+        config.actor_rollout_ref.model.model_init_seed = seeds.model_init
+        config.actor_rollout_ref.rollout.seed = seeds.rollout
+    return seeds
+
+
 def run_ppo(config) -> None:
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    apply_reproduction_seed_contract(config)
     if not ray.is_initialized():
         # this is for local ray cluster
         runtime_env_vars = {
@@ -111,8 +149,19 @@ class TaskRunner:
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+        tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
+        model_revision = config.actor_rollout_ref.model.get("revision")
+        if model_revision is not None:
+            tokenizer_kwargs["revision"] = model_revision
+        text_only = config.actor_rollout_ref.model.get("text_only", False)
+        from verl.models.qwen35 import QWEN35_PINNED_REVISIONS
+
+        if config.actor_rollout_ref.model.path in QWEN35_PINNED_REVISIONS and not text_only:
+            raise ValueError("Pinned Qwen3.5 reproduction models require model.text_only=true")
+        tokenizer = hf_tokenizer(local_path, **tokenizer_kwargs)
+        processor = None
+        if not text_only:
+            processor = hf_processor(local_path, use_fast=True, **tokenizer_kwargs)
 
         # define worker classes
         if config.actor_rollout_ref.actor.strategy == "fsdp":

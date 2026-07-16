@@ -20,6 +20,12 @@ from codetiming import Timer
 import numpy as np
 
 from verl import DataProto
+from verl.utils.reproducibility import (
+    ROLLOUT_GLOBAL_STEP_KEY,
+    ROLLOUT_SAMPLE_INDEX_KEY,
+    ROLLOUT_TRAJECTORY_INDEX_KEY,
+    ROLLOUT_TURN_INDEX_KEY,
+)
 
 from .interface import RAgent, RConfig
 from .utils import (chat_template, create_attention_mask, create_position_ids,
@@ -79,13 +85,20 @@ class LLMGenerationManager:
     def generate_with_graceful_padding(self, input_ids: torch.Tensor,
                                     attention_masks: torch.Tensor,
                                     position_ids: torch.Tensor,
-                                    meta_info: dict):
+                                    meta_info: dict,
+                                    rollout_coordinates: dict[str, torch.Tensor] | None = None):
 
         """
         batch may not be divisible by wordsize.
         Use "Hello" as padding, insert padding data into batch so that data 
         """
         bsz = input_ids.shape[0]
+        rollout_coordinates = rollout_coordinates or {}
+        for key, coordinate in rollout_coordinates.items():
+            if coordinate.shape != (bsz,):
+                raise ValueError(
+                    f"{key} must have shape ({bsz},), got {tuple(coordinate.shape)}"
+                )
 
         group_nums = self.world_size
         remainder = bsz % group_nums
@@ -106,12 +119,22 @@ class LLMGenerationManager:
             input_ids = padding_by_index(input_ids, padding_token_ids, padding_index)
             attention_masks = padding_by_index(attention_masks, padding_attention_masks, padding_index)
             position_ids = padding_by_index(position_ids, padding_position_ids, padding_index)
+            rollout_coordinates = {
+                key: padding_by_index(
+                    coordinate,
+                    torch.zeros((), dtype=coordinate.dtype, device=coordinate.device),
+                    padding_index,
+                )
+                for key, coordinate in rollout_coordinates.items()
+            }
 
-        batch = DataProto.from_dict(tensors={
+        tensors = {
             'input_ids': input_ids,
             'position_ids': position_ids,
             'attention_mask': attention_masks
-        }, meta_info=meta_info)
+        }
+        tensors.update(rollout_coordinates)
+        batch = DataProto.from_dict(tensors=tensors, meta_info=meta_info)
         output_batch = self.actor_rollout_wg.generate_sequences(batch)
         if remainder:
             # 4. remove padding
@@ -156,8 +179,42 @@ class LLMGenerationManager:
                 position_ids = create_position_ids(attention_masks)
                 active_num_list.append(len(messages))
                 logger.info(f'padding done')
+                coordinate_keys = (
+                    ROLLOUT_SAMPLE_INDEX_KEY,
+                    ROLLOUT_TRAJECTORY_INDEX_KEY,
+                )
+                coordinate_presence = [key in gen_batch.batch for key in coordinate_keys]
+                seed_contract_present = ROLLOUT_GLOBAL_STEP_KEY in meta_info
+                if seed_contract_present != all(coordinate_presence) or (
+                    any(coordinate_presence) and not seed_contract_present
+                ):
+                    raise ValueError(
+                        "recurrent rollout seed coordinates are incomplete"
+                    )
+                rollout_coordinates = None
+                if seed_contract_present:
+                    active_indices = self.agent.sample_index_list[-1]
+                    if len(active_indices) != len(messages):
+                        raise RuntimeError(
+                            "agent sample indices must align with active rollout messages"
+                        )
+                    rollout_coordinates = {
+                        key: gen_batch.batch[key][active_indices]
+                        for key in coordinate_keys
+                    }
+                    rollout_coordinates[ROLLOUT_TURN_INDEX_KEY] = torch.full(
+                        (len(messages),),
+                        self.agent.step,
+                        dtype=torch.long,
+                    )
             with _timer('mt_gen', timing_raw):
-                gen_output = self.generate_with_graceful_padding(input_ids, attention_masks, position_ids, meta_info_gen)
+                gen_output = self.generate_with_graceful_padding(
+                    input_ids,
+                    attention_masks,
+                    position_ids,
+                    meta_info_gen,
+                    rollout_coordinates=rollout_coordinates,
+                )
                 logger.info('generation done')
             with _timer('mt_update', timing_raw):
                 gen_output.batch['step_id'] = torch.ones(gen_output.batch['responses'].shape[0], dtype=torch.long) * self.agent.step

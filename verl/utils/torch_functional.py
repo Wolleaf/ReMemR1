@@ -392,6 +392,12 @@ Optimizer related
 """
 
 
+def _warmup_ratio(current_step: int, num_warmup_steps: int) -> float:
+    # LambdaLR evaluates step 0 during construction; that LR is used by the
+    # first optimizer update because callers step the scheduler afterwards.
+    return min(1.0, float(current_step + 1) / float(max(1, num_warmup_steps)))
+
+
 def get_cosine_schedule_with_warmup(
     optimizer: Optimizer,
     num_warmup_steps: int,
@@ -427,7 +433,7 @@ def get_cosine_schedule_with_warmup(
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
+            return _warmup_ratio(current_step, num_warmup_steps)
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         x = math.cos(math.pi * float(num_cycles) * 2.0 * progress)
         return max(0.0, x * coef + intercept)
@@ -441,7 +447,7 @@ def get_constant_schedule_with_warmup(
     last_epoch: int = -1,
 ):
     def lr_lambda(current_step):
-        return min(1, float(current_step) / float(max(1, num_warmup_steps)))
+        return _warmup_ratio(current_step, num_warmup_steps)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
@@ -548,7 +554,7 @@ def get_wsd_schedule_with_warmup(
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
+            return _warmup_ratio(current_step, num_warmup_steps)
         if current_step < num_warmup_steps + num_stable_steps:
             return 1.0
         if current_step < num_training_steps:

@@ -145,7 +145,12 @@ def _run_ppo_with_fake_ray():
     run_ppo = _load_isolated_function(
         MAIN_PPO_PATH,
         "run_ppo",
-        {"os": os, "ray": fake_ray, "TaskRunner": _FakeTaskRunner},
+        {
+            "os": os,
+            "ray": fake_ray,
+            "TaskRunner": _FakeTaskRunner,
+            "apply_reproduction_seed_contract": lambda config: None,
+        },
     )
     config = SimpleNamespace(ray_init=SimpleNamespace(num_cpus=3))
     run_ppo(config)

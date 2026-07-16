@@ -28,11 +28,58 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import GenerationConfig
 
 from verl import DataProto
+from verl.utils.reproducibility import (
+    ROLLOUT_GLOBAL_STEP_KEY,
+    ROLLOUT_SAMPLE_INDEX_KEY,
+    ROLLOUT_TRAJECTORY_INDEX_KEY,
+    ROLLOUT_TURN_INDEX_KEY,
+    derive_rollout_generation_seed,
+)
 from verl.utils.torch_functional import get_response_mask
 
 from .base import BaseRollout
 
 __all__ = ["HFRollout"]
+
+
+_ROLLOUT_COORDINATE_KEYS = (
+    ROLLOUT_SAMPLE_INDEX_KEY,
+    ROLLOUT_TRAJECTORY_INDEX_KEY,
+    ROLLOUT_TURN_INDEX_KEY,
+)
+
+
+def _has_rollout_seed_contract(prompts: DataProto) -> bool:
+    present = [ROLLOUT_GLOBAL_STEP_KEY in prompts.meta_info]
+    present.extend(key in prompts.batch for key in _ROLLOUT_COORDINATE_KEYS)
+    if any(present) and not all(present):
+        raise ValueError(
+            "HF rollout seed contract requires global_step, sample, trajectory, "
+            "and recurrent turn coordinates"
+        )
+    return all(present)
+
+
+def _coordinate_value(prompts: DataProto, key: str) -> int:
+    coordinate = prompts.batch[key]
+    if coordinate.numel() != 1:
+        raise ValueError(f"{key} must contain exactly one value per HF generation call")
+    return coordinate.item()
+
+
+@contextlib.contextmanager
+def _fork_rng_from_generator(seed: int, device: torch.device):
+    """Temporarily install a private generator state for HF's global multinomial calls."""
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    devices = [] if device.type == "cpu" else [device]
+    with torch.random.fork_rng(devices=devices):
+        if device.type == "cpu":
+            torch.random.set_rng_state(generator.get_state())
+        else:
+            torch.cuda.set_rng_state(generator.get_state(), device=device)
+        yield generator
 
 
 class HFRollout(BaseRollout):
@@ -56,6 +103,10 @@ class HFRollout(BaseRollout):
         micro_batch_size = int(self.config.get("micro_batch_size", batch_size))
         if micro_batch_size <= 0:
             raise ValueError(f"micro_batch_size must be positive, got {micro_batch_size}")
+        if _has_rollout_seed_contract(prompts) and micro_batch_size != 1:
+            raise ValueError(
+                "deterministic recurrent HF rollout requires micro_batch_size=1"
+            )
 
         batch_prompts = [
             prompts[start : start + micro_batch_size]
@@ -121,6 +172,21 @@ class HFRollout(BaseRollout):
         if num_return_sequences <= 0:
             raise ValueError(f"n must be positive, got {num_return_sequences}")
 
+        generation_seed = None
+        if _has_rollout_seed_contract(prompts):
+            rollout_seed = self.config.get("seed")
+            if rollout_seed is None:
+                raise ValueError(
+                    "deterministic recurrent HF rollout requires rollout.seed"
+                )
+            generation_seed = derive_rollout_generation_seed(
+                rollout_seed,
+                prompts.meta_info[ROLLOUT_GLOBAL_STEP_KEY],
+                _coordinate_value(prompts, ROLLOUT_SAMPLE_INDEX_KEY),
+                _coordinate_value(prompts, ROLLOUT_TRAJECTORY_INDEX_KEY),
+                _coordinate_value(prompts, ROLLOUT_TURN_INDEX_KEY),
+            )
+
         top_p = resolve("top_p", self.config.get("top_p", 1.0))
         top_k = max(0, resolve("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
 
@@ -153,6 +219,10 @@ class HFRollout(BaseRollout):
                 "temperature": temperature,
                 "num_return_sequences": num_return_sequences,
             }
+            if generation_seed is not None and num_return_sequences != 1:
+                raise ValueError(
+                    "seeded recurrent prompts must be expanded before HF generation; n must be 1"
+                )
 
         # Keep the explicit rollout contract authoritative over HF aliases.
         generation_overrides.pop("num_return_sequences", None)
@@ -183,8 +253,13 @@ class HFRollout(BaseRollout):
             if idx.device.type == "cuda"
             else contextlib.nullcontext()
         )
+        rng_ctx = (
+            _fork_rng_from_generator(generation_seed, idx.device)
+            if do_sample and generation_seed is not None
+            else contextlib.nullcontext()
+        )
         try:
-            with param_ctx, autocast_ctx:
+            with param_ctx, autocast_ctx, rng_ctx:
                 output = self.module.generate(
                     input_ids=idx,
                     attention_mask=attention_mask,
