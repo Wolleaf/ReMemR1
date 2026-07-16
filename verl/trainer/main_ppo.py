@@ -69,7 +69,13 @@ def apply_reproduction_seed_contract(config):
     """Derive and validate every formal seed from one run seed."""
 
     reproduction = config.get("reproduction")
-    if reproduction is None or reproduction.get("run_seed") is None:
+    if reproduction is None:
+        return None
+    if reproduction.get("formal_data") is True and reproduction.get("run_seed") is None:
+        raise ValueError(
+            "reproduction.formal_data=true requires reproduction.run_seed"
+        )
+    if reproduction.get("run_seed") is None:
         return None
 
     from omegaconf import open_dict

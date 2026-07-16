@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 import warnings
 from typing import Optional, Union
 
@@ -25,6 +26,17 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from verl.utils.fs import copy_to_local, is_non_local
 
 from .checkpoint_manager import BaseCheckpointManager
+from .reproduction import (
+    REPRODUCTION_RANK_EXTRA_SCHEMA_VERSION,
+    CheckpointContractError,
+    capture_process_rng_state,
+    json_safe_state_sha256,
+    restore_process_rng_state,
+    to_json_safe_state,
+    validate_reproduction_rank_extra_state,
+    validate_scheduler_optimizer_alignment,
+    verify_reproduction_checkpoint_directory,
+)
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -67,9 +79,49 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             checkpoint_contents=checkpoint_contents,
         )
 
-    def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+    def load_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        del_local_after_load=False,
+        reproduction=False,
+        expected_global_step=None,
+    ):
         if local_path is None:
             return
+
+        reproduction_state = None
+        if reproduction:
+            if hdfs_path is not None:
+                raise CheckpointContractError(
+                    "reproduction checkpoint load does not support HDFS"
+                )
+            if del_local_after_load:
+                raise CheckpointContractError(
+                    "reproduction checkpoint load cannot delete verified shards"
+                )
+            if not os.path.isabs(local_path):
+                raise CheckpointContractError(
+                    "reproduction actor checkpoint path must be absolute"
+                )
+            checkpoint_root = Path(local_path).parent
+            _, reproduction_state = verify_reproduction_checkpoint_directory(
+                checkpoint_root
+            )
+            if expected_global_step is None:
+                expected_global_step = reproduction_state.global_step
+            if reproduction_state.global_step != expected_global_step:
+                raise CheckpointContractError(
+                    "root extra-state global_step does not match requested resume step"
+                )
+            if self.optimizer is None:
+                raise CheckpointContractError(
+                    "reproduction actor resume requires an optimizer"
+                )
+            if self.lr_scheduler is None:
+                raise CheckpointContractError(
+                    "reproduction actor resume requires an lr_scheduler"
+                )
 
         # every rank download its own checkpoint
         remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -84,6 +136,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
         extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
+        if reproduction:
+            if optimizer_state_dict is None:
+                raise CheckpointContractError(
+                    "reproduction actor checkpoint is missing optimizer state"
+                )
+            validate_reproduction_rank_extra_state(
+                extra_state_dict,
+                expected_global_step=expected_global_step,
+            )
+            validate_scheduler_optimizer_alignment(
+                extra_state_dict["lr_scheduler"],
+                optimizer_state_dict,
+                expected_global_step=expected_global_step,
+            )
+
         if del_local_after_load:
             try:
                 os.remove(local_model_path) if is_non_local(local_model_path) else None
@@ -97,26 +164,64 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
+            if reproduction:
+                optimizer_state_dict = FSDP.optim_state_dict_to_load(
+                    self.model,
+                    self.optimizer,
+                    optimizer_state_dict,
+                )
             self.model.load_state_dict(model_state_dict)
             if self.optimizer is not None:
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
-        if "rng" in extra_state_dict:
+        if reproduction:
+            restore_process_rng_state(extra_state_dict["rng"])
+        elif "rng" in extra_state_dict:
             # 'rng' may not exist for backward compatibility
             self.load_rng_state(extra_state_dict["rng"])
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep=None,
+        reproduction=False,
+    ):
         if local_path is None:
             return
+
+        if reproduction:
+            if hdfs_path is not None:
+                raise CheckpointContractError(
+                    "reproduction checkpoint save does not support HDFS"
+                )
+            if not os.path.isabs(local_path):
+                raise CheckpointContractError(
+                    "reproduction actor checkpoint path must be absolute"
+                )
+            if max_ckpt_to_keep is not None:
+                raise CheckpointContractError(
+                    "reproduction checkpoints disable in-save retention; "
+                    "prune only after explicit verification"
+                )
+            if self.optimizer is None:
+                raise CheckpointContractError(
+                    "reproduction actor checkpoint requires optimizer state"
+                )
+            if self.lr_scheduler is None:
+                raise CheckpointContractError(
+                    "reproduction actor checkpoint requires lr_scheduler state"
+                )
 
         # record the previous global step
         self.previous_global_step = global_step
 
         # remove previous local_path
-        if max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
+        if not reproduction and max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
             keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
             self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
             self.previous_saved_paths = self.previous_saved_paths[keep_start:]
@@ -131,13 +236,40 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             warnings.simplefilter("ignore")
             with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
                 model_state_dict = self.model.state_dict()
-                optimizer_state_dict = self.optimizer.state_dict() if self.optimizer is not None else None
+                if self.optimizer is None:
+                    optimizer_state_dict = None
+                elif reproduction:
+                    optimizer_state_dict = FSDP.optim_state_dict(
+                        self.model,
+                        self.optimizer,
+                    )
+                else:
+                    optimizer_state_dict = self.optimizer.state_dict()
                 lr_scheduler_state_dict = self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
 
-                extra_state_dict = {
-                    "lr_scheduler": lr_scheduler_state_dict,
-                    "rng": self.get_rng_state(),
-                }
+                if reproduction:
+                    rng_state = capture_process_rng_state()
+                    extra_state_dict = {
+                        "schema_version": REPRODUCTION_RANK_EXTRA_SCHEMA_VERSION,
+                        "global_step": global_step,
+                        "lr_scheduler": lr_scheduler_state_dict,
+                        "rng": rng_state,
+                    }
+                    validate_reproduction_rank_extra_state(
+                        extra_state_dict,
+                        expected_global_step=global_step,
+                    )
+                    validate_scheduler_optimizer_alignment(
+                        lr_scheduler_state_dict,
+                        optimizer_state_dict,
+                        expected_global_step=global_step,
+                    )
+                else:
+                    rng_state = self.get_rng_state()
+                    extra_state_dict = {
+                        "lr_scheduler": lr_scheduler_state_dict,
+                        "rng": rng_state,
+                    }
                 model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -163,3 +295,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if max_ckpt_to_keep is not None and max_ckpt_to_keep > 0:
             self.previous_saved_paths.append(local_path)
+
+        if reproduction:
+            return {
+                "schema_version": REPRODUCTION_RANK_EXTRA_SCHEMA_VERSION,
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "global_step": global_step,
+                "rng_state": to_json_safe_state(rng_state),
+                "rng_state_sha256": json_safe_state_sha256(rng_state),
+                "lr_scheduler_sha256": json_safe_state_sha256(
+                    lr_scheduler_state_dict
+                ),
+            }

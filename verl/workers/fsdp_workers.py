@@ -286,7 +286,13 @@ class ActorRolloutRefWorker(Worker):
                     config=source_model_config,
                 )
                 actor_module = qwen35_result.model
-                build_metadata["qwen35_mapping"] = qwen35_result.metadata.to_dict()
+                qwen35_mapping = qwen35_result.metadata.to_dict()
+                from verl.utils.checkpoint.reproduction import canonical_json_sha256
+
+                build_metadata["qwen35_mapping"] = qwen35_mapping
+                build_metadata["qwen35_mapping_sha256"] = canonical_json_sha256(
+                    qwen35_mapping
+                )
             else:
                 model_load_kwargs = {
                     "pretrained_model_name_or_path": local_path,
@@ -807,8 +813,143 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    def _current_adapter_state_metadata(self):
+        from peft import get_peft_model_state_dict
+
+        from verl.utils.checkpoint.reproduction import canonical_tensor_state_sha256
+
+        adapter_state = get_peft_model_state_dict(self.actor_module)
+        tensor_keys = tuple(sorted(adapter_state))
+        return {
+            "adapter_tensor_keys": list(tensor_keys),
+            "adapter_state_sha256": canonical_tensor_state_sha256(adapter_state),
+        }
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+    def get_reproduction_build_metadata(self):
+        """Return immutable JSON-safe actor identity used by strict checkpoints."""
+
+        assert self._is_actor
+        from verl.utils.checkpoint.reproduction import to_json_safe_state
+
+        build_metadata = self.model_build_metadata.get("actor")
+        if not isinstance(build_metadata, dict):
+            raise RuntimeError("actor build metadata is unavailable")
+        trainable = build_metadata.get("trainable_parameters")
+        if not isinstance(trainable, dict) or not trainable.get("state_sha256"):
+            raise RuntimeError(
+                "initial trainable adapter state hash is unavailable"
+            )
+        return {
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "build_metadata": to_json_safe_state(build_metadata),
+            "initial_adapter_state_sha256": trainable["state_sha256"],
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_initial_adapter_state_sha256(self):
+        """Expose the seeded step-0 adapter fingerprint to the driver."""
+
+        metadata = self.get_reproduction_build_metadata()
+        return metadata["initial_adapter_state_sha256"]
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_reproduction_rng_state(self):
+        """Return a JSON-safe snapshot without mutating any RNG stream."""
+
+        assert self._is_actor
+        from verl.utils.checkpoint.reproduction import (
+            capture_process_rng_state,
+            json_safe_state_sha256,
+            to_json_safe_state,
+        )
+
+        rng_state = capture_process_rng_state()
+        return {
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "rng_state": to_json_safe_state(rng_state),
+            "rng_state_sha256": json_safe_state_sha256(rng_state),
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_reproduction_adapter(
+        self,
+        local_path,
+        checkpoint_extra_state,
+        tokenizer_id,
+        tokenizer_revision,
+        template_revision,
+    ):
+        """Export only PEFT tensors while full FSDP parameters are summoned."""
+
+        assert self._is_actor
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        from verl.utils.checkpoint.reproduction import (
+            AdapterExportMetadata,
+            CheckpointContractError,
+            CheckpointExtraState,
+            canonical_tensor_state_sha256,
+            export_peft_adapter,
+        )
+        from peft import get_peft_model_state_dict
+
+        if not os.path.isabs(local_path):
+            raise CheckpointContractError(
+                "reproduction adapter export path must be absolute"
+            )
+        state = CheckpointExtraState.from_dict(checkpoint_extra_state)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        exported_metadata = None
+        with FSDP.summon_full_params(
+            self.actor_module_fsdp,
+            recurse=True,
+            writeback=False,
+            rank0_only=True,
+            offload_to_cpu=True,
+        ):
+            if self.rank == 0:
+                if not hasattr(self.actor_module, "peft_config"):
+                    raise CheckpointContractError(
+                        "adapter export requires a PEFT actor model"
+                    )
+                adapter_state = get_peft_model_state_dict(self.actor_module)
+                adapter_state_sha256 = canonical_tensor_state_sha256(adapter_state)
+                if tuple(sorted(adapter_state)) != state.adapter_tensor_keys:
+                    raise CheckpointContractError(
+                        "live adapter tensor keys differ from checkpoint extra-state"
+                    )
+                if adapter_state_sha256 != state.adapter_state_sha256:
+                    raise CheckpointContractError(
+                        "live adapter tensor-state hash differs from checkpoint extra-state"
+                    )
+                metadata = AdapterExportMetadata.from_checkpoint(
+                    state,
+                    tokenizer_id=tokenizer_id,
+                    tokenizer_revision=tokenizer_revision,
+                    template_revision=template_revision,
+                )
+                export_peft_adapter(self.actor_module, local_path, metadata)
+                exported_metadata = metadata.to_dict()
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return exported_metadata
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(
+        self,
+        local_path,
+        hdfs_path=None,
+        global_step=0,
+        max_ckpt_to_keep=None,
+        reproduction=False,
+    ):
         # only support save and load ckpt for actor
         assert self._is_actor
         import torch
@@ -816,24 +957,73 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
+        save_metadata = self.checkpoint_manager.save_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            reproduction=reproduction,
+        )
 
         torch.distributed.barrier()
+        if reproduction:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            with FSDP.summon_full_params(
+                self.actor_module_fsdp,
+                recurse=True,
+                writeback=False,
+                rank0_only=True,
+                offload_to_cpu=True,
+            ):
+                if self.rank == 0:
+                    save_metadata.update(self._current_adapter_state_metadata())
+            torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return save_metadata
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+    def load_checkpoint(
+        self,
+        local_path,
+        hdfs_path=None,
+        del_local_after_load=False,
+        reproduction=False,
+        expected_global_step=None,
+    ):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            del_local_after_load=del_local_after_load,
+            reproduction=reproduction,
+            expected_global_step=expected_global_step,
+        )
+
+        loaded_metadata = None
+        if reproduction:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            with FSDP.summon_full_params(
+                self.actor_module_fsdp,
+                recurse=True,
+                writeback=False,
+                rank0_only=True,
+                offload_to_cpu=True,
+            ):
+                if self.rank == 0:
+                    loaded_metadata = self._current_adapter_state_metadata()
+            torch.distributed.barrier()
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+        return loaded_metadata
 
 
 class CriticWorker(Worker):

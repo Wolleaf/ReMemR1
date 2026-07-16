@@ -18,6 +18,8 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+from pathlib import Path
+import re
 import shutil
 import uuid
 from collections import defaultdict
@@ -58,6 +60,27 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.checkpoint.reproduction import (
+    EXTRA_STATE_FILENAME,
+    AdapterExportMetadata,
+    CheckpointContractError,
+    CheckpointExtraState,
+    DataloaderProgress,
+    atomic_publish_directory,
+    atomic_write_text,
+    canonical_json_sha256,
+    capture_process_rng_state,
+    json_safe_state_sha256,
+    restore_process_rng_state,
+    to_json_safe_state,
+    validate_adapter_export,
+    validate_bound_dataset_manifest,
+    validate_checkpoint_compatibility,
+    validate_reproduction_manifest_configuration,
+    validate_reproduction_rank_extra_state,
+    validate_scheduler_optimizer_alignment,
+    verify_reproduction_checkpoint_directory,
+)
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -65,6 +88,13 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.reproducibility import (
     ROLLOUT_GLOBAL_STEP_KEY,
     make_rollout_coordinate_tensors,
+)
+from verl.utils.reproduction_fingerprint import (
+    StepZeroFingerprint,
+    hash_ordered_sample_ids,
+    hash_sampled_token_rows,
+    load_and_verify_step_zero_fingerprint,
+    publish_step_zero_fingerprint,
 )
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
@@ -345,6 +375,19 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        reproduction = config.get("reproduction")
+        if (
+            reproduction is not None
+            and reproduction.get("formal_data") is True
+            and reproduction.get("run_seed") is None
+        ):
+            raise ValueError(
+                "reproduction.formal_data=true requires reproduction.run_seed"
+            )
+        self.reproduction_checkpoint_enabled = bool(
+            reproduction is not None and reproduction.get("run_seed") is not None
+        )
+        self._step_zero_completed = False
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -379,6 +422,132 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader()
+        if self.reproduction_checkpoint_enabled:
+            self._validate_reproduction_dataset_manifest()
+
+    def _validate_reproduction_dataset_manifest(self) -> None:
+        reproduction = self.config.reproduction
+        validate_bound_dataset_manifest(
+            self.train_dataset,
+            configured_sha256=reproduction.data_manifest_sha256,
+            configured_mode=reproduction.data_manifest_mode,
+            configured_profile=reproduction.data_manifest_profile,
+            label="train",
+        )
+        validate_bound_dataset_manifest(
+            self.val_dataset,
+            configured_sha256=reproduction.val_data_manifest_sha256,
+            configured_mode=reproduction.val_data_manifest_mode,
+            configured_profile=reproduction.val_data_manifest_profile,
+            label="validation",
+        )
+
+    def _validate_step_zero_configuration(self) -> None:
+        reproduction = self.config.reproduction
+        fingerprint_path = reproduction.get("step_zero_fingerprint_path")
+        reference_path = reproduction.get("step_zero_reference_path")
+        for name, value in (
+            ("step_zero_fingerprint_path", fingerprint_path),
+            ("step_zero_reference_path", reference_path),
+        ):
+            if value is not None and (
+                not isinstance(value, str)
+                or not value
+                or not os.path.isabs(value)
+            ):
+                raise ValueError(f"reproduction.{name} must be an absolute path or null")
+        if fingerprint_path is not None and fingerprint_path == reference_path:
+            raise ValueError(
+                "step-zero fingerprint output and reference paths must be different"
+            )
+
+        total_steps = self.config.trainer.total_training_steps
+        is_formal_comparison = (
+            isinstance(total_steps, int) and total_steps >= 40
+        )
+        if is_formal_comparison and fingerprint_path is None:
+            raise ValueError(
+                "40/80-step reproduction jobs require a step-zero fingerprint path"
+            )
+        if fingerprint_path is None:
+            if reference_path is not None:
+                raise ValueError(
+                    "step-zero reference requires a fingerprint output path"
+                )
+            self._step_zero_completed = True
+            return
+
+        alpha = self.config.algorithm.alpha
+        if alpha == 1.0:
+            if reference_path is not None:
+                raise ValueError(
+                    "outcome-only B runs must not use a step-zero reference"
+                )
+        elif alpha == 0.8:
+            if reference_path is None:
+                raise ValueError(
+                    "paired C runs require the B step-zero fingerprint reference"
+                )
+        elif is_formal_comparison:
+            raise ValueError("formal comparison jobs require algorithm.alpha=1.0 or 0.8")
+
+        fingerprint_file = Path(fingerprint_path)
+        reference_file = Path(reference_path) if reference_path is not None else None
+        if self.config.trainer.resume_mode == "disable":
+            if fingerprint_file.exists():
+                raise ValueError(
+                    f"fresh run refuses to overwrite step-zero evidence: {fingerprint_file}"
+                )
+            if reference_file is not None:
+                StepZeroFingerprint.load(reference_file)
+            return
+
+        load_and_verify_step_zero_fingerprint(
+            fingerprint_file,
+            reference_path=reference_file,
+        )
+        self._step_zero_completed = True
+
+    def _should_record_step_zero_fingerprint(self) -> bool:
+        return bool(
+            self.reproduction_checkpoint_enabled
+            and not self._step_zero_completed
+            and self.config.trainer.resume_mode == "disable"
+            and self.global_steps == 1
+            and self.config.reproduction.get("step_zero_fingerprint_path")
+        )
+
+    def _record_step_zero_fingerprint(
+        self,
+        *,
+        ordered_sample_ids,
+        sampled_token_rows,
+    ) -> Path:
+        actor_identity = self._get_reproduction_actor_identity()
+        fingerprint = StepZeroFingerprint(
+            run_seed=int(self.config.reproduction.run_seed),
+            rollout_global_step=self.global_steps,
+            base_model_id=self.config.actor_rollout_ref.model.path,
+            base_model_revision=self.config.actor_rollout_ref.model.revision,
+            data_manifest_sha256=self.config.reproduction.data_manifest_sha256,
+            initial_adapter_sha256=actor_identity[
+                "initial_adapter_state_sha256"
+            ],
+            first_batch_sha256=hash_ordered_sample_ids(ordered_sample_ids),
+            first_sampled_tokens_sha256=hash_sampled_token_rows(
+                sampled_token_rows
+            ),
+        )
+        destination = publish_step_zero_fingerprint(
+            fingerprint,
+            self.config.reproduction.step_zero_fingerprint_path,
+            reference_path=self.config.reproduction.get(
+                "step_zero_reference_path"
+            ),
+        )
+        self._step_zero_completed = True
+        print(f"Published step-zero reproduction fingerprint: {destination}")
+        return destination
 
     def _validate_config(self):
         config = self.config
@@ -509,6 +678,118 @@ class RayPPOTrainer:
 
             conf = dict(enabled_conf.config) if enabled_conf.config is not None else {}
             self.recurrent_config = self.recurrent_register.config_cls(**conf)
+
+        if self.reproduction_checkpoint_enabled:
+            reproduction = config.reproduction
+            formal_data = reproduction.get("formal_data")
+            validate_reproduction_manifest_configuration(
+                train_sha256=reproduction.get("data_manifest_sha256"),
+                train_mode=reproduction.get("data_manifest_mode"),
+                train_profile=reproduction.get("data_manifest_profile"),
+                validation_sha256=reproduction.get("val_data_manifest_sha256"),
+                validation_mode=reproduction.get("val_data_manifest_mode"),
+                validation_profile=reproduction.get("val_data_manifest_profile"),
+                formal_data=formal_data,
+                total_training_steps=config.trainer.total_training_steps,
+            )
+            dataloader_num_workers = config.data.get("dataloader_num_workers", 8)
+            if (
+                type(dataloader_num_workers) is not int
+                or dataloader_num_workers < 0
+            ):
+                raise ValueError(
+                    "formal reproduction requires "
+                    "data.dataloader_num_workers to be a non-negative integer"
+                )
+            if n_gpus != 1:
+                raise ValueError(
+                    "the formal reproduction checkpoint path currently requires one GPU"
+                )
+            if config.trainer.default_hdfs_dir is not None:
+                raise ValueError(
+                    "formal reproduction checkpoints do not support HDFS"
+                )
+            if config.trainer.get("remove_previous_ckpt_in_save", False):
+                raise ValueError(
+                    "formal reproduction checkpoints forbid remove_previous_ckpt_in_save"
+                )
+            for name in ("max_actor_ckpt_to_keep", "max_critic_ckpt_to_keep"):
+                if config.trainer.get(name) is not None:
+                    raise ValueError(
+                        f"formal reproduction requires trainer.{name}=null; "
+                        "prune only after explicit checkpoint verification"
+                    )
+            if config.trainer.get("del_local_ckpt_after_load", False):
+                raise ValueError(
+                    "formal reproduction cannot delete checkpoint shards after load"
+                )
+            if config.trainer.get("save_best_val", False):
+                raise ValueError(
+                    "formal reproduction disables the non-resumable best-val saver"
+                )
+            if config.trainer.resume_mode not in {"disable", "resume_path"}:
+                raise ValueError(
+                    "formal reproduction resume_mode must be disable or resume_path; "
+                    "auto resume is forbidden"
+                )
+            if config.trainer.resume_mode == "resume_path":
+                resume_path = config.trainer.get("resume_from_path")
+                if not isinstance(resume_path, str) or not os.path.isabs(resume_path):
+                    raise ValueError(
+                        "formal reproduction resume_from_path must be an absolute path"
+                    )
+            if not config.actor_rollout_ref.model.get("revision"):
+                raise ValueError("formal reproduction requires a fixed model revision")
+            if not config.actor_rollout_ref.model.get("text_only", False):
+                raise ValueError("formal reproduction requires model.text_only=true")
+            if not config.actor_rollout_ref.actor.lora.get("enabled", False):
+                raise ValueError("formal reproduction requires actor LoRA")
+            if (
+                config.actor_rollout_ref.actor.optim.get("warmup_style")
+                != "constant"
+                or config.actor_rollout_ref.actor.optim.get("lr_warmup_steps")
+                != 8
+            ):
+                raise ValueError(
+                    "reproduction actor scheduler requires constant warmup with "
+                    "lr_warmup_steps=8"
+                )
+            if config.recurrent.enable != "memory":
+                raise ValueError(
+                    "formal reproduction requires recurrent.enable=memory"
+                )
+            if config.recurrent.memory.config.get("require_manifest") is not True:
+                raise ValueError(
+                    "formal reproduction requires "
+                    "recurrent.memory.config.require_manifest=true"
+                )
+            tokenizer_name = config.recurrent.memory.config.get("tokenizer_name")
+            tokenizer_revision = config.recurrent.memory.config.get(
+                "tokenizer_revision"
+            )
+            if tokenizer_name != config.actor_rollout_ref.model.path:
+                raise ValueError(
+                    "formal recurrent tokenizer_name must equal the actor model ID"
+                )
+            if tokenizer_revision != config.actor_rollout_ref.model.revision:
+                raise ValueError(
+                    "formal recurrent tokenizer_revision must equal the actor revision"
+                )
+            if reproduction.get("export_adapter_on_save", False):
+                template_revision = reproduction.get("template_revision")
+                if not isinstance(template_revision, str) or not template_revision:
+                    raise ValueError(
+                        "adapter export requires reproduction.template_revision"
+                    )
+            required_contents = {"model", "optimizer", "extra"}
+            configured_contents = set(
+                config.actor_rollout_ref.actor.checkpoint.contents
+            )
+            if not required_contents.issubset(configured_contents):
+                raise ValueError(
+                    "formal reproduction actor checkpoint must include model, optimizer, and extra"
+                )
+            self._validate_step_zero_configuration()
         print("[validate_config] All configuration checks passed successfully!")
 
     def _create_dataloader(self):
@@ -547,12 +828,6 @@ class RayPPOTrainer:
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
-                                                   drop_last=True,
-                                                   collate_fn=collate_fn,
-                                                   sampler=sampler)
         if self.config.recurrent.enable:
             self.val_dataset = self.recurrent_register.dataset_cls(
                 recurrent_config=self.recurrent_config,
@@ -576,10 +851,11 @@ class RayPPOTrainer:
             'truncation', 'error'
         ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
 
+        dataloader_num_workers = self.config.data.get("dataloader_num_workers", 8)
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=8,
+            num_workers=dataloader_num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=sampler,
@@ -588,7 +864,7 @@ class RayPPOTrainer:
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=val_batch_size,
-            num_workers=8,
+            num_workers=dataloader_num_workers,
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn,
@@ -916,6 +1192,496 @@ class RayPPOTrainer:
                     agent_cls=self.recurrent_register.agent_cls,
                 )
 
+    @staticmethod
+    def _checkpoint_step_from_path(path: str | Path) -> int:
+        match = re.fullmatch(r"global_step_(\d+)", Path(path).name)
+        if match is None:
+            raise CheckpointContractError(
+                f"checkpoint directory must be named global_step_<N>: {path}"
+            )
+        return int(match.group(1))
+
+    def _get_reproduction_actor_identity(self) -> dict:
+        results = self.actor_rollout_wg.get_reproduction_build_metadata()
+        if not isinstance(results, (list, tuple)) or not results:
+            raise CheckpointContractError(
+                "actor workers returned no reproduction build metadata"
+            )
+        if any(not isinstance(item, dict) for item in results):
+            raise CheckpointContractError(
+                "actor build metadata records must be mappings"
+            )
+        ordered = sorted(results, key=lambda item: item.get("rank", -1))
+        expected_world_size = len(ordered)
+        expected_ranks = list(range(expected_world_size))
+        actual_ranks = [item.get("rank") for item in ordered]
+        if actual_ranks != expected_ranks:
+            raise CheckpointContractError(
+                f"actor build metadata ranks mismatch: {actual_ranks}"
+            )
+        fingerprints = set()
+        initial_adapter_hashes = set()
+        for item in ordered:
+            if item.get("world_size") != expected_world_size:
+                raise CheckpointContractError(
+                    "actor build metadata world_size mismatch"
+                )
+            build_metadata = item.get("build_metadata")
+            if not isinstance(build_metadata, dict):
+                raise CheckpointContractError(
+                    "actor build metadata payload must be a mapping"
+                )
+            if (
+                build_metadata.get("base_model")
+                != self.config.actor_rollout_ref.model.path
+                or build_metadata.get("revision")
+                != self.config.actor_rollout_ref.model.revision
+            ):
+                raise CheckpointContractError(
+                    "actor build metadata base model identity differs from config"
+                )
+            qwen35_mapping = build_metadata.get("qwen35_mapping")
+            if (
+                build_metadata.get("qwen35_text_only") is not True
+                or not isinstance(qwen35_mapping, dict)
+                or qwen35_mapping.get("strict_loading") is not True
+                or qwen35_mapping.get("loader")
+                != "transformers.AutoModelForCausalLM"
+            ):
+                raise CheckpointContractError(
+                    "formal actor metadata must come from the strict Qwen3.5 text loader"
+                )
+            mapping_hash = canonical_json_sha256(qwen35_mapping)
+            if build_metadata.get("qwen35_mapping_sha256") != mapping_hash:
+                raise CheckpointContractError(
+                    "actor Qwen3.5 text mapping hash mismatch"
+                )
+            initial_hash = item.get("initial_adapter_state_sha256")
+            if not isinstance(initial_hash, str) or re.fullmatch(
+                r"[0-9a-f]{64}", initial_hash
+            ) is None:
+                raise CheckpointContractError(
+                    "actor initial adapter state hash is missing or invalid"
+                )
+            initial_adapter_hashes.add(initial_hash)
+            fingerprints.add(canonical_json_sha256(build_metadata))
+        if len(fingerprints) != 1:
+            raise CheckpointContractError(
+                "actor ranks were built from different model metadata"
+            )
+        if len(initial_adapter_hashes) != 1:
+            raise CheckpointContractError(
+                "actor ranks have different initial adapter state hashes"
+            )
+        return ordered[0]
+
+    def _validate_rank_save_metadata(self, results, global_step: int) -> list[dict]:
+        if not isinstance(results, (list, tuple)) or not results:
+            raise CheckpointContractError(
+                "actor checkpoint workers returned no rank metadata"
+            )
+        if any(not isinstance(item, dict) for item in results):
+            raise CheckpointContractError(
+                "actor checkpoint rank metadata records must be mappings"
+            )
+        required_keys = {
+            "schema_version",
+            "rank",
+            "world_size",
+            "global_step",
+            "rng_state",
+            "rng_state_sha256",
+            "lr_scheduler_sha256",
+            "adapter_tensor_keys",
+            "adapter_state_sha256",
+        }
+        ordered = sorted(results, key=lambda item: item.get("rank", -1))
+        expected_world_size = len(ordered)
+        if [item.get("rank") for item in ordered] != list(range(expected_world_size)):
+            raise CheckpointContractError("actor checkpoint rank metadata is incomplete")
+        normalized = []
+        for item in ordered:
+            if not isinstance(item, dict) or set(item) != required_keys:
+                raise CheckpointContractError(
+                    "actor checkpoint rank metadata does not match schema"
+                )
+            if item["schema_version"] != 1:
+                raise CheckpointContractError(
+                    "unsupported actor checkpoint rank metadata schema"
+                )
+            if item["world_size"] != expected_world_size:
+                raise CheckpointContractError(
+                    "actor checkpoint rank world_size mismatch"
+                )
+            if item["global_step"] != global_step:
+                raise CheckpointContractError(
+                    "actor checkpoint rank global_step mismatch"
+                )
+            if canonical_json_sha256(item["rng_state"]) != item["rng_state_sha256"]:
+                raise CheckpointContractError(
+                    "actor checkpoint JSON-safe RNG hash mismatch"
+                )
+            adapter_keys = item["adapter_tensor_keys"]
+            if (
+                not isinstance(adapter_keys, list)
+                or not adapter_keys
+                or adapter_keys != sorted(set(adapter_keys))
+            ):
+                raise CheckpointContractError(
+                    "actor checkpoint adapter tensor keys are invalid"
+                )
+            if not isinstance(item["adapter_state_sha256"], str) or re.fullmatch(
+                r"[0-9a-f]{64}", item["adapter_state_sha256"]
+            ) is None:
+                raise CheckpointContractError(
+                    "actor checkpoint adapter state hash is invalid"
+                )
+            normalized.append(to_json_safe_state(item))
+        return normalized
+
+    def _create_reproduction_extra_state(
+        self,
+        *,
+        global_step: int,
+        actor_identity: dict,
+        rank_save_metadata,
+        dataloader_state,
+        driver_rng_state,
+    ) -> CheckpointExtraState:
+        build_metadata = actor_identity["build_metadata"]
+        configured_model = str(self.config.actor_rollout_ref.model.path)
+        configured_revision = self.config.actor_rollout_ref.model.revision
+        if build_metadata.get("base_model") != configured_model:
+            raise CheckpointContractError(
+                "actor build metadata base model differs from resolved config"
+            )
+        if build_metadata.get("revision") != configured_revision:
+            raise CheckpointContractError(
+                "actor build metadata revision differs from resolved config"
+            )
+        text_mapping = build_metadata.get("qwen35_mapping")
+        target_manifest = build_metadata.get("lora_target_manifest")
+        if not isinstance(text_mapping, dict) or not isinstance(target_manifest, dict):
+            raise CheckpointContractError(
+                "actor build metadata is missing text mapping or LoRA targets"
+            )
+
+        rank_metadata = self._validate_rank_save_metadata(
+            rank_save_metadata,
+            global_step,
+        )
+        driver_json_state = to_json_safe_state(driver_rng_state)
+        rng_state = {
+            "schema_version": 1,
+            "driver": {
+                "rng_state": driver_json_state,
+                "rng_state_sha256": canonical_json_sha256(driver_json_state),
+            },
+            "actor_workers": rank_metadata,
+        }
+        dataloader_json_state = to_json_safe_state(dataloader_state)
+        lora_config = OmegaConf.to_container(
+            self.config.actor_rollout_ref.actor.lora,
+            resolve=True,
+            enum_to_str=True,
+        )
+        resolved_config = OmegaConf.to_container(
+            self.config,
+            resolve=True,
+            enum_to_str=True,
+        )
+        return CheckpointExtraState.create(
+            global_step=global_step,
+            rng_state=rng_state,
+            dataloader_state=DataloaderProgress(
+                state_sha256=canonical_json_sha256(dataloader_json_state)
+            ),
+            data_manifest_sha256=self.config.reproduction.data_manifest_sha256,
+            base_model_id=configured_model,
+            base_model_revision=configured_revision,
+            text_mapping=text_mapping,
+            lora_config=lora_config,
+            lora_target_manifest=target_manifest,
+            adapter_tensor_keys=rank_metadata[0]["adapter_tensor_keys"],
+            adapter_state_sha256=rank_metadata[0]["adapter_state_sha256"],
+            model_build_metadata=build_metadata,
+            resolved_config=to_json_safe_state(resolved_config),
+        )
+
+    def _validate_reproduction_checkpoint_artifacts(
+        self,
+        checkpoint_root: str | Path,
+        state: CheckpointExtraState,
+        *,
+        verify_directory: bool = True,
+    ):
+        root = Path(checkpoint_root)
+        _, loaded_state = verify_reproduction_checkpoint_directory(
+            root,
+            verify_files=verify_directory,
+        )
+        if loaded_state.sha256 != state.sha256:
+            raise CheckpointContractError(
+                "reproduction extra-state changed while publishing checkpoint"
+            )
+
+        dataloader_path = root / "data.pt"
+        driver_rng_path = root / "driver_rng.pt"
+        if not dataloader_path.is_file() or not driver_rng_path.is_file():
+            raise CheckpointContractError(
+                "reproduction checkpoint is missing dataloader or driver RNG state"
+            )
+        dataloader_state = torch.load(dataloader_path, weights_only=False)
+        driver_rng_state = torch.load(driver_rng_path, weights_only=False)
+        if json_safe_state_sha256(dataloader_state) != state.dataloader_state.state_sha256:
+            raise CheckpointContractError("dataloader state hash mismatch")
+
+        rng_metadata = state.rng_state
+        if set(rng_metadata) != {"schema_version", "driver", "actor_workers"}:
+            raise CheckpointContractError("checkpoint RNG metadata does not match schema")
+        if rng_metadata["schema_version"] != 1:
+            raise CheckpointContractError("unsupported checkpoint RNG metadata schema")
+        driver_metadata = rng_metadata["driver"]
+        if set(driver_metadata) != {"rng_state", "rng_state_sha256"}:
+            raise CheckpointContractError("driver RNG metadata does not match schema")
+        driver_json_state = to_json_safe_state(driver_rng_state)
+        if canonical_json_sha256(driver_json_state) != driver_metadata["rng_state_sha256"]:
+            raise CheckpointContractError("driver RNG state hash mismatch")
+        if driver_json_state != driver_metadata["rng_state"]:
+            raise CheckpointContractError("driver RNG state metadata mismatch")
+
+        worker_metadata = self._validate_rank_save_metadata(
+            rng_metadata["actor_workers"],
+            state.global_step,
+        )
+        world_size = len(worker_metadata)
+        for item in worker_metadata:
+            rank = item["rank"]
+            extra_path = root / "actor" / (
+                f"extra_state_world_size_{world_size}_rank_{rank}.pt"
+            )
+            model_path = root / "actor" / (
+                f"model_world_size_{world_size}_rank_{rank}.pt"
+            )
+            optimizer_path = root / "actor" / (
+                f"optim_world_size_{world_size}_rank_{rank}.pt"
+            )
+            if not extra_path.is_file() or not model_path.is_file() or not optimizer_path.is_file():
+                raise CheckpointContractError(
+                    f"actor rank {rank} checkpoint shards are incomplete"
+                )
+            raw_extra = torch.load(extra_path, weights_only=False)
+            raw_model = torch.load(model_path, weights_only=False)
+            raw_optimizer = torch.load(optimizer_path, weights_only=False)
+            if not isinstance(raw_model, dict) or not raw_model:
+                raise CheckpointContractError(
+                    f"actor rank {rank} model shard is empty or unreadable"
+                )
+            if not isinstance(raw_optimizer, dict) or not raw_optimizer:
+                raise CheckpointContractError(
+                    f"actor rank {rank} optimizer shard is empty or unreadable"
+                )
+            validate_reproduction_rank_extra_state(
+                raw_extra,
+                expected_global_step=state.global_step,
+            )
+            validate_scheduler_optimizer_alignment(
+                raw_extra["lr_scheduler"],
+                raw_optimizer,
+                expected_global_step=state.global_step,
+            )
+            if json_safe_state_sha256(raw_extra["rng"]) != item["rng_state_sha256"]:
+                raise CheckpointContractError(
+                    f"actor rank {rank} raw RNG state hash mismatch"
+                )
+            if json_safe_state_sha256(raw_extra["lr_scheduler"]) != item["lr_scheduler_sha256"]:
+                raise CheckpointContractError(
+                    f"actor rank {rank} lr_scheduler state hash mismatch"
+                )
+            del raw_model, raw_optimizer, raw_extra
+        return dataloader_state, driver_rng_state
+
+    def _save_reproduction_checkpoint(self):
+        checkpoint_root = Path(self.config.trainer.default_local_dir).expanduser().resolve()
+        destination = checkpoint_root / f"global_step_{self.global_steps}"
+        actor_identity = self._get_reproduction_actor_identity()
+        published_state = {}
+
+        def writer(staging: Path) -> None:
+            rank_metadata = self.actor_rollout_wg.save_checkpoint(
+                str(staging / "actor"),
+                None,
+                self.global_steps,
+                max_ckpt_to_keep=None,
+                reproduction=True,
+            )
+            if self.use_critic:
+                self.critic_wg.save_checkpoint(
+                    str(staging / "critic"),
+                    None,
+                    self.global_steps,
+                    max_ckpt_to_keep=None,
+                )
+            dataloader_state = self.train_dataloader.state_dict()
+            driver_rng_state = capture_process_rng_state()
+            torch.save(dataloader_state, staging / "data.pt")
+            torch.save(driver_rng_state, staging / "driver_rng.pt")
+            extra_state = self._create_reproduction_extra_state(
+                global_step=self.global_steps,
+                actor_identity=actor_identity,
+                rank_save_metadata=rank_metadata,
+                dataloader_state=dataloader_state,
+                driver_rng_state=driver_rng_state,
+            )
+            extra_state.save(staging / EXTRA_STATE_FILENAME)
+            published_state["extra"] = extra_state
+
+        def validator(staging: Path) -> None:
+            state = published_state.get("extra")
+            if state is None:
+                raise CheckpointContractError(
+                    "checkpoint writer did not produce reproduction extra-state"
+                )
+            self._validate_reproduction_checkpoint_artifacts(
+                staging,
+                state,
+                verify_directory=False,
+            )
+
+        atomic_publish_directory(
+            destination,
+            writer,
+            validator=validator,
+            marker_metadata={
+                "artifact_type": "reproduction_training_checkpoint",
+                "global_step": self.global_steps,
+            },
+        )
+        atomic_write_text(
+            checkpoint_root / "latest_checkpointed_iteration.txt",
+            str(self.global_steps),
+        )
+        if self.config.reproduction.get("export_adapter_on_save", False):
+            self._export_reproduction_adapter(
+                published_state["extra"],
+                checkpoint_root,
+            )
+        return destination
+
+    def _export_reproduction_adapter(
+        self,
+        checkpoint_state: CheckpointExtraState,
+        checkpoint_root: Path,
+    ) -> Path:
+        configured_root = self.config.reproduction.get("adapter_export_dir")
+        if configured_root is None:
+            export_root = checkpoint_root / "exports"
+        else:
+            export_root = Path(configured_root).expanduser().resolve()
+        destination = export_root / f"global_step_{self.global_steps}" / "adapter"
+        results = self.actor_rollout_wg.export_reproduction_adapter(
+            str(destination),
+            checkpoint_state.to_dict(),
+            str(self.config.actor_rollout_ref.model.path),
+            self.config.actor_rollout_ref.model.revision,
+            self.config.reproduction.template_revision,
+        )
+        if not isinstance(results, (list, tuple)):
+            raise CheckpointContractError(
+                "actor workers returned invalid adapter export metadata"
+            )
+        rank_zero_results = [item for item in results if item is not None]
+        if len(rank_zero_results) != 1:
+            raise CheckpointContractError(
+                "adapter export must return exactly one rank-zero metadata record"
+            )
+        expected_metadata = AdapterExportMetadata.from_dict(rank_zero_results[0])
+        validate_adapter_export(
+            destination,
+            expected_metadata=expected_metadata,
+        )
+        return destination
+
+    def _load_reproduction_checkpoint(
+        self,
+        checkpoint_root: str | Path,
+        expected_global_step: int,
+    ) -> None:
+        root = Path(checkpoint_root)
+        _, state = verify_reproduction_checkpoint_directory(root)
+        if state.global_step != expected_global_step:
+            raise CheckpointContractError(
+                "checkpoint directory global_step does not match reproduction extra-state"
+            )
+        actor_identity = self._get_reproduction_actor_identity()
+        build_metadata = actor_identity["build_metadata"]
+        current_lora_config = OmegaConf.to_container(
+            self.config.actor_rollout_ref.actor.lora,
+            resolve=True,
+            enum_to_str=True,
+        )
+        current_resolved_config = to_json_safe_state(
+            OmegaConf.to_container(
+                self.config,
+                resolve=True,
+                enum_to_str=True,
+            )
+        )
+        validate_checkpoint_compatibility(
+            state,
+            base_model_id=str(self.config.actor_rollout_ref.model.path),
+            base_model_revision=self.config.actor_rollout_ref.model.revision,
+            text_mapping=build_metadata.get("qwen35_mapping"),
+            lora_config=current_lora_config,
+            lora_target_manifest=build_metadata.get("lora_target_manifest"),
+            model_build_metadata=build_metadata,
+            resolved_config=current_resolved_config,
+            data_manifest_sha256=self.config.reproduction.data_manifest_sha256,
+        )
+        dataloader_state, driver_rng_state = (
+            self._validate_reproduction_checkpoint_artifacts(
+                root,
+                state,
+                verify_directory=False,
+            )
+        )
+        try:
+            loaded_adapter_metadata = self.actor_rollout_wg.load_checkpoint(
+                str(root / "actor"),
+                del_local_after_load=False,
+                reproduction=True,
+                expected_global_step=expected_global_step,
+            )
+            loaded_records = [
+                item for item in loaded_adapter_metadata if item is not None
+            ]
+            if len(loaded_records) != 1:
+                raise CheckpointContractError(
+                    "resume did not return exactly one loaded adapter hash"
+                )
+            loaded_record = loaded_records[0]
+            if tuple(loaded_record.get("adapter_tensor_keys", ())) != state.adapter_tensor_keys:
+                raise CheckpointContractError(
+                    "loaded adapter tensor keys differ from checkpoint extra-state"
+                )
+            if loaded_record.get("adapter_state_sha256") != state.adapter_state_sha256:
+                raise CheckpointContractError(
+                    "loaded adapter semantic hash differs from checkpoint extra-state"
+                )
+            if self.use_critic:
+                self.critic_wg.load_checkpoint(
+                    str(root / "critic"),
+                    del_local_after_load=False,
+                )
+            self.train_dataloader.load_state_dict(dataloader_state)
+            restore_process_rng_state(driver_rng_state)
+        except Exception as exc:
+            raise RuntimeError(
+                "fatal reproduction resume failure after state mutation; "
+                "terminate this process instead of continuing training"
+            ) from exc
+        self.global_steps = expected_global_step
+
     def _save_checkpoint_best_val(self):
         # Remove old best models
         local_dir = self.config.trainer.default_local_dir
@@ -946,6 +1712,11 @@ class RayPPOTrainer:
             shutil.rmtree(old_model_path)
 
     def _save_checkpoint(self):
+        if self.reproduction_checkpoint_enabled:
+            destination = self._save_reproduction_checkpoint()
+            print(f"Published reproduction checkpoint: {destination}")
+            return
+
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
 
@@ -1005,7 +1776,22 @@ class RayPPOTrainer:
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
         print(f"Load from checkpoint folder: {global_step_folder}")
-        # set global step
+        if self.reproduction_checkpoint_enabled:
+            if not os.path.isabs(global_step_folder):
+                raise CheckpointContractError(
+                    "formal reproduction checkpoint path must be absolute"
+                )
+            checkpoint_global_step = self._checkpoint_step_from_path(
+                global_step_folder
+            )
+            self._load_reproduction_checkpoint(
+                global_step_folder,
+                checkpoint_global_step,
+            )
+            print(f"Resumed verified reproduction checkpoint at step {self.global_steps}")
+            return
+
+        # Preserve the historical parsing behavior for non-reproduction runs.
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
         print(f"Setting global step to {self.global_steps}")
@@ -1151,6 +1937,20 @@ class RayPPOTrainer:
                                 raise NotImplementedError("REMAX is not implemented for recurrent.")
                             batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                                     dtype=object)
+                            capture_step_zero = self._should_record_step_zero_fingerprint()
+                            if capture_step_zero:
+                                sample_ids = gen_batch.non_tensor_batch.get(
+                                    "manifest_qa_id"
+                                )
+                                if sample_ids is None:
+                                    raise CheckpointContractError(
+                                        "step-zero evidence requires ordered manifest QA IDs"
+                                    )
+                                ordered_step_zero_sample_ids = (
+                                    sample_ids.tolist()
+                                    if hasattr(sample_ids, "tolist")
+                                    else list(sample_ids)
+                                )
                             # Note that we repeat outside the loop, since the generated responses are not aligned and we cannot
                             # simply union them.
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
@@ -1164,6 +1964,14 @@ class RayPPOTrainer:
                                 )
 
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop_revisit(gen_batch, timing_raw)
+
+                            if capture_step_zero:
+                                self._record_step_zero_fingerprint(
+                                    ordered_sample_ids=ordered_step_zero_sample_ids,
+                                    sampled_token_rows=gen_batch_output.batch[
+                                        "responses"
+                                    ].detach().cpu().tolist(),
+                                )
 
                             assert final_mask.sum().item() == len(batch.batch), \
                                 "The number of final responses should be equal to the number of prompts." \

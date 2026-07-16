@@ -195,6 +195,20 @@ def test_run_seed_wiring_populates_data_model_and_rollout(monkeypatch):
     assert config.actor_rollout_ref.rollout.seed == seeds.rollout == 2924589348
 
 
+def test_formal_data_cannot_disable_all_reproduction_guards_by_omitting_seed(
+    monkeypatch,
+):
+    apply_contract, omegaconf = _load_seed_wiring_function(monkeypatch)
+    config = omegaconf.OmegaConf.create(
+        {
+            "reproduction": {"formal_data": True, "run_seed": None},
+        }
+    )
+
+    with pytest.raises(ValueError, match="formal_data=true requires"):
+        apply_contract(config)
+
+
 def test_run_seed_wiring_rejects_an_inconsistent_explicit_derivation(monkeypatch):
     apply_contract, omegaconf = _load_seed_wiring_function(monkeypatch)
     config = omegaconf.OmegaConf.create(
