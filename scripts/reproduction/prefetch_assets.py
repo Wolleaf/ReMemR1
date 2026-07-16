@@ -204,24 +204,57 @@ def _stream_digest(path: Path, algorithm: str, *, git_blob_size: int | None = No
     return digest.hexdigest()
 
 
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    identity = (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+    # Windows reports st_ctime_ns inconsistently between stat() and fstat().
+    return identity if os.name == "nt" else (*identity, value.st_ctime_ns)
+
+
 def verify_cached_file(path: str | Path, file_spec: Mapping[str, Any]) -> dict[str, Any]:
     cache_path = Path(path)
     try:
-        observed_size = cache_path.stat().st_size
+        path_before = cache_path.stat()
+        handle = cache_path.open("rb")
     except OSError as exc:
         raise AssetIntegrityError(f"cached file is unavailable: {exc}") from exc
+    observed_size = path_before.st_size
     expected_size = file_spec["size"]
     if observed_size != expected_size:
+        handle.close()
         raise AssetIntegrityError(f"size mismatch: expected {expected_size}, observed {observed_size}")
 
-    if "sha256" in file_spec:
-        algorithm = "sha256"
-        expected_digest = file_spec["sha256"]
-        observed_digest = _stream_digest(cache_path, algorithm)
-    else:
-        algorithm = "git_blob_sha1"
-        expected_digest = file_spec["git_blob_sha1"]
-        observed_digest = _stream_digest(cache_path, "sha1", git_blob_size=expected_size)
+    try:
+        descriptor_before = os.fstat(handle.fileno())
+        if _stat_identity(descriptor_before) != _stat_identity(path_before):
+            raise AssetIntegrityError("cached file changed before hashing")
+        if "sha256" in file_spec:
+            algorithm = "sha256"
+            digest = hashlib.sha256()
+            expected_digest = file_spec["sha256"]
+        else:
+            algorithm = "git_blob_sha1"
+            digest = hashlib.sha1()
+            digest.update(f"blob {expected_size}\0".encode("ascii"))
+            expected_digest = file_spec["git_blob_sha1"]
+        for chunk in iter(lambda: handle.read(_CHUNK_SIZE), b""):
+            digest.update(chunk)
+        descriptor_after = os.fstat(handle.fileno())
+        if _stat_identity(descriptor_after) != _stat_identity(descriptor_before):
+            raise AssetIntegrityError("cached file changed while hashing")
+        observed_digest = digest.hexdigest()
+    finally:
+        handle.close()
+    try:
+        path_after = cache_path.stat()
+    except OSError as exc:
+        raise AssetIntegrityError(f"cached file disappeared after hashing: {exc}") from exc
+    if _stat_identity(path_after) != _stat_identity(path_before):
+        raise AssetIntegrityError("cached file path changed while hashing")
     if observed_digest != expected_digest:
         raise AssetIntegrityError(
             f"{algorithm} mismatch: expected {expected_digest}, observed {observed_digest}"
@@ -324,12 +357,14 @@ def _materialize_qwen35_snapshot(
                     f"cannot materialize incomplete cached file {file_spec['path']!r}"
                 )
             source = Path(result["_cached_path"])
+            verify_cached_file(source, file_spec)
             target = staging.joinpath(*PurePosixPath(file_spec["path"]).parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.link(source.resolve(strict=True), target)
             except OSError:
                 shutil.copy2(source, target)
+            verify_cached_file(target, file_spec)
             sha256 = _stream_digest(target, "sha256")
             manifest_files[file_spec["path"]] = {
                 "sha256": sha256,
@@ -423,7 +458,9 @@ def prefetch_assets(
                     "status": "incomplete",
                 }
         for result in file_results:
-            result.pop("_cached_path", None)
+            cached_path = result.pop("_cached_path", None)
+            if cached_path is not None:
+                result["cached_path"] = str(Path(cached_path).resolve(strict=True))
         complete = complete and asset_complete
         asset_result = {
             "asset_id": asset_id,

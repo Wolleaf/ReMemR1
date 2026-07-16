@@ -1,0 +1,25 @@
+# Exact direct dependencies imported by the repository but not listed in the
+# scientific CUDA lock. The complete transitive environment is frozen and
+# hashed by scripts/cloud/install_env.sh after installation.
+accelerate==1.14.0
+aiohttp==3.12.15
+cachetools==6.1.0
+codetiming==1.4.0
+dill==0.4.1
+einops==0.8.1
+fastapi==0.116.1
+filelock==3.19.1
+numpy==2.3.5
+ninja==1.13.0
+openai==1.102.0
+pandas==2.3.2
+psutil==7.0.0
+pyarrow==21.0.0
+pytest==9.1.1
+PyYAML==6.0.3
+safetensors==0.6.2
+setuptools==80.9.0
+tqdm==4.67.1
+uvicorn==0.35.0
+uvloop==0.21.0
+wheel==0.45.1
