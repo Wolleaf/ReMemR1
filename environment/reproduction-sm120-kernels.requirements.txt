@@ -1,0 +1,6 @@
+# Install only after the core environment, using --no-build-isolation and with
+# CUDA_HOME pointing at CUDA 13.0. Installation alone does not open the GPU gate:
+# both commits remain UNVERIFIED until build, BF16 forward/backward, and repeated
+# optimizer-loop evidence has been recorded on compute capability 12.0.
+flash-linear-attention[cuda] @ git+https://github.com/fla-org/flash-linear-attention.git@b328e7c611ca205d1908cce9a90b8ca223fc0101
+causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@4f6ae4e26ae5fe8af9372f8d312ab25cc4595223

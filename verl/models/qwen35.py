@@ -62,6 +62,9 @@ _SNAPSHOT_MANIFEST_KEYS = frozenset(
 _SNAPSHOT_MANIFEST_FILE_KEYS = frozenset({"sha256", "size"})
 _MAX_SNAPSHOT_MANIFEST_BYTES = 16 * 1024 * 1024
 _HASH_CHUNK_BYTES = 8 * 1024 * 1024
+_MODEL_WEIGHT_FILENAME_PATTERN = re.compile(
+    r"^(?:model-\d{5}-of-\d{5}|model\.safetensors-\d{5}-of-\d{5})\.safetensors$"
+)
 _AUTO_CONFIG_FORWARD_KWARGS = frozenset(
     {
         "cache_dir",
@@ -590,8 +593,8 @@ def _validate_snapshot_manifest(
         PurePosixPath(relative_path).parent == PurePosixPath(".")
         and (
             PurePosixPath(relative_path).name == "model.safetensors"
-            or re.fullmatch(
-                r"model-\d+-of-\d+\.safetensors", PurePosixPath(relative_path).name
+            or _MODEL_WEIGHT_FILENAME_PATTERN.fullmatch(
+                PurePosixPath(relative_path).name
             )
         )
         for relative_path in normalized_entries

@@ -1,0 +1,48 @@
+{
+  "build_info_sha256": "ce1ba282730ffb0b4e4d780caae1ee5584db8a85753e692994ca448812d7f2ce",
+  "environment_lock_sha256": "5e02dd0d1ade78bc56a5ae9615958decb6bde1e76a87be8c21f15d5dad272c2e",
+  "kernels": {
+    "causal-conv1d": {
+      "bf16_backward_log_sha256": "UNVERIFIED",
+      "bf16_forward_log_sha256": "UNVERIFIED",
+      "build_log_sha256": "UNVERIFIED",
+      "commit": "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223",
+      "optimizer_loop_log_sha256": "UNVERIFIED",
+      "repository": "https://github.com/Dao-AILab/causal-conv1d.git",
+      "status": "UNVERIFIED"
+    },
+    "flash-linear-attention": {
+      "bf16_backward_log_sha256": "UNVERIFIED",
+      "bf16_forward_log_sha256": "UNVERIFIED",
+      "build_log_sha256": "UNVERIFIED",
+      "commit": "b328e7c611ca205d1908cce9a90b8ca223fc0101",
+      "optimizer_loop_log_sha256": "UNVERIFIED",
+      "repository": "https://github.com/fla-org/flash-linear-attention.git",
+      "status": "UNVERIFIED"
+    }
+  },
+  "packages": {
+    "datasets": "UNVERIFIED",
+    "huggingface-hub": "UNVERIFIED",
+    "hydra-core": "UNVERIFIED",
+    "omegaconf": "UNVERIFIED",
+    "peft": "UNVERIFIED",
+    "ray": "UNVERIFIED",
+    "tensordict": "UNVERIFIED",
+    "torch": "UNVERIFIED",
+    "torchdata": "UNVERIFIED",
+    "transformers": "UNVERIFIED"
+  },
+  "pip_freeze_sha256": "UNVERIFIED",
+  "python": "UNVERIFIED",
+  "schema_version": 1,
+  "status": "UNVERIFIED",
+  "system": {
+    "cuda_runtime": "UNVERIFIED",
+    "driver_version": "UNVERIFIED",
+    "gpu_compute_capability": "UNVERIFIED",
+    "gpu_name": "UNVERIFIED",
+    "operating_system": "UNVERIFIED"
+  },
+  "training_gate": "BLOCKED"
+}

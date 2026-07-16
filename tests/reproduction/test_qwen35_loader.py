@@ -433,6 +433,37 @@ def test_hdfs_style_copy_is_accepted_only_with_fully_verified_manifest(monkeypat
     assert _FakeAutoModelForCausalLM.calls[0][0] == str(local_path)
 
 
+@pytest.mark.parametrize(
+    "weight_name",
+    (
+        "model-00001-of-00002.safetensors",
+        "model.safetensors-00001-of-00002.safetensors",
+    ),
+)
+def test_snapshot_manifest_accepts_both_official_shard_filename_forms(tmp_path, weight_name):
+    local_path = tmp_path / "exported-snapshot"
+    local_path.mkdir()
+    (local_path / "config.json").write_text("{}", encoding="utf-8")
+    (local_path / weight_name).write_bytes(b"weights")
+    _write_snapshot_manifest(local_path)
+
+    evidence = qwen35.validate_qwen35_revision_source(local_path, QWEN35_4B_REVISION)
+
+    assert evidence.kind == "verified_snapshot_manifest"
+    assert evidence.verified_file_count == 2
+
+
+def test_snapshot_manifest_rejects_arbitrary_weight_filename(tmp_path):
+    local_path = tmp_path / "exported-snapshot"
+    local_path.mkdir()
+    (local_path / "config.json").write_text("{}", encoding="utf-8")
+    (local_path / "weights-00001-of-00002.safetensors").write_bytes(b"weights")
+    _write_snapshot_manifest(local_path)
+
+    with pytest.raises(qwen35.Qwen35RevisionError, match="must include model.safetensors"):
+        qwen35.validate_qwen35_revision_source(local_path, QWEN35_4B_REVISION)
+
+
 def test_snapshot_manifest_rejects_tampered_weight_bytes(tmp_path):
     local_path = tmp_path / "exported-snapshot"
     local_path.mkdir()

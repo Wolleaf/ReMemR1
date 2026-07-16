@@ -1,0 +1,100 @@
+{
+  "kernels": [
+    {
+      "commit": "b328e7c611ca205d1908cce9a90b8ca223fc0101",
+      "distribution": "flash-linear-attention",
+      "name": "flash-linear-attention",
+      "repository": "https://github.com/fla-org/flash-linear-attention.git",
+      "required_evidence": [
+        "build_log_sha256",
+        "bf16_forward_log_sha256",
+        "bf16_backward_log_sha256",
+        "optimizer_loop_log_sha256"
+      ],
+      "training_gate": "BLOCKED",
+      "verification_status": "UNVERIFIED"
+    },
+    {
+      "commit": "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223",
+      "distribution": "causal-conv1d",
+      "name": "causal-conv1d",
+      "repository": "https://github.com/Dao-AILab/causal-conv1d.git",
+      "required_evidence": [
+        "build_log_sha256",
+        "bf16_forward_log_sha256",
+        "bf16_backward_log_sha256",
+        "optimizer_loop_log_sha256"
+      ],
+      "training_gate": "BLOCKED",
+      "verification_status": "UNVERIFIED"
+    }
+  ],
+  "lock_sha256": "5e02dd0d1ade78bc56a5ae9615958decb6bde1e76a87be8c21f15d5dad272c2e",
+  "packages": [
+    {
+      "name": "torch",
+      "version": "2.11.0+cu130"
+    },
+    {
+      "name": "transformers",
+      "version": "5.14.0"
+    },
+    {
+      "name": "peft",
+      "version": "0.19.1"
+    },
+    {
+      "name": "ray",
+      "version": "2.56.0"
+    },
+    {
+      "name": "hydra-core",
+      "version": "1.3.4"
+    },
+    {
+      "name": "omegaconf",
+      "version": "2.3.1"
+    },
+    {
+      "name": "tensordict",
+      "version": "0.13.0"
+    },
+    {
+      "name": "torchdata",
+      "version": "0.11.0"
+    },
+    {
+      "name": "datasets",
+      "version": "5.0.0"
+    },
+    {
+      "name": "huggingface-hub",
+      "version": "1.23.0"
+    }
+  ],
+  "platform": {
+    "cuda_toolkit": "13.0",
+    "gpu_compute_capability": [
+      12,
+      0
+    ],
+    "operating_system": "Ubuntu 22.04",
+    "python": "3.12.2",
+    "torch_index_url": "https://download.pytorch.org/whl/cu130"
+  },
+  "requirements": [
+    {
+      "normalized_content_sha256": "b8552a6f2737dca3f70cb4b794cb5bea94a482aec06a620d246a1276523f8724",
+      "path": "environment/reproduction-cu130.requirements.txt"
+    },
+    {
+      "normalized_content_sha256": "5110a2f9e5ec47023f0bbf73b2aa0c34539970506f0d7769446ef38d4d5ff998",
+      "path": "environment/reproduction-sm120-kernels.requirements.txt"
+    }
+  ],
+  "schema_version": 1,
+  "transitive_freeze": {
+    "artifact": "pip-freeze.txt",
+    "status": "REQUIRED_AFTER_GPU_INSTALL"
+  }
+}
