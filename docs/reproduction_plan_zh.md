@@ -1,5 +1,9 @@
 # ReMemR1 缩小复现方案（Qwen3.5 版）
 
+> **历史文档，已停止维护。** 本文记录的是早期“2B 全参数为主、4B 可选”的分析，
+> 已被 [final_reproduction_plan_zh.md](./final_reproduction_plan_zh.md) 取代。
+> 后续实现、训练、预算和对外表述不得再以本文的模型定位或参数为准。
+
 > 平台：AutoDL  
 > 推荐主硬件：1 张 RTX PRO 6000 Blackwell 96GB  
 > 低成本/环境验证硬件：1 张 RTX 5090 32GB  
@@ -116,7 +120,7 @@ Qwen3.5 的主要层不是普通 full attention。正式训练前必须满足：
 | G-1 | 无 GPU/CPU | HF rollout 接口、完整 Hydra config、callback modes、HF eval runner | 单元测试 | 清除当前代码的确定性阻塞 |
 | G0 | 0.8B | 单状态、短序列 | 20 个优化循环 | 验证 Torch、GDN、FLA、BF16 和 Blackwell 稳定性 |
 | G1 | 0.8B | 2 chunks、group 4、输出 128-256 | 1 step + 1 个恢复 step | 覆盖 rollout、reward、backward、保存、恢复续训、合并、评测 |
-| G2 | 2B | 正式长度、group 4 后升 8 | 3 steps | 测显存、吞吐和费用，决定 5090 或 PRO 6000 |
+| G2 | 2B | 两个独立容量任务：group 4 x 1 step；group 8 x 2 steps | 合计 3 steps | 测显存、吞吐和费用，决定 5090 或 PRO 6000 |
 
 G-1 到 G2 任何一项失败都不进入正式计费训练。G-1 中可以做纯 CPU 的接口和 Hydra 解析测试；需要模型 forward 的部分放到 G0/G1。
 
@@ -202,7 +206,7 @@ A 必须从 prompt/action space 中移除 recall 行为，并且不把历史检�
 | PPO micro batch / GPU | 未单列 | 1 |
 | 总步数 | 200-300 | 80；预算允许同步续到 120 |
 | actor learning rate | `1e-6` | `1e-6` |
-| warmup | 20 steps | 8 steps；120-step 版本可为 12 |
+| warmup | 20 steps | 固定 8 steps；分段 resume 时不得改变 |
 | KL coefficient | 0.001 | 0.001 |
 | clip ratio | 0.2 | 0.2 |
 | rollout temperature | 1.0 | 1.0 |
@@ -222,7 +226,7 @@ GRPO group 优先保留 8。最终答案奖励接近二值，group 太小容易�
 |---|---:|---:|---:|---:|
 | GPU world size | 1 | 1 | 1 | 2 |
 | train batch | 1 | 1 | 4 | 2 |
-| rollout group `n` | 4 | 第 1 step 为 4，后 2 steps 为 8 | 8 | 8 |
+| rollout group `n` | 4 | G2a 为 4；独立 G2b 为 8 | 8 | 8 |
 | PPO mini batch | 1 | 1 | 4 | 2 |
 | PPO micro batch / GPU | 1 | 1 | 1 | 1 |
 | actor/ref log-prob micro batch / GPU | 1 | 1 | 1 | 1 |
@@ -230,7 +234,7 @@ GRPO group 优先保留 8。最终答案奖励接近二值，group 太小容易�
 | chunk size | 1024 | 5000 | 5000 | 5000 |
 | chunks | 2 | 6 | 6 | 6 |
 | response length | 128-256 | 512 | 512 | 512 |
-| steps | 1 + 1 个 resume smoke | 3 | 分段 40 -> 80，按门控续到 120 | 先 3，再决定 |
+| steps | 1 + 1 个 resume smoke | G2a 为 1；独立 G2b 为 2 | 分段 40 -> 80，按门控续到 120 | 先 3，再决定 |
 
 本仓库校验的是 prompt-level `train_batch_size >= ppo_mini_batch_size`，因此不能把单卡 train batch 1 与 PPO mini batch 4 混用。若后续把 PRO 6000 的 train batch 提到 8，PPO mini batch 同步提到 8；所有条件保持相同。
 
@@ -238,14 +242,14 @@ GRPO group 优先保留 8。最终答案奖励接近二值，group 太小容易�
 
 ### 5.3 完整配置文件要求
 
-下列内容是配置约束，不是可直接复制的零散命令。实施阶段必须生成并版本化完整的 G1、G2、A、B、C 配置文件；不存在于当前 schema 的 `callback_mode`、`rollout.micro_batch_size`、`model_dtype`、`mixed_precision` 应先加入配置 schema，或在 Hydra CLI 中使用 `+` 前缀。
+下列内容是配置约束，不是可直接复制的零散命令。实施阶段必须生成并版本化完整的 G1、G2a、G2b、A、B、C 配置文件；不存在于当前 schema 的 `callback_mode`、`rollout.micro_batch_size`、`model_dtype`、`mixed_precision` 应先加入配置 schema，或在 Hydra CLI 中使用 `+` 前缀。
 
 每份配置至少显式覆盖：
 
 ```text
 trainer.nnodes=1
 trainer.n_gpus_per_node=<1或2>
-trainer.total_training_steps=<G1首段为1、恢复段为2；G2为3；正式分段为40/80/120>
+trainer.total_training_steps=<G1首段为1、恢复段为2；G2a为1；G2b为2；正式分段为40/80/120>
 trainer.total_epochs=1
 trainer.save_freq=<G1为1；G2为-1；80/120-step正式训练为40；50-step降级版为25或50>
 trainer.test_freq=-1
@@ -305,7 +309,7 @@ actor_rollout_ref.actor.use_kl_loss=true
 actor_rollout_ref.actor.kl_loss_coef=0.001
 actor_rollout_ref.actor.kl_loss_type=low_var_kl
 actor_rollout_ref.actor.optim.lr=1e-6
-actor_rollout_ref.actor.optim.lr_warmup_steps=<smoke为0；80-step为8；120-step为12>
+actor_rollout_ref.actor.optim.lr_warmup_steps=<smoke为0；正式所有分段固定为8>
 actor_rollout_ref.actor.fsdp_config.fsdp_size=<实际GPU数>
 actor_rollout_ref.actor.fsdp_config.param_offload=<按5.4节硬件策略>
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=<按5.4节硬件策略>
@@ -620,7 +624,7 @@ forward -> loss -> backward -> optimizer.step -> zero_grad
 
 ### 10.4 G2：2B 三步容量测试
 
-先 group 4 跑 1 step，再升到 group 8 跑 2 steps。使用正式的 `5000 x 6` 与输出 512，记录：
+从同一基础 checkpoint 启动两个独立任务：G2a 使用 group 4 跑 1 step，G2b 使用 group 8 跑 2 steps；二者都设置 `save_freq=-1`，使用正式的 `5000 x 6` 与输出 512，并分别记录：
 
 - 中位 step time。
 - rollout、reward、log-prob、update 各阶段耗时。
@@ -820,7 +824,7 @@ active_indices = self.active_mask.nonzero().squeeze().cpu().numpy()
 ### 15.1 工程验收
 
 - G-1 的 HF rollout 接口、三种 callback modes、Transformers eval runner 和 Ray 临时盘测试全部通过。
-- G1/G2/A/B/C 的完整 Hydra 配置可 `--cfg job --resolve`，且没有残留 8-GPU、GAE、大 batch 或 30-epoch 默认值。
+- G1/G2a/G2b/A/B/C 的完整 Hydra 配置可 `--cfg job --resolve`，且没有残留 8-GPU、GAE、大 batch 或 30-epoch 默认值。
 - 0.8B 连续 20 个优化循环无 hang/NaN。
 - 2B 至少完成 3 个正式长度 RL steps。
 - callback、reward、backward、checkpoint、合并、重载、单条评测全部通过。
@@ -843,7 +847,7 @@ active_indices = self.active_mask.nonzero().squeeze().cpu().numpy()
 - AutoDL 无 GPU 准备脚本。
 - `remem-hf` lock 与可选 `remem-engine` lock。
 - Qwen3.5 模型加载、template、padding、HF rollout、merger 适配及测试。
-- G1/G2/A/B/C 的完整配置，以及 5090/PRO 6000 资源变体。
+- G1/G2a/G2b/A/B/C 的完整配置，以及 5090/PRO 6000 资源变体。
 - 固定 train/validation/eval manifests。
 - 单独的 sequential agent 与统一 `callback_mode`，预算版至少支持 B/C。
 - learned/no/fixed callback 推理消融及确定性测试。
