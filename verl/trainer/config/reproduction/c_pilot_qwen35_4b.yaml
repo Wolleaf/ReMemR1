@@ -1,0 +1,28 @@
+# @package _global_
+defaults:
+  - /reproduction/c40_qwen35_4b
+  - _self_
+
+reproduction:
+  step_zero_fingerprint_path: /root/autodl-tmp/rememr1/evidence/pilots/qwen35-4b-lora-r32/C/seed42/run-20260716-c-pilot/step_zero_fingerprint.json
+  step_zero_reference_path: /root/autodl-tmp/rememr1/evidence/pilots/qwen35-4b-lora-r32/B/seed42/run-20260716-b-pilot/step_zero_fingerprint.json
+  adapter_export_dir: /root/autodl-tmp/rememr1/artifacts/pilots/qwen35-4b-lora-r32/C/seed42/run-20260716-c-pilot/adapter
+
+actor_rollout_ref:
+  actor:
+    optim:
+      total_training_steps: 1
+
+critic:
+  optim:
+    total_training_steps: 1
+
+trainer:
+  total_training_steps: 1
+  experiment_name: qwen35-4b-lora-r32-C-pilot-seed42-run-20260716
+  rollout_data_dir: /root/autodl-tmp/rememr1/logs/pilots/qwen35-4b-lora-r32/C/seed42/run-20260716-c-pilot/rollouts
+  validation_data_dir: /root/autodl-tmp/rememr1/logs/pilots/qwen35-4b-lora-r32/C/seed42/run-20260716-c-pilot/validation
+  save_freq: 1
+  resume_mode: disable
+  resume_from_path: null
+  default_local_dir: /root/autodl-tmp/rememr1/checkpoints/pilots/qwen35-4b-lora-r32/C/seed42/run-20260716-c-pilot

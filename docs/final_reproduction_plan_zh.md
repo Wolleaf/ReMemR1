@@ -748,7 +748,7 @@ SGLang、Qwen2 patch、大 batch、默认 GSM8K 路径或空的正式 resume pat
 14. 实现 Transformers recurrent eval runner、硬超时和失败退出；
 15. 实现多合法答案取最大分的 EM/F1/substring evaluator；
 16. 实现 resumable FSDP checkpoint、adapter export、merge/reload；
-17. 生成 G0、G1-step1/resume2、G2a、G2b-step1/resume2、B40/C40/B80/C80 完整配置；
+17. 生成 G0、G1-step1/resume2、G2a、G2b-step1/resume2、B/C pilot、B40/C40/B80/C80 完整配置；
 18. 对每份配置运行 `--cfg job --resolve`；
 19. CPU 实例化 formal dataset，确认 truncation、schema、嵌套 manifest 和 provenance 全部通过。
 
@@ -1122,6 +1122,8 @@ configs/reproduction/g1_resume2_qwen35_2b_lora.yaml
 configs/reproduction/g2a_qwen35_4b_lora.yaml
 configs/reproduction/g2b_step1_qwen35_4b_lora.yaml
 configs/reproduction/g2b_resume2_qwen35_4b_lora.yaml
+configs/reproduction/b_pilot_qwen35_4b_lora.yaml
+configs/reproduction/c_pilot_qwen35_4b_lora.yaml
 configs/reproduction/b40_qwen35_4b_lora.yaml
 configs/reproduction/c40_qwen35_4b_lora.yaml
 configs/reproduction/b80_qwen35_4b_lora.yaml

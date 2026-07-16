@@ -1,0 +1,212 @@
+# @package _global_
+defaults:
+  - /ppo_trainer
+  - _self_
+
+# Replace the zero digest with the sealed gate bundle manifest SHA-256.
+data:
+  train_files: /root/autodl-tmp/rememr1/data/gates/g1/train/train.parquet
+  val_files: /root/autodl-tmp/rememr1/data/gates/g1/validation/train.parquet
+  context_key: context
+  max_prompt_length: 2048
+  max_response_length: 1024
+  train_batch_size: 1
+  val_batch_size: null
+  seed: 1938833696
+  shuffle: false
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 1
+  dataloader_num_workers: 1
+  truncation: center
+
+reproduction:
+  run_seed: 42
+  formal_data: false
+  data_seed: 1938833696
+  model_init_seed: 1767863184
+  rollout_seed: 2924589348
+  data_manifest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  data_manifest_mode: train
+  data_manifest_profile: fixture
+  val_data_manifest_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+  val_data_manifest_mode: train
+  val_data_manifest_profile: fixture
+  export_adapter_on_save: true
+  adapter_export_dir: /root/autodl-tmp/rememr1/artifacts/gates/g1-qwen35-2b/seed42/run-20260716-resume2/adapter
+  template_revision: rememr1-template-v1
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen3.5-2B
+    revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+    text_only: true
+    model_init_seed: 1767863184
+    attn_implementation: sdpa
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+    use_liger: false
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 1
+    ppo_micro_batch_size: null
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 4096
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: true
+    use_torch_compile: false
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ppo_epochs: 1
+    shuffle: false
+    ulysses_sequence_parallel_size: 1
+    checkpoint:
+      contents: [model, optimizer, extra]
+    lora:
+      enabled: true
+      rank: 32
+      alpha: 64
+      dropout: 0.0
+      bias: none
+      text_model_prefix: model
+    optim:
+      lr: 5.0e-6
+      lr_warmup_steps: 8
+      lr_warmup_steps_ratio: 0.0
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: 2
+      weight_decay: 0.01
+    fsdp_config:
+      root_only: true
+      use_orig_params: true
+      model_dtype: fp32
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+      param_offload: false
+      optimizer_offload: false
+      fsdp_size: 1
+  ref:
+    strategy: fsdp
+    fsdp_config:
+      root_only: true
+      use_orig_params: false
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+      param_offload: false
+    use_torch_compile: false
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: false
+    log_prob_max_token_len_per_gpu: 4096
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    name: hf
+    mode: sync
+    temperature: 1.0
+    top_k: 0
+    top_p: 1.0
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 4096
+    max_model_len: null
+    log_prob_micro_batch_size: null
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: false
+    log_prob_max_token_len_per_gpu: 4096
+    do_sample: true
+    micro_batch_size: 1
+    seed: 2924589348
+    n: 4
+    val_kwargs:
+      top_k: 0
+      top_p: 1.0
+      temperature: 0.0
+      n: 1
+      do_sample: false
+
+critic:
+  optim:
+    lr_warmup_steps: 8
+    lr_warmup_steps_ratio: 0.0
+    warmup_style: constant
+    total_training_steps: 2
+  ppo_mini_batch_size: 1
+  ppo_micro_batch_size: null
+  ppo_micro_batch_size_per_gpu: 1
+  use_dynamic_bsz: false
+
+reward_model:
+  enable: false
+  micro_batch_size: null
+  micro_batch_size_per_gpu: 1
+  reward_manager: thread
+  reward_metric: em
+
+algorithm:
+  alpha: 0.8
+  action_reweight: false
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  grpo_use_adv: false
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+trainer:
+  balance_batch: true
+  total_epochs: 1
+  total_training_steps: 2
+  project_name: rememr1-qwen35-reproduction
+  experiment_name: g1-qwen35-2b-resume2-seed42-run-20260716
+  logger: [console]
+  rollout_data_dir: /root/autodl-tmp/rememr1/logs/gates/g1-qwen35-2b/seed42/run-20260716-resume2/rollouts
+  validation_data_dir: /root/autodl-tmp/rememr1/logs/gates/g1-qwen35-2b/seed42/run-20260716-resume2/validation
+  nnodes: 1
+  n_gpus_per_node: 1
+  save_freq: 1
+  resume_mode: resume_path
+  resume_from_path: /root/autodl-tmp/rememr1/checkpoints/gates/g1-qwen35-2b/seed42/run-20260716-step1/global_step_1
+  val_before_train: false
+  test_freq: -1
+  default_hdfs_dir: null
+  del_local_ckpt_after_load: false
+  default_local_dir: /root/autodl-tmp/rememr1/checkpoints/gates/g1-qwen35-2b/seed42/run-20260716-resume2
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  save_best_val: false
+
+recurrent:
+  enable: memory
+  memory:
+    path: recurrent/impls/memory_revisit.py
+    name: REGISTER
+    config:
+      context_key: context
+      chunk_size: 1024
+      max_prompt_length: 1024
+      max_memorization_length: 256
+      max_chunks: 2
+      max_final_response_length: 256
+      callback_mode: learned
+      require_manifest: true
+      tokenizer_name: Qwen/Qwen3.5-2B
+      tokenizer_revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+
+ray_init:
+  num_cpus: 8
