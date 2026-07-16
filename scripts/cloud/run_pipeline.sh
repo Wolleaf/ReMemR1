@@ -156,17 +156,64 @@ CURRENT_STAGE="initialization"
 PIPELINE_FINISHED="no"
 STAGE_RUNNER="${REMEMR1_STAGE_RUNNER:-${REMEMR1_PROJECT_DIR}/scripts/cloud/run_stage.sh}"
 
+pipeline_test_event() {
+    local event_file="${REMEMR1_PIPELINE_TEST_EVENT_FILE:-}"
+    [[ "${REMEMR1_TEST_MODE:-no}" == "yes" && -n "${event_file}" ]] || return 0
+    case "${event_file}" in
+        "${PERSIST_REAL}/"*) ;;
+        *) return 1 ;;
+    esac
+    [[ ! -L "${event_file}" ]] || return 1
+    printf '%s\n' "$1" >> "${event_file}"
+}
+
+pipeline_sync_terminal() {
+    local marker="$1"
+    local point="$2"
+    local running="no"
+    [[ -f "${PIPELINE_DIR}/.running" ]] && running="yes"
+    pipeline_test_event "sync:${point}:${marker##*/}:begin:running=${running}" || return
+    if [[ "${REMEMR1_TEST_MODE:-no}" == "yes" &&
+          "${REMEMR1_PIPELINE_TEST_FAIL_SYNC_AT:-}" == "${point}" ]]; then
+        pipeline_test_event \
+            "sync:${point}:${marker##*/}:injected-failure:running=${running}" || true
+        return 75
+    fi
+    rememr1_sync_file "${marker}" || return
+    pipeline_test_event "sync:${point}:${marker##*/}:complete:running=${running}"
+}
+
+remove_running_after_terminal() {
+    local marker="$1"
+    local point="$2"
+    shift 2
+    rm -f -- "$@" || return
+    rm -f -- "${PIPELINE_DIR}/.running" || return
+    if ! pipeline_test_event "running-removed:${point}"; then
+        write_value "${PIPELINE_DIR}/.running" "$$" || true
+        return 1
+    fi
+    if ! pipeline_sync_terminal "${marker}" "${point}-after-cleanup"; then
+        write_value "${PIPELINE_DIR}/.running" "$$" || true
+        return 1
+    fi
+}
+
 pipeline_exit() {
     local rc="$?"
     trap - EXIT INT TERM
-    rm -f "${PIPELINE_DIR}/.running"
     if [[ "${PIPELINE_FINISHED}" != "yes" ]]; then
         [[ "${rc}" -ne 0 ]] || rc=70
-        rm -f "${PIPELINE_DIR}/.success"
-        write_value "${PIPELINE_DIR}/.failed" "${rc}"
-        write_value "${PIPELINE_DIR}/failed-stage" "${CURRENT_STAGE}"
-        write_value "${PIPELINE_DIR}/failed-phase" "${PHASE}"
-        rememr1_sync_file "${PIPELINE_DIR}/.failed" || true
+        if write_value "${PIPELINE_DIR}/failed-stage" "${CURRENT_STAGE}" &&
+           write_value "${PIPELINE_DIR}/failed-phase" "${PHASE}" &&
+           write_value "${PIPELINE_DIR}/.failed" "${rc}" &&
+           pipeline_sync_terminal "${PIPELINE_DIR}/.failed" "failure-before-cleanup"; then
+            remove_running_after_terminal \
+                "${PIPELINE_DIR}/.failed" "failure" \
+                "${PIPELINE_DIR}/.success" || true
+        else
+            echo "pipeline failure state could not be durably published; retaining .running" >&2
+        fi
     fi
     exit "${rc}"
 }
@@ -195,8 +242,7 @@ fi
 trap pipeline_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-rm -f "${PIPELINE_DIR}/.success" "${PIPELINE_DIR}/.failed" \
-    "${PIPELINE_DIR}/failed-stage" "${PIPELINE_DIR}/failed-phase"
+rm -f "${PIPELINE_DIR}/.success"
 write_value "${PIPELINE_DIR}/.running" "$$"
 write_value "${PIPELINE_DIR}/current-phase" "${PHASE}"
 
@@ -565,13 +611,19 @@ run_stage() {
 finish_phase() {
     local marker="$1"
     local value="$2"
+    local terminal_marker="${3:-${marker}}"
     trap '' INT TERM
-    write_value "${marker}" "${value}"
-    rm -f "${PIPELINE_DIR}/.running" "${PIPELINE_DIR}/.failed" \
-        "${PIPELINE_DIR}/failed-stage" "${PIPELINE_DIR}/failed-phase" \
-        "${PIPELINE_DIR}/current-stage" "${PIPELINE_DIR}/current-attempt"
-    write_value "${PIPELINE_DIR}/last-successful-phase" "${PHASE}"
-    rememr1_sync_file "${marker}" || return
+    write_value "${marker}" "${value}" || return 74
+    write_value "${PIPELINE_DIR}/last-successful-phase" "${PHASE}" || return 74
+    if [[ "${terminal_marker}" != "${marker}" ]]; then
+        write_value "${terminal_marker}" "0" || return 74
+    fi
+    pipeline_sync_terminal "${terminal_marker}" "success-before-cleanup" || return 74
+    remove_running_after_terminal \
+        "${terminal_marker}" "success" \
+        "${PIPELINE_DIR}/.failed" "${PIPELINE_DIR}/failed-stage" \
+        "${PIPELINE_DIR}/failed-phase" "${PIPELINE_DIR}/current-stage" \
+        "${PIPELINE_DIR}/current-attempt" || return 74
 }
 
 if [[ "${PHASE}" == "cpu" ]]; then
@@ -663,8 +715,7 @@ for stage in gpu-preflight g0 g1-step1 g1-resume2 g1-artifacts; do
     run_stage "${stage}"
 done
 CURRENT_STAGE="gpu-finalization"
-finish_phase "${PIPELINE_DIR}/.gpu-gates-ready" "${handoff}"
-write_value "${PIPELINE_DIR}/.success" "0"
-rememr1_sync_file "${PIPELINE_DIR}/.success"
+finish_phase "${PIPELINE_DIR}/.gpu-gates-ready" "${handoff}" \
+    "${PIPELINE_DIR}/.success"
 PIPELINE_FINISHED="yes"
 echo "[pipeline] G-1, G0, and G1 gates complete: ${PIPELINE_DIR}" || true

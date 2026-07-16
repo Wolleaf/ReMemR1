@@ -47,11 +47,49 @@ export REMEMR1_LAUNCHER_DIR
 started_at="$(rememr1_utc_now)"
 lock_acquired=no
 outcome=failed
+terminal_publish_failure=write
+
+launcher_test_failure_requested() {
+    [[ "${REMEMR1_TEST_MODE:-no}" == "yes" && \
+       "${REMEMR1_TEST_LAUNCHER_FAIL_AT:-}" == "$1" ]]
+}
+
+sync_launcher_state() {
+    local point="$1"
+    rememr1_test_event "launcher-sync-started point=${point} launcher_dir=${launcher_dir}" || return
+    if launcher_test_failure_requested "${point}"; then
+        rememr1_test_event \
+            "launcher-sync-failed point=${point} launcher_dir=${launcher_dir}" || true
+        return 1
+    fi
+    if ! rememr1_sync_all; then
+        rememr1_test_event \
+            "launcher-sync-failed point=${point} launcher_dir=${launcher_dir}" || true
+        return 1
+    fi
+    rememr1_test_event \
+        "launcher-sync-complete point=${point} launcher_dir=${launcher_dir}"
+}
+
+remove_running_marker() {
+    if launcher_test_failure_requested "running-marker-remove"; then
+        rememr1_test_event \
+            "running-marker-remove-failed launcher_dir=${launcher_dir}" || true
+        return 1
+    fi
+    if ! rm -f -- "${launcher_dir}/.running"; then
+        rememr1_test_event \
+            "running-marker-remove-failed launcher_dir=${launcher_dir}" || true
+        return 1
+    fi
+    rememr1_test_event "running-marker-removed launcher_dir=${launcher_dir}"
+}
 
 publish_terminal_state() {
     local rc="$1"
     local final_outcome="$2"
     local finished_at result_path terminal_json terminal_text
+    terminal_publish_failure=write
     finished_at="$(rememr1_utc_now)"
     result_path=""
     if [[ -f "${REMEMR1_RESULT_FILE:-}" ]]; then
@@ -80,20 +118,29 @@ publish_terminal_state() {
     else
         atomic_write "${launcher_dir}/.failed" "${rc}" || return
     fi
-    rm -f -- "${launcher_dir}/.running" || return
+    rememr1_test_event \
+        "terminal-state-written exit_code=${rc} launcher_dir=${launcher_dir}" || return
+    terminal_publish_failure=terminal-state-sync
+    sync_launcher_state "terminal-state-sync" || return
+    terminal_publish_failure=running-marker-remove
+    remove_running_marker || return
+    terminal_publish_failure=running-marker-sync
+    sync_launcher_state "running-marker-sync" || return
     rememr1_test_event "exit-code-written exit_code=${rc} launcher_dir=${launcher_dir}" || return
+    terminal_publish_failure=none
 }
 
 finish_worker() {
     local rc="$1"
     trap - EXIT INT TERM
     set +e
-    local publish_ok=no
+    local publish_ok=no reserve sync_rc
     if publish_terminal_state "${rc}" "${outcome}"; then
         publish_ok=yes
     else
         reserve="${REMEMR1_RESERVE_FILE:-${PERSIST_ROOT}/cloud/terminal-reserve}"
-        if [[ "${lock_acquired}" == "yes" ]] && \
+        if [[ "${terminal_publish_failure}" == "write" && \
+              "${lock_acquired}" == "yes" ]] && \
            rememr1_path_is_within "${reserve}" "${PERSIST_ROOT}" && \
            [[ -f "${reserve}" && ! -L "${reserve}" ]] && \
            /usr/bin/truncate -s 0 -- "${reserve}"; then
@@ -109,8 +156,7 @@ finish_worker() {
     fi
 
     if [[ "${publish_ok}" == "yes" ]]; then
-        rememr1_sync_all
-        sync_rc=$?
+        sync_rc=0
     else
         sync_rc=1
     fi

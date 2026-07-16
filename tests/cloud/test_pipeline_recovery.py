@@ -47,6 +47,7 @@ def _write_cloud_fixture(tmp_path: Path):
     run_root = persist / "cloud" / "runs"
     events = persist / "events.log"
     python_log = persist / "python.log"
+    pipeline_events = persist / "pipeline-events.log"
     g0_sentinel = persist / "g0-failed-once"
     result_file = persist / "pipeline-result"
     lock_file = persist / "cloud" / "pipeline.lock"
@@ -128,6 +129,10 @@ def _write_cloud_fixture(tmp_path: Path):
         "\"${stage}\" \"${REMEMR1_EXPECTED_COMMIT}\" \"${REMEMR1_PIPELINE_DIR}\" "
         "> \"${run}/run.meta\"\n"
         "printf '%s\\n' now > \"${run}/finished-at\"\n"
+        "if [[ \"${stage}\" == \"${REMEMR1_TEST_FAIL_STAGE:-}\" ]]; then\n"
+        "  printf '23\\n' > \"${run}/.failed\"\n"
+        "  exit 23\n"
+        "fi\n"
         "if [[ \"${stage}\" == g0 ]]; then\n"
         f"  if [[ ! -e {shlex.quote(_bash_path(g0_sentinel))} ]]; then\n"
         f"    printf first > {shlex.quote(_bash_path(g0_sentinel))}\n"
@@ -164,10 +169,17 @@ def _write_cloud_fixture(tmp_path: Path):
         {
             "REMEMR1_CLOUD_ENV": _bash_path(env_file),
             "REMEMR1_TEST_MODE": "yes",
+            "REMEMR1_PIPELINE_TEST_EVENT_FILE": _bash_path(pipeline_events),
         }
     )
     if os.name == "nt":
-        forwarded = ["REMEMR1_CLOUD_ENV", "REMEMR1_TEST_MODE"]
+        forwarded = [
+            "REMEMR1_CLOUD_ENV",
+            "REMEMR1_TEST_MODE",
+            "REMEMR1_PIPELINE_TEST_EVENT_FILE",
+            "REMEMR1_PIPELINE_TEST_FAIL_SYNC_AT",
+            "REMEMR1_TEST_FAIL_STAGE",
+        ]
         env["WSLENV"] = ":".join(
             value for value in [env.get("WSLENV", ""), *forwarded] if value
         )
@@ -223,6 +235,16 @@ def test_retry_adopts_complete_failed_gpu_artifacts_without_retraining(tmp_path)
     assert events.read_text(encoding="utf-8") == events_before
     assert (pipeline / ".failed").read_text(encoding="ascii").strip() == "23"
     assert (pipeline / "failed-stage").read_text(encoding="ascii").strip() == "g0"
+    terminal_events = (persist / "pipeline-events.log").read_text(
+        encoding="ascii"
+    ).splitlines()
+    assert terminal_events[-5:] == [
+        "sync:failure-before-cleanup:.failed:begin:running=yes",
+        "sync:failure-before-cleanup:.failed:complete:running=yes",
+        "running-removed:failure",
+        "sync:failure-after-cleanup:.failed:begin:running=no",
+        "sync:failure-after-cleanup:.failed:complete:running=no",
+    ]
 
     retried = _run_pipeline(
         env,
@@ -280,3 +302,36 @@ def test_retry_adopts_complete_failed_gpu_artifacts_without_retraining(tmp_path)
     assert downgrade.returncode != 0
     assert (pipeline / ".success").read_text(encoding="ascii").strip() == "0"
     assert not (pipeline / ".failed").exists()
+    terminal_events = (persist / "pipeline-events.log").read_text(
+        encoding="ascii"
+    ).splitlines()
+    assert terminal_events[-5:] == [
+        "sync:success-before-cleanup:.success:begin:running=yes",
+        "sync:success-before-cleanup:.success:complete:running=yes",
+        "running-removed:success",
+        "sync:success-after-cleanup:.success:begin:running=no",
+        "sync:success-after-cleanup:.success:complete:running=no",
+    ]
+
+
+def test_failed_terminal_sync_keeps_running_and_requires_explicit_retry(tmp_path):
+    env, persist, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+    dry_run = _run_pipeline(env, lock_file, "--phase", "cpu", "--dry-run")
+    assert dry_run.returncode == 0, dry_run.stderr
+    pipeline = next(pipeline_root.iterdir())
+
+    env["REMEMR1_TEST_FAIL_STAGE"] = "cpu-preflight"
+    env["REMEMR1_PIPELINE_TEST_FAIL_SYNC_AT"] = "failure-before-cleanup"
+    failed = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert failed.returncode == 23, failed.stderr
+    assert (pipeline / ".running").is_file()
+    assert (pipeline / ".failed").read_text(encoding="ascii").strip() == "23"
+    assert (
+        pipeline / "failed-stage"
+    ).read_text(encoding="ascii").strip() == "cpu-preflight"
+
+    events_before = events.read_text(encoding="utf-8")
+    refused = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert refused.returncode != 0
+    assert events.read_text(encoding="utf-8") == events_before
+    assert (pipeline / ".failed").read_text(encoding="ascii").strip() == "23"

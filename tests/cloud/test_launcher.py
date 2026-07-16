@@ -113,6 +113,7 @@ exit \"${{FAKE_PIPELINE_RC}}\"
             "REMEMR1_CLOUD_ENV",
             "REMEMR1_TEST_MODE",
             "REMEMR1_TEST_SHUTDOWN_LOG",
+            "REMEMR1_TEST_LAUNCHER_FAIL_AT",
             "FAKE_PIPELINE_RC",
         ]
         existing = env.get("WSLENV", "")
@@ -183,6 +184,8 @@ def test_run_logged_preserves_the_command_exit_status(tmp_path):
         [shutil.which("bash"), _bash_path(probe)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         timeout=15,
     )
@@ -354,6 +357,8 @@ fi
         [shutil.which("bash"), _bash_path(probe)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         timeout=15,
     )
@@ -426,12 +431,92 @@ def test_success_publishes_durable_state_before_shutdown_request(launcher_tmp_pa
     assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "test-mode"
     assert not (launcher / "shutdown-dispatched").exists()
     events = _events(shutdown_log)
+    written_index = next(
+        i for i, event in enumerate(events) if "terminal-state-written " in event
+    )
+    terminal_sync_index = next(
+        i
+        for i, event in enumerate(events)
+        if "launcher-sync-complete point=terminal-state-sync " in event
+    )
+    removed_index = next(
+        i for i, event in enumerate(events) if "running-marker-removed " in event
+    )
+    removal_sync_index = next(
+        i
+        for i, event in enumerate(events)
+        if "launcher-sync-complete point=running-marker-sync " in event
+    )
     exit_index = next(i for i, event in enumerate(events) if "exit-code-written " in event)
     safe_index = next(
         i for i, event in enumerate(events) if "shutdown-safe-written " in event
     )
     shutdown_index = next(i for i, event in enumerate(events) if "shutdown-request " in event)
-    assert exit_index < safe_index < shutdown_index
+    assert (
+        written_index
+        < terminal_sync_index
+        < removed_index
+        < removal_sync_index
+        < exit_index
+        < safe_index
+        < shutdown_index
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "running_remains", "expected_event", "forbidden_event"),
+    [
+        (
+            "terminal-state-sync",
+            True,
+            "launcher-sync-failed point=terminal-state-sync ",
+            "running-marker-removed ",
+        ),
+        (
+            "running-marker-remove",
+            True,
+            "running-marker-remove-failed ",
+            "launcher-sync-started point=running-marker-sync ",
+        ),
+        (
+            "running-marker-sync",
+            False,
+            "launcher-sync-failed point=running-marker-sync ",
+            "launcher-sync-complete point=running-marker-sync ",
+        ),
+    ],
+)
+def test_terminal_durability_failures_never_become_shutdown_safe(
+    launcher_tmp_path,
+    failure_point,
+    running_remains,
+    expected_event,
+    forbidden_event,
+):
+    env, launcher_root, shutdown_log, _ = _write_cloud_fixture(
+        launcher_tmp_path, pipeline_rc=23
+    )
+    env["REMEMR1_TEST_LAUNCHER_FAIL_AT"] = failure_point
+
+    _launch(env, "cpu", expected_returncodes=(0, 23))
+    launcher = _wait_for_terminal(launcher_root)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+
+    assert (launcher / "exit-code").read_text(encoding="ascii").strip() == "23"
+    assert (launcher / ".failed").is_file()
+    assert (launcher / ".running").exists() is running_remains
+    assert (launcher / "persistence-failed").is_file()
+    assert not (launcher / "reserve-released").exists()
+    assert not (launcher / "shutdown-safe").exists()
+    assert (
+        launcher / "shutdown-skipped"
+    ).read_text(encoding="ascii").strip() == "durable-state-sync-failed"
+    events = _events(shutdown_log)
+    assert any(expected_event in event for event in events)
+    assert not any(forbidden_event in event for event in events)
+    assert not any("shutdown-request " in event for event in events)
 
 
 def test_zero_length_terminal_reserve_is_rearmed_after_lock(launcher_tmp_path):

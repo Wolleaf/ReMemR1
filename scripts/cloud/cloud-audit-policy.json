@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "cloud_roots": [
+    "scripts/cloud"
+  ],
+  "exclude_globs": [],
+  "shell": {
+    "include_globs": [
+      "scripts/cloud/*.sh",
+      "scripts/cloud/**/*.sh"
+    ],
+    "executable_globs": [
+      "scripts/cloud/*.sh",
+      "scripts/cloud/**/*.sh"
+    ],
+    "allowed_shebangs": [
+      "#!/usr/bin/env bash"
+    ],
+    "require_tracked": true
+  },
+  "entrypoints": [
+    {
+      "id": "bootstrap",
+      "path": "scripts/cloud/bootstrap.sh",
+      "documentation": [
+        {
+          "path": "scripts/cloud/README.md",
+          "required_literals": [
+            "scripts/cloud/bootstrap.sh"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cpu",
+      "path": "scripts/cloud/start_cpu_prep.sh",
+      "documentation": [
+        {
+          "path": "scripts/cloud/README.md",
+          "required_literals": [
+            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_cpu_prep.sh --retry-failed-stage"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "gpu",
+      "path": "scripts/cloud/start_gpu_gates.sh",
+      "documentation": [
+        {
+          "path": "scripts/cloud/README.md",
+          "required_literals": [
+            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_gpu_gates.sh"
+          ]
+        }
+      ]
+    }
+  ],
+  "shutdown": {
+    "enabled": true,
+    "scan_globs": [
+      "scripts/cloud/*.sh",
+      "scripts/cloud/**/*.sh",
+      "scripts/cloud/*.py",
+      "scripts/cloud/**/*.py"
+    ],
+    "owner_files": [
+      "scripts/cloud/bootstrap.sh",
+      "scripts/cloud/lib/shutdown.sh"
+    ],
+    "test_evidence": [
+      {
+        "id": "shutdown-test-hook",
+        "owner_required_literals": [
+          "REMEMR1_TEST_MODE",
+          "REMEMR1_TEST_SHUTDOWN_LOG"
+        ],
+        "test_globs": [
+          "tests/cloud/*.py",
+          "tests/cloud/**/*.py"
+        ],
+        "test_required_literals": [
+          "REMEMR1_TEST_MODE",
+          "REMEMR1_TEST_SHUTDOWN_LOG"
+        ]
+      }
+    ],
+    "additional_invocation_regexes": []
+  }
+}
