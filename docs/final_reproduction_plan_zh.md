@@ -9,9 +9,9 @@
 > 当前方案分支：`reproduction/qwen35-plan`
 > 最后核对：2026-07-16
 
-本文档取代 [reproduction_plan_zh.md](./reproduction_plan_zh.md) 和
+本文档是唯一权威方案。早期 2B 全参数方案已删除；
 [reproduction_implementation_handoff_zh.md](./reproduction_implementation_handoff_zh.md)
-中的旧 2B 全参数主线。后两份文件仅保留历史分析和入口说明；后续实现、租卡、训练、评测和简历表述均以本文档为准。
+只保留实施入口，不维护独立参数。后续实现、租卡、训练、评测和简历表述均以本文档为准。
 
 ---
 
