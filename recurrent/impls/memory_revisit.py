@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass
-import re
 from typing import List, Optional, Tuple, Union
 from uuid import uuid4
 
@@ -12,8 +11,14 @@ from typing_extensions import override
 
 import verl.utils.torch_functional as verl_F
 from recurrent.interface import RAgent, RConfig, RDataset, RRegister
-from recurrent.utils import TokenTemplate, chat_template, now, unpad
-from recurrent.impls.tf_idf_retriever import TfidfRetriever
+from recurrent.protocol import (
+    CALLBACK_MODES,
+    MemoryRecord,
+    parse_intermediate_action,
+    retrieve_top1,
+    resolve_callback_query,
+)
+from recurrent.utils import TokenTemplate, chat_template
 from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
@@ -28,6 +33,7 @@ class MemoryConfig(RConfig):
     # max_input_length = max_prompt_length + chunk_size + max_memorization_length + template_length
     max_chunks: int  # max number of chunks to process
     max_final_response_length: int
+    callback_mode: str = "learned"
     # max_output_length = max_final_response_length if final else max_memorization_length
 
     @property
@@ -159,6 +165,11 @@ class MemoryAgent(RAgent):
     def __init__(self, tokenizer:PreTrainedTokenizer, config: MemoryConfig):
         self.config = config
         self.tokenizer = tokenizer
+        if self.config.callback_mode not in CALLBACK_MODES:
+            raise ValueError(
+                "callback_mode must be one of learned, none, fixed_question; "
+                f"got {self.config.callback_mode!r}"
+            )
         # A trick to get a simple chat_template for any tokenizer
         # the output text looks like:
         # '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n'
@@ -175,8 +186,6 @@ class MemoryAgent(RAgent):
         self.NO_MEMORY_RECALLED_STRING = "No memory was recalled."
         self.NO_MEMORY_RECALLED_TOKENS = torch.tensor(tokenizer.encode(self.NO_MEMORY_RECALLED_STRING, add_special_tokens=False), dtype=torch.long)
 
-        self.retriever = TfidfRetriever(tokenizer)
-
     @override
     def start(self, gen_batch: DataProto, timing_raw: dict):
         self.gen_batch = gen_batch
@@ -186,7 +195,11 @@ class MemoryAgent(RAgent):
         
         self.ctx_length = gen_batch.batch['context_length'] # if all context is used, then the sample will no more be active
         self.bsz = len(self.ctx_length)
-        self.history_memory = [set() for _ in range(self.bsz)]
+        self.history_memory: List[List[MemoryRecord]] = [[] for _ in range(self.bsz)]
+        self.questions = [
+            self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+            for prompt_ids in gen_batch.non_tensor_batch['prompt_ids']
+        ]
         self.memory = np.empty(self.bsz, dtype=object)
         self.recall_memories = np.empty(self.bsz, dtype=object)
         self.is_final = False
@@ -262,13 +275,22 @@ class MemoryAgent(RAgent):
     @override
     def update(self, gen_output: DataProto) -> DataProto:
         all_decoded_responses = self.tokenizer.batch_decode(gen_output.batch['responses'], skip_special_tokens=True) # List[str], length: [recalled_bsz]
-        # update recalled memory
-        recalled_queries = [self._parse_recall_query(response) for response in all_decoded_responses] # List[str], length: [recalled_bsz]
         if not self.is_final:
-            active_indices = self.active_mask.nonzero().squeeze().cpu().numpy()
+            active_indices = self.active_mask.nonzero().flatten().cpu().tolist()
+            parsed_actions = [parse_intermediate_action(response) for response in all_decoded_responses]
         else:
-            active_indices = torch.arange(len(recalled_queries), dtype=torch.int)
-        recalled_memories = [self.retriever.top1_retrieve(query, self.history_memory[idx]) for query, idx in zip(recalled_queries, active_indices)] # List[str], length: [recalled_bsz]
+            active_indices = list(range(len(all_decoded_responses)))
+            parsed_actions = []
+
+        recalled_queries = self._resolve_callback_queries(parsed_actions, active_indices)
+        retrievals = [
+            retrieve_top1(query, self.history_memory[idx]) if query is not None else None
+            for query, idx in zip(recalled_queries, active_indices)
+        ]
+        recalled_memories = [
+            result.record.update_text if result is not None else None
+            for result in retrievals
+        ]
         recalled_memories_values = [
             torch.tensor(self.tokenizer.encode(memory_str, add_special_tokens=False), dtype=torch.long) if memory_str is not None else self.NO_MEMORY_RECALLED_TOKENS
             for memory_str in recalled_memories
@@ -276,10 +298,32 @@ class MemoryAgent(RAgent):
         recalled_memories_arr = np.empty(len(recalled_memories_values), dtype=object)
         recalled_memories_arr[:] = recalled_memories_values
         gen_output.batch['recalled_memories'] = recalled_memories_arr
+        gen_output.batch['recalled_step_ids'] = torch.tensor(
+            [result.record.step_id if result is not None else -1 for result in retrievals],
+            dtype=torch.long,
+            device=gen_output.batch['responses'].device,
+        )
+        gen_output.batch['recall_scores'] = torch.tensor(
+            [result.score if result is not None else 0.0 for result in retrievals],
+            dtype=torch.float32,
+            device=gen_output.batch['responses'].device,
+        )
+        gen_output.non_tensor_batch['recall_queries'] = np.asarray(recalled_queries, dtype=object)
+        source_chunk_ids = np.empty(len(retrievals), dtype=object)
+        source_chunk_ids[:] = [
+            result.record.source_chunk_ids if result is not None else ()
+            for result in retrievals
+        ]
+        gen_output.non_tensor_batch['recalled_source_chunk_ids'] = source_chunk_ids
+        source_doc_ids = np.empty(len(retrievals), dtype=object)
+        source_doc_ids[:] = [
+            result.record.source_doc_ids if result is not None else ()
+            for result in retrievals
+        ]
+        gen_output.non_tensor_batch['recalled_source_doc_ids'] = source_doc_ids
 
         if not self.is_final:
-            self.memory[self.active_mask] = unpad(self.tokenizer, gen_output.batch['responses'], remove_eos=True)
-            all_update_memories = [self._parse_update_memory(response) for response in all_decoded_responses] # List[str], length: [recalled_bsz]
+            all_update_memories = [action.update for action in parsed_actions]
 
             # update memory
             update_values = [
@@ -298,56 +342,37 @@ class MemoryAgent(RAgent):
         self.step += 1
         return gen_output
 
-    def update_memory(self, memory_strings: List[str], active_indices: List[int]):
-        # self.history_memory is a set
+    def _resolve_callback_queries(self, parsed_actions, active_indices):
+        if self.is_final:
+            return [None] * len(active_indices)
+        return [
+            resolve_callback_query(
+                self.config.callback_mode,
+                learned_query=action.recall,
+                question=self.questions[int(idx)],
+            )
+            for action, idx in zip(parsed_actions, active_indices)
+        ]
+
+    def update_memory(self, memory_strings: List[Optional[str]], active_indices: List[int]):
         assert len(active_indices) == len(memory_strings)
-        new_memories = [memory_str if memory_str is not None else self.NO_MEMORY_STRING for memory_str in memory_strings]
-        for idx, memory in zip(active_indices, new_memories):
-            self.history_memory[int(idx)].add(memory)
-    
-    def _preprocess_text(self, text: str) -> set[str]:
-        text = re.sub(r'[^\w\s]', '', text.lower())
-        # Split into words and return a set of unique tokens
-        return set(text.split())
-    
-    def look_up_memory(self, query: str, idx: int) -> str:
-        assert False
-        """Look up the top-1 memory based on the query."""
-        scores = []
-        if query is None:
-            return None
-        query_tokens = self._preprocess_text(query)
-        for memory_string in self.history_memory[idx]:
-            memory_tokens = self._preprocess_text(memory_string)
-            intersection = query_tokens.intersection(memory_tokens)
-            union = query_tokens.union(memory_tokens)
-            if not union:
-                score = 0.0
-            else:
-                score = len(intersection) / len(union)
-            if score > 0:
-                scores.append((memory_string, score))
-        scores.sort(key=lambda item: item[1], reverse=True)
-        return scores[0][0] if scores else None
+        for idx, memory in zip(active_indices, memory_strings):
+            if memory is None:
+                continue
+            self.history_memory[int(idx)].append(
+                MemoryRecord(
+                    step_id=self.step,
+                    update_text=memory,
+                    source_chunk_ids=(self.step,),
+                )
+            )
 
     ## MODIFIED: Helper function to parse the callback ID from the LLM's text output
     def _parse_recall_query(self, text_response: str) -> str:
-        """Extracts the chunk ID from a string like '<recall>who's the president of the United States?</recall>'."""
-        try:
-            match = re.search(r'<recall>(.+)</recall>', text_response)
-            if match:
-                query = match.group(1) # we pick the first group, which is the query
-                return query
-        except (ValueError, TypeError):
-            pass # Fall through to return None if parsing fails
-        return None
+        return parse_intermediate_action(text_response).recall
 
     def _parse_update_memory(self, text_response: str) -> str:
-        try:
-            cleaned = re.sub(r'<recall>.*?</recall>', '', text_response, flags=re.DOTALL)
-            return cleaned.strip()
-        except (ValueError, TypeError):
-            return None
+        return parse_intermediate_action(text_response).update
 
     @override
     def done(self):
@@ -361,6 +386,7 @@ class MemoryAgent(RAgent):
         del self.memory
         del self.messages
         del self.history_memory
+        del self.questions
         del self.recall_memories
         del self.active_mask
         sample_index = torch.cat(self.sample_index_list)

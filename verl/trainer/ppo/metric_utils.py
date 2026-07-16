@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List
 import numpy as np
 import torch
 
+from recurrent.protocol import parse_final_action, parse_intermediate_action
+from recurrent.rewards import compute_state_reward
 from verl import DataProto
 from taskutils.memory_eval.utils import (
     extract_answer,
@@ -88,19 +90,14 @@ def compute_format_rewards(all_responses_str: List[str], batch: DataProto) -> to
     for response_str, action_type in zip(all_responses_str, batch.batch['action_type']):
         action_type = int(action_type)
         if action_type == 1: # callback, not used in revisit version
-            all_recall_queries = re.findall(r'<recall>(.*?)</recall>', response_str)
-            all_recall_queries = [recall_query for recall_query in all_recall_queries if recall_query.strip()]
-            reward_score = 1.0 if len(all_recall_queries) == 1 else 0.0
+            action = parse_intermediate_action(response_str)
+            reward_score = float(action.recall_occurrences.is_single_non_empty)
 
         elif action_type == 2: # memory
-            all_update_memories = re.findall(r'<update>(.*?)</update>', response_str)
-            all_update_memories = [memory for memory in all_update_memories if memory.strip()]
-            reward_score = 1.0 if len(all_update_memories) == 1 else 0.0
+            reward_score = float(parse_intermediate_action(response_str).format_valid)
 
         elif action_type == 0: # final
-            all_final_answers = re.findall(r'\\boxed{(.+)}', response_str)
-            all_final_answers = [answer for answer in all_final_answers if answer.strip()]
-            reward_score = 1.0 if len(all_final_answers) == 1 else 0.0
+            reward_score = float(parse_final_action(response_str).format_valid)
         else:
             raise ValueError(f"Invalid action type: {action_type}")
         format_rewards.append(reward_score)
@@ -135,39 +132,25 @@ def compute_action_rewards(all_prompt_str: List[str], all_responses_str: List[st
     action_reward_scalar = []
     rewarded_mask = rewarded_scalar > 0.0
     assert sample_index.shape == rewarded_mask.shape
+    recalled_step_ids = batch.batch.get('recalled_step_ids')
 
-    def recall_metric(predict, ground_truth_list):
-        reward_score = 0.0
-        for ground_truth in ground_truth_list:
-            ground_truth_words = list(ground_truth.split())
-            if not len(ground_truth_words):
-                continue
-            reward_score += sum([1.0 if word in predict else 0.0 for word in ground_truth_words]) / len(ground_truth_words)
-        reward_score /= len(ground_truth_list)
-        return reward_score
-
-    for prompt_str, response_str, recalled_memories_str, action_type, reward_batch_item in zip(all_prompt_str, all_responses_str, all_recalled_memories_str, batch.batch['action_type'], reward_batch[sample_index]):
+    for action_index, (prompt_str, response_str, recalled_memories_str, action_type, reward_batch_item) in enumerate(zip(all_prompt_str, all_responses_str, all_recalled_memories_str, batch.batch['action_type'], reward_batch[sample_index])):
         action_type = int(action_type)
         ground_truth_list = reward_batch_item.non_tensor_batch['reward_model']['ground_truth']
         if action_type == 1: # callback: min_callback as golden standard, calculate penalty for over-callback
             reward_score = 0.0
         elif action_type == 2: # memory: word-level recall reward
-            # reward for memory update
-            previous_memory = re.findall(r'<memory>(.*?)</memory>', prompt_str)
-            previous_memory = previous_memory[0] if previous_memory else ''
-            generated_memory = re.findall(r'<update>(.*?)</update>', response_str)
-            generated_memory = generated_memory[0] if generated_memory else ''
-            generated_memory_recall = recall_metric(generated_memory, ground_truth_list)
-            previous_memory_recall = recall_metric(previous_memory, ground_truth_list)
-            update_reward_score = generated_memory_recall - previous_memory_recall
-
-            # reward for memory revisit
-            generated_revisit_recall = recall_metric(recalled_memories_str + ' ' + prompt_str, ground_truth_list)
-            prompt_recall = recall_metric(prompt_str, ground_truth_list)
-            revisit_reward_score = max(0, generated_revisit_recall - prompt_recall)
-
-            # aggregate the rewards
-            reward_score = update_reward_score + revisit_reward_score
+            recalled_memory = recalled_memories_str
+            if recalled_step_ids is not None and int(recalled_step_ids[action_index]) < 0:
+                recalled_memory = None
+            components = compute_state_reward(
+                prompt=prompt_str,
+                response=response_str,
+                recalled_memory=recalled_memory,
+                answers=ground_truth_list,
+                is_final=False,
+            )
+            reward_score = components.memory + components.callback
         elif action_type == 0: # final: word-level recall reward
             # we omit the final reward for now
             reward_score = 0.0

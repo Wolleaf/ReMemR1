@@ -1305,7 +1305,9 @@ class RayPPOTrainer:
                                 step_uid_indexed = [str(uid)+str(int(step_id)) for uid, step_id in zip(uid_indexed, batch.batch['step_id'])] # [num_actions]. for each step in each question, we have a unique uid.
 
                                 state_advantage_scalar = compute_1D_grpo_advantage(
-                                    token_level_rewards=state_reward_scalar.unsqueeze(-1).tile([1, 2]), # [num_actions, 2]
+                                    # Keep one scalar reward per action. Duplicating this column
+                                    # doubles the unnormalized state advantage when grpo_use_adv=False.
+                                    token_level_rewards=state_reward_scalar.unsqueeze(-1), # [num_actions, 1]
                                     index=step_uid_indexed, # [num_actions]
                                     use_adv=self.config.algorithm.grpo_use_adv # bool
                                 ) # [num_actions]
