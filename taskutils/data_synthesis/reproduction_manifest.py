@@ -17,11 +17,12 @@ import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 EVAL_QA_COUNT = 64
 EVAL_PREFIX_DOCUMENT_COUNT = 200
 EVAL_POOL_DOCUMENT_COUNT = 800
@@ -111,6 +112,27 @@ def ordered_values_sha256(values: Sequence[str]) -> str:
     """Hash a sequence without discarding its order."""
 
     return _sha256_json(list(values))
+
+
+def token_ids_sha256(token_ids: Sequence[int]) -> str:
+    """Hash the exact tokenizer output committed to provenance boundaries."""
+
+    normalized = []
+    for index, token_id in enumerate(token_ids):
+        if (
+            isinstance(token_id, bool)
+            or not isinstance(token_id, Integral)
+            or int(token_id) < 0
+        ):
+            raise ManifestValidationError(
+                f"token_ids[{index}] must be a non-negative integer"
+            )
+        normalized.append(int(token_id))
+    if not normalized:
+        raise ManifestValidationError("token_ids must not be empty")
+    return _sha256_json(
+        {"kind": "reproduction-context-token-ids-v1", "token_ids": normalized}
+    )
 
 
 def _require_nonempty_text(value: Any, path: str) -> str:
@@ -430,6 +452,7 @@ class ManifestRecord:
     chunks: tuple[ChunkRecord, ...]
     context: str
     context_sha256: str
+    context_token_ids_sha256: str
     context_token_count: int
     consumed_token_count: int
     chunk_size: int
@@ -443,6 +466,7 @@ class ManifestRecord:
             "consumed_token_count": self.consumed_token_count,
             "context": self.context,
             "context_sha256": self.context_sha256,
+            "context_token_ids_sha256": self.context_token_ids_sha256,
             "context_token_count": self.context_token_count,
             "document_count": self.document_count,
             "document_pool_sha256": self.document_pool_sha256,
@@ -573,6 +597,7 @@ def render_context(documents: Sequence[DocumentInput | DocumentRecord]) -> str:
 @dataclass(frozen=True, slots=True)
 class _Tokenized:
     count: int
+    input_ids: tuple[int, ...]
     offsets: tuple[tuple[int, int], ...] | None
 
 
@@ -591,9 +616,21 @@ def _tokenize(encode: Callable[[str], Any], text: str) -> _Tokenized:
         input_ids = result
     if isinstance(input_ids, (str, bytes)) or not hasattr(input_ids, "__len__"):
         raise ManifestValidationError("tokenizer input_ids must be a sized sequence")
-    count = len(input_ids)
+    normalized_input_ids = []
+    for index, token_id in enumerate(input_ids):
+        if (
+            isinstance(token_id, bool)
+            or not isinstance(token_id, Integral)
+            or int(token_id) < 0
+        ):
+            raise ManifestValidationError(
+                f"tokenizer input_ids[{index}] must be a non-negative integer"
+            )
+        normalized_input_ids.append(int(token_id))
+    frozen_input_ids = tuple(normalized_input_ids)
+    count = len(frozen_input_ids)
     if offsets is None:
-        return _Tokenized(count=count, offsets=None)
+        return _Tokenized(count=count, input_ids=frozen_input_ids, offsets=None)
     if len(offsets) != count:
         raise ManifestValidationError("offset_mapping length differs from input_ids")
     parsed: list[tuple[int, int]] = []
@@ -618,7 +655,11 @@ def _tokenize(encode: Callable[[str], Any], text: str) -> _Tokenized:
             )
         parsed.append((start, end))
         previous_start = start
-    return _Tokenized(count=count, offsets=tuple(parsed))
+    return _Tokenized(
+        count=count,
+        input_ids=frozen_input_ids,
+        offsets=tuple(parsed),
+    )
 
 
 def _block_char_spans(documents: Sequence[DocumentInput]) -> tuple[tuple[int, int], ...]:
@@ -881,6 +922,7 @@ def build_manifest_record(
         chunks=tuple(chunks),
         context=context,
         context_sha256=hashlib.sha256(context.encode("utf-8")).hexdigest(),
+        context_token_ids_sha256=token_ids_sha256(tokenized.input_ids),
         context_token_count=tokenized.count,
         consumed_token_count=tokenized.count,
         chunk_size=chunk_size,
@@ -933,6 +975,10 @@ def validate_manifest_record(record: ManifestRecord, path: str = "record") -> No
     expected_context_hash = hashlib.sha256(record.context.encode("utf-8")).hexdigest()
     if record.context_sha256 != expected_context_hash:
         raise _error(path, "context_sha256 mismatch")
+    _require_sha256(
+        record.context_token_ids_sha256,
+        f"{path}.context_token_ids_sha256",
+    )
     _require_int(
         record.context_token_count,
         f"{path}.context_token_count",
@@ -1312,6 +1358,7 @@ __all__ = [
     "stable_document_id",
     "stable_supporting_fact_id",
     "ordered_values_sha256",
+    "token_ids_sha256",
     "canonical_json_bytes",
     "canonical_jsonl_bytes",
     "canonical_jsonl_sha256",

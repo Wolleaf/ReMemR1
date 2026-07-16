@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from taskutils.data_synthesis.reproduction_manifest import (
+    SCHEMA_VERSION,
     EVAL_CHUNK_SIZE,
     EVAL_POOL_DOCUMENT_COUNT,
     EVAL_PREFIX_DOCUMENT_COUNT,
@@ -150,7 +151,7 @@ def test_schema_commits_qa_golds_documents_and_revisions(pair):
     record = pair.pool_records[0]
 
     assert record.metadata.to_dict() == {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "seed": 42,
         "source_name": "toy-hotpot",
         "source_revision": "source-rev-1",

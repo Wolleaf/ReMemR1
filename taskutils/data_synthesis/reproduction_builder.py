@@ -48,7 +48,7 @@ from .reproduction_manifest import (
 )
 
 
-BUNDLE_KIND = "rememr1-reproduction-data-bundle-v1"
+BUNDLE_KIND = "rememr1-reproduction-data-bundle-v2"
 FORMAL_TRAIN_QA_COUNT = 512
 FORMAL_TRAIN_DOCUMENT_COUNT = 200
 FORMAL_TRAIN_CHUNK_SIZE = 5000
@@ -865,6 +865,7 @@ def _row_from_record(
             "chunk_count": len(record.chunks),
             "chunk_size": record.chunk_size,
             "context_sha256": record.context_sha256,
+            "context_token_ids_sha256": record.context_token_ids_sha256,
             "context_token_count": record.context_token_count,
             "document_count": record.document_count,
             "document_pool_sha256": record.document_pool_sha256,
@@ -927,6 +928,7 @@ def manifest_record_from_dict(value: Mapping[str, Any]) -> ManifestRecord:
             "consumed_token_count",
             "context",
             "context_sha256",
+            "context_token_ids_sha256",
             "context_token_count",
             "document_count",
             "document_pool_sha256",
@@ -1114,6 +1116,7 @@ def manifest_record_from_dict(value: Mapping[str, Any]) -> ManifestRecord:
         chunks=tuple(chunks),
         context=value["context"],
         context_sha256=value["context_sha256"],
+        context_token_ids_sha256=value["context_token_ids_sha256"],
         context_token_count=value["context_token_count"],
         consumed_token_count=value["consumed_token_count"],
         chunk_size=value["chunk_size"],
