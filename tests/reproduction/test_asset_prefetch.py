@@ -1,8 +1,10 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
+from types import ModuleType
 
 import pytest
 
@@ -30,6 +32,24 @@ def _git_blob_sha1(data: bytes) -> str:
     digest.update(f"blob {len(data)}\0".encode("ascii"))
     digest.update(data)
     return digest.hexdigest()
+
+
+def test_huggingface_downloader_serializes_float_timeout_for_hub_env(monkeypatch):
+    hub = ModuleType("huggingface_hub")
+    hub.__path__ = []
+    constants = ModuleType("huggingface_hub.constants")
+    constants.HF_HUB_ETAG_TIMEOUT = 10
+    constants.HF_HUB_DOWNLOAD_TIMEOUT = 10
+    downloader = object()
+    hub.hf_hub_download = downloader
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.constants", constants)
+
+    assert assets._huggingface_downloader(300.0) is downloader
+    assert os.environ["HF_HUB_ETAG_TIMEOUT"] == "300"
+    assert os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] == "300"
+    assert constants.HF_HUB_ETAG_TIMEOUT == 300.0
+    assert constants.HF_HUB_DOWNLOAD_TIMEOUT == 300.0
 
 
 def _manifest_for_files(tmp_path, file_specs, *, kind="dataset_source"):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -263,7 +264,7 @@ def verify_cached_file(path: str | Path, file_spec: Mapping[str, Any]) -> dict[s
 
 
 def _huggingface_downloader(timeout: float) -> Callable[..., str]:
-    timeout_text = str(timeout)
+    timeout_text = str(max(1, math.ceil(timeout)))
     os.environ["HF_HUB_ETAG_TIMEOUT"] = timeout_text
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = timeout_text
     try:
