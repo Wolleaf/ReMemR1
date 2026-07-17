@@ -16,6 +16,7 @@ LAUNCH = REPO_ROOT / "scripts" / "cloud" / "launch.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "cloud" / "bootstrap.sh"
 RUN_GPU = REPO_ROOT / "scripts" / "cloud" / "run_gpu.sh"
 STATUS = REPO_ROOT / "scripts" / "cloud" / "status.sh"
+PREPARE_KERNEL_SOURCES = REPO_ROOT / "scripts" / "cloud" / "prepare_kernel_sources.sh"
 
 
 def _bash_path(path: Path) -> str:
@@ -396,6 +397,20 @@ PATH={fake_path}
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_kernel_source_prefetch_accepts_only_an_empty_unmaterialized_clone():
+    source = PREPARE_KERNEL_SOURCES.read_text(encoding="utf-8")
+
+    assert 'git clone --filter=blob:none --no-checkout' in source
+    assert '! -e "${destination}/.git/index"' in source
+    assert '! -L "${destination}/.git/index"' in source
+    assert '! -name .git -print -quit' in source
+    assert '"${unmaterialized_checkout}" != yes' in source
+    assert "kernel source checkout is dirty after materialization" in source
+    assert source.index('git -C "${destination}" checkout --detach') < source.index(
+        "kernel source checkout is dirty after materialization"
+    )
 
 
 def test_shutdown_markers_distinguish_skips_from_backend_failure(tmp_path):

@@ -17,6 +17,7 @@ prepare_repo() {
     local repository="$2"
     local commit="$3"
     local destination="${SOURCE_ROOT}/${name}"
+    local unmaterialized_checkout=no
     if [[ ! -d "${destination}/.git" ]]; then
         [[ ! -e "${destination}" ]] || {
             echo "kernel source path exists but is not a git checkout: ${destination}" >&2
@@ -24,13 +25,24 @@ prepare_repo() {
         }
         git clone --filter=blob:none --no-checkout "${repository}" "${destination}"
     fi
-    if [[ -n "$(git -C "${destination}" status --porcelain --untracked-files=all)" ]]; then
+    if [[ ! -e "${destination}/.git/index" && \
+          ! -L "${destination}/.git/index" && \
+          -z "$(find "${destination}" -mindepth 1 -maxdepth 1 \
+              ! -name .git -print -quit)" ]]; then
+        unmaterialized_checkout=yes
+    fi
+    if [[ "${unmaterialized_checkout}" != yes && \
+          -n "$(git -C "${destination}" status --porcelain --untracked-files=all)" ]]; then
         echo "kernel source checkout is dirty: ${destination}" >&2
         return 1
     fi
     git -C "${destination}" fetch --no-tags --depth=1 origin "${commit}"
     git -C "${destination}" checkout --detach "${commit}"
     [[ "$(git -C "${destination}" rev-parse HEAD)" == "${commit}" ]] || return 1
+    if [[ -n "$(git -C "${destination}" status --porcelain --untracked-files=all)" ]]; then
+        echo "kernel source checkout is dirty after materialization: ${destination}" >&2
+        return 1
+    fi
 }
 
 prepare_repo \
