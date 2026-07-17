@@ -10,12 +10,14 @@ PROJECT_DIR="${REMEMR1_PROJECT_DIR:-/root/autodl-tmp/ReMemR1}"
 EXPERIMENT_PROFILE="${REMEMR1_EXPERIMENT_PROFILE:-rtx5090-32g-qwen35-2b-v1}"
 PHASE="cpu"
 ALLOW_GUEST_SHUTDOWN="no"
+RECOVER_INCOMPLETE_CHECKOUT="no"
 START_ARGS=()
 
 usage() {
     cat >&2 <<'EOF'
 Usage: bootstrap.sh [--repo URL] [--branch NAME] [--expected-commit SHA]
                     [--project-dir DIR] [--phase cpu|init-only]
+                    [--recover-incomplete-checkout]
                     [--allow-guest-shutdown] [--keep-running] [--dry-run]
 
 Without --expected-commit, the branch tip is resolved once and recorded as a
@@ -31,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --expected-commit) EXPECTED_COMMIT="$2"; shift 2 ;;
         --project-dir) PROJECT_DIR="$2"; shift 2 ;;
         --phase) PHASE="$2"; shift 2 ;;
+        --recover-incomplete-checkout) RECOVER_INCOMPLETE_CHECKOUT="yes"; shift ;;
         --allow-guest-shutdown) ALLOW_GUEST_SHUTDOWN="yes"; shift ;;
         --keep-running|--dry-run) START_ARGS+=("$1"); shift ;;
         -h|--help) usage; exit 0 ;;
@@ -65,7 +68,7 @@ if [[ "${REMEMR1_TEST_MODE:-no}" != "no" || \
     echo "bootstrap does not support the launcher test hook" >&2
     exit 2
 fi
-for command_name in findmnt flock git mkfifo realpath sync tee timeout; do
+for command_name in find findmnt flock git mkfifo mv realpath sync tee timeout; do
     command -v "${command_name}" >/dev/null 2>&1 || {
         echo "required command is missing: ${command_name}" >&2
         exit 1
@@ -256,6 +259,187 @@ trap bootstrap_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+bootstrap_checkout_exact_revision() {
+    local checkout_dir="$1"
+    local expected_commit="$2"
+    local actual_commit checkout_status
+    if ! timeout --signal=TERM --kill-after=1m 15m \
+        git -C "${checkout_dir}" \
+        -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 \
+        fetch --no-tags --depth=1 origin "${expected_commit}"; then
+        return 1
+    fi
+    if ! timeout --signal=TERM --kill-after=30s 5m \
+        git -C "${checkout_dir}" checkout --detach "${expected_commit}"; then
+        return 1
+    fi
+    actual_commit="$(git -C "${checkout_dir}" rev-parse HEAD)" || return 1
+    if [[ "${actual_commit}" != "${expected_commit}" ]]; then
+        echo "checked-out commit does not match the resolved revision" >&2
+        return 1
+    fi
+    checkout_status="$(
+        git -C "${checkout_dir}" status --porcelain --untracked-files=all
+    )" || return 1
+    if [[ -n "${checkout_status}" ]]; then
+        echo "checked-out revision is not clean: ${checkout_dir}" >&2
+        return 1
+    fi
+}
+
+recover_incomplete_checkout() {
+    local repo_url="$1"
+    local project_dir="$2"
+    local origin_url backup_path record path_index
+    local -a head_paths index_flags index_paths status_records
+
+    if [[ ! -e "${project_dir}" ]]; then
+        echo "No incomplete checkout needs recovery at ${project_dir}"
+        return 0
+    fi
+    if [[ ! -d "${project_dir}" || -L "${project_dir}" || \
+          ! -d "${project_dir}/.git" || -L "${project_dir}/.git" ]]; then
+        echo "recovery requires a normal checkout directory with a real .git directory" >&2
+        return 1
+    fi
+    origin_url="$(git -C "${project_dir}" remote get-url origin 2>/dev/null)" || {
+        echo "recovery could not read the checkout origin" >&2
+        return 1
+    }
+    if [[ "${origin_url}" != "${repo_url}" ]]; then
+        echo "recovery refused a checkout whose origin does not match --repo" >&2
+        return 1
+    fi
+    if ! git -C "${project_dir}" status --porcelain=v1 -z \
+        --untracked-files=all >/dev/null; then
+        echo "recovery could not inspect checkout status" >&2
+        return 1
+    fi
+    mapfile -d '' -t status_records < <(
+        git -C "${project_dir}" status --porcelain=v1 -z --untracked-files=all
+    )
+    if [[ -n "$(find "${project_dir}/.git" -type f -name '*.lock' -print -quit)" ]]; then
+        echo "recovery refused a checkout containing a Git lock" >&2
+        return 1
+    fi
+    git -C "${project_dir}" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1 || {
+        echo "recovery requires a valid HEAD commit" >&2
+        return 1
+    }
+    mapfile -d '' -t head_paths < <(
+        git -C "${project_dir}" ls-tree -r --name-only -z HEAD
+    )
+    mapfile -d '' -t index_paths < <(
+        git -C "${project_dir}" ls-files -z
+    )
+    if [[ "${#status_records[@]}" -eq 0 ]]; then
+        mapfile -d '' -t index_flags < <(
+            git -C "${project_dir}" ls-files -v -z
+        )
+        if ! git -C "${project_dir}" diff --cached --quiet HEAD -- || \
+           [[ "${#index_paths[@]}" -ne "${#head_paths[@]}" || \
+              "${#index_flags[@]}" -ne "${#index_paths[@]}" ]]; then
+            echo "recovery refused an apparently clean checkout with index drift" >&2
+            return 1
+        fi
+        for ((path_index = 0; path_index < ${#head_paths[@]}; path_index++)); do
+            if [[ "${index_paths[path_index]}" != "${head_paths[path_index]}" || \
+                  "${index_flags[path_index]:0:2}" != "H " || \
+                  ( ! -e "${project_dir}/${head_paths[path_index]}" && \
+                    ! -L "${project_dir}/${head_paths[path_index]}" ) ]]; then
+                echo "recovery refused an incomplete checkout hidden by index flags" >&2
+                return 1
+            fi
+        done
+        echo "Existing checkout is already clean; no recovery needed"
+        return 0
+    fi
+    if [[ -n "$(
+        find "${project_dir}" -mindepth 1 -maxdepth 1 ! -name .git -print -quit
+    )" ]]; then
+        echo "recovery refused a checkout containing worktree files" >&2
+        return 1
+    fi
+    if [[ "${#head_paths[@]}" -eq 0 || \
+          "${#index_paths[@]}" -ne 0 || \
+          "${#status_records[@]}" -ne "${#head_paths[@]}" ]]; then
+        echo "recovery refused a checkout that is not a complete no-checkout clone" >&2
+        return 1
+    fi
+    for record in "${status_records[@]}"; do
+        if [[ "${record:0:3}" != "D  " ]]; then
+            echo "recovery refused status other than a staged no-checkout deletion" >&2
+            return 1
+        fi
+    done
+
+    backup_path="${project_dir}.incomplete-checkout-backup.$(
+        date -u +%Y%m%dT%H%M%SZ
+    ).$$"
+    [[ ! -e "${backup_path}" ]] || {
+        echo "recovery backup path already exists: ${backup_path}" >&2
+        return 1
+    }
+    if ! mv -T -- "${project_dir}" "${backup_path}"; then
+        echo "could not preserve the incomplete checkout at ${backup_path}" >&2
+        return 1
+    fi
+    if ! timeout --signal=TERM --kill-after=30s 2m sync -f "${backup_path}" || \
+       ! timeout --signal=TERM --kill-after=30s 2m \
+        sync -f "$(dirname "${backup_path}")"; then
+        echo "incomplete checkout was preserved but its rename could not be synced" >&2
+        return 1
+    fi
+    echo "Preserved incomplete checkout at ${backup_path}"
+}
+
+prepare_cloud_checkout() {
+    local repo_url="$1"
+    local expected_commit="$2"
+    local project_dir="$3"
+    local clone_staging existing_status
+
+    mkdir -p "$(dirname "${project_dir}")"
+    if [[ -e "${project_dir}" && ! -d "${project_dir}/.git" ]]; then
+        echo "project path exists but is not a git checkout: ${project_dir}" >&2
+        return 1
+    fi
+    if [[ -d "${project_dir}/.git" ]]; then
+        existing_status="$(
+            git -C "${project_dir}" status --porcelain --untracked-files=all
+        )" || {
+            echo "could not inspect existing cloud checkout: ${project_dir}" >&2
+            return 1
+        }
+        if [[ -n "${existing_status}" ]]; then
+            echo "refusing to change a dirty cloud checkout: ${project_dir}" >&2
+            return 1
+        fi
+        bootstrap_checkout_exact_revision "${project_dir}" "${expected_commit}"
+        return
+    fi
+
+    clone_staging="${project_dir}.clone-staging.$$"
+    [[ ! -e "${clone_staging}" ]] || {
+        echo "clone staging path already exists: ${clone_staging}" >&2
+        return 1
+    }
+    if ! timeout --signal=TERM --kill-after=1m 30m \
+        git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 \
+        clone --filter=blob:none --no-checkout "${repo_url}" "${clone_staging}"; then
+        echo "clone failed; staging preserved for diagnosis: ${clone_staging}" >&2
+        return 1
+    fi
+    if ! bootstrap_checkout_exact_revision "${clone_staging}" "${expected_commit}"; then
+        echo "checkout failed; staging preserved for diagnosis: ${clone_staging}" >&2
+        return 1
+    fi
+    if ! mv -T -- "${clone_staging}" "${project_dir}"; then
+        echo "could not publish checkout; staging preserved for diagnosis: ${clone_staging}" >&2
+        return 1
+    fi
+}
+
 if [[ -z "${EXPECTED_COMMIT}" ]]; then
     remote_line=""
     for attempt in 1 2 3; do
@@ -274,37 +458,11 @@ if [[ -z "${EXPECTED_COMMIT}" ]]; then
     echo "Resolved ${BRANCH} once: ${EXPECTED_COMMIT}"
 fi
 
-mkdir -p "$(dirname "${PROJECT_DIR}")"
-if [[ -e "${PROJECT_DIR}" && ! -d "${PROJECT_DIR}/.git" ]]; then
-    echo "project path exists but is not a git checkout: ${PROJECT_DIR}" >&2
-    exit 1
+if [[ "${RECOVER_INCOMPLETE_CHECKOUT}" == "yes" ]]; then
+    recover_incomplete_checkout "${REPO_URL}" "${PROJECT_DIR}"
 fi
-if [[ ! -d "${PROJECT_DIR}/.git" ]]; then
-    clone_staging="${PROJECT_DIR}.clone-staging.$$"
-    [[ ! -e "${clone_staging}" ]] || {
-        echo "clone staging path already exists: ${clone_staging}" >&2
-        exit 1
-    }
-    timeout --signal=TERM --kill-after=1m 30m \
-        git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 \
-        clone --filter=blob:none --no-checkout "${REPO_URL}" "${clone_staging}"
-    mv "${clone_staging}" "${PROJECT_DIR}"
-fi
-
+prepare_cloud_checkout "${REPO_URL}" "${EXPECTED_COMMIT}" "${PROJECT_DIR}"
 cd "${PROJECT_DIR}"
-if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
-    echo "refusing to change a dirty cloud checkout: ${PROJECT_DIR}" >&2
-    exit 1
-fi
-timeout --signal=TERM --kill-after=1m 15m \
-    git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 \
-    fetch --no-tags --depth=1 origin "${EXPECTED_COMMIT}"
-timeout --signal=TERM --kill-after=30s 5m \
-    git checkout --detach "${EXPECTED_COMMIT}"
-[[ "$(git rev-parse HEAD)" == "${EXPECTED_COMMIT}" ]] || {
-    echo "checked-out commit does not match the resolved revision" >&2
-    exit 1
-}
 
 init_args=(
     --project-dir "${PROJECT_DIR}"

@@ -15,11 +15,17 @@ B/C80 与导出。每个 GPU 阶段都是独立的付费决策，不会由一条
 
 ### 1. CPU：一次 bootstrap
 
+AutoDL 的“无卡模式”或关机后的临时 shell 通常只有 `0.5 core / 2 GiB`，不能执行 CPU
+preparation。必须先启动一台仍在计费、且 cgroup 有效配额满足 `>=24 cores / >=48 GiB RAM`
+的实例；可以使用便宜的有卡实例，GPU 不参与本阶段计算。下面的开关仅允许 CPU 阶段在实例中
+看见 GPU，不会绕过 CPU、RAM 或持久盘门禁。
+
 公开仓库按当前交付分支启动：
 
 ```bash
 bash <<'REMEMR1_BOOTSTRAP'
 set -euo pipefail
+export REMEMR1_ALLOW_GPU_CPU_PHASE=yes
 bootstrap="$(mktemp /tmp/rememr1-bootstrap.XXXXXX)"
 trap 'rm -f -- "${bootstrap}"' EXIT
 curl --fail --show-error --silent --location --connect-timeout 30 --max-time 300 \
@@ -38,6 +44,7 @@ CPU preparation 成功。
 ```bash
 bash <<'REMEMR1_BOOTSTRAP'
 set -euo pipefail
+export REMEMR1_ALLOW_GPU_CPU_PHASE=yes
 commit='<TRUSTED_40_HEX_COMMIT>'
 bootstrap="$(mktemp /tmp/rememr1-bootstrap.XXXXXX)"
 trap 'rm -f -- "${bootstrap}"' EXIT
@@ -46,6 +53,17 @@ curl --fail --show-error --silent --location --connect-timeout 30 --max-time 300
   "https://raw.githubusercontent.com/Wolleaf/ReMemR1/${commit}/scripts/cloud/bootstrap.sh"
 bash "${bootstrap}" --expected-commit "${commit}" --phase cpu --allow-guest-shutdown
 REMEMR1_BOOTSTRAP
+```
+
+如果曾运行 `85fa07edd4712237a28a3c964f1b8e99453c01f2`，并在首次 clone 后看到
+`refusing to change a dirty cloud checkout`，只需在新 bootstrap 的最后一条命令增加
+`--recover-incomplete-checkout`。该开关仅隔离严格匹配旧版 `--no-checkout` 残留的目录，原目录会
+原子改名并保留为带时间戳的 `*.incomplete-checkout-backup.*`，不会执行 `rm` 或 `reset`；目录不存在
+或已经是 clean checkout 时可安全重复执行，其它 dirty 状态一律拒绝。
+
+```bash
+bash "${bootstrap}" --expected-commit "${commit}" --phase cpu \
+  --recover-incomplete-checkout --allow-guest-shutdown
 ```
 
 ### 2. GPU：先跑有界 G0/G1 门禁
@@ -145,7 +163,7 @@ bash /root/autodl-tmp/ReMemR1/scripts/cloud/export_2b_results.sh
 
 - CPU 和 GPU 实例必须挂载同一个 provider volume，路径固定为 `/root/autodl-tmp`，且任何时刻只允许一个 host 写入。
 - 系统为 Ubuntu 22.04、root、非 WSL；`/root/autodl-tmp` 必须是独立持久挂载，不能是 `/`、overlay、tmpfs、ramfs 或 squashfs。
-- CPU preparation 至少 48 GiB RAM；CPU/GPU host 至少 24 cores；active profile 持久盘至少 200 GiB 可用。
+- CPU preparation 的 cgroup 有效配额至少 48 GiB RAM、24 cores；门禁按 host、CPU quota、cpuset 和 memory limit 的最小值判断；active profile 持久盘至少 200 GiB 可用。
 - GPU 必须恰好一张 NVIDIA GeForce RTX 5090，可见显存至少 31 GiB，启动空闲显存至少 29 GiB，无其它 compute process。
 - GPU compute capability 固定 `sm_120`；CUDA runtime/toolkit 固定 13.0；镜像为 12.8 时必须停止并重新封环境，不能视为等价。
 - R0 host RAM 至少 96 GiB；R1 至少 128 GiB。R1 还要求完整 R0 容量证据、一次性审批和 B/C40 费用投影。

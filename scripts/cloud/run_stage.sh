@@ -597,7 +597,7 @@ case "${STAGE}" in
                 exit 1
             fi
         fi
-        for command_name in curl findmnt flock git sha256sum setsid timeout; do
+        for command_name in curl findmnt flock git python3 sha256sum setsid timeout; do
             command -v "${command_name}" >/dev/null 2>&1 || {
                 echo "required command is missing: ${command_name}" >&2
                 exit 1
@@ -614,17 +614,20 @@ case "${STAGE}" in
             echo "CPU preparation requires at least ${min_free_gib} GiB free on the persistent volume" >&2
             exit 1
         }
-        memory_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-        min_ram_gib="${REMEMR1_MIN_RAM_GIB:-48}"
-        [[ "${min_ram_gib}" =~ ^[0-9]+$ ]] || {
-            echo "REMEMR1_MIN_RAM_GIB must be an integer" >&2
+        min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-24}"
+        [[ "${min_cpu_cores}" =~ ^[0-9]+$ && "${min_cpu_cores}" -gt 0 ]] || {
+            echo "REMEMR1_MIN_CPU_CORES must be a positive integer" >&2
             exit 2
         }
-        min_memory_kib="$((min_ram_gib * 1024 * 1024))"
-        [[ "${memory_kib}" =~ ^[0-9]+$ && "${memory_kib}" -ge "${min_memory_kib}" ]] || {
-            echo "CPU preparation requires at least ${min_ram_gib} GiB RAM for formal parquet materialization" >&2
-            exit 1
+        min_ram_gib="${REMEMR1_MIN_RAM_GIB:-48}"
+        [[ "${min_ram_gib}" =~ ^[0-9]+$ && "${min_ram_gib}" -gt 0 ]] || {
+            echo "REMEMR1_MIN_RAM_GIB must be a positive integer" >&2
+            exit 2
         }
+        run_logged host-resource-preflight 5m \
+            python3 scripts/cloud/host_resource_probe.py \
+            --min-cpu-cores "${min_cpu_cores}" \
+            --min-ram-gib "${min_ram_gib}"
         df -h "${REMEMR1_PERSIST_ROOT}" | tee -a "${LOG_FILE}"
         ;;
     cpu-environment)
