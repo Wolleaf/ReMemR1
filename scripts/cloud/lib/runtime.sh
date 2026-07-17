@@ -15,6 +15,34 @@ rememr1_json_escape() {
     printf '%s' "${value}"
 }
 
+rememr1_select_host_python() {
+    local candidate
+    for candidate in "$@"; do
+        if [[ -n "${candidate}" && -f "${candidate}" && -x "${candidate}" ]] && \
+           "${candidate}" -c \
+               'import sys; sys.exit(0 if sys.version_info[0] == 3 and sys.version_info[:2] >= (3, 10) else 1)' \
+               >/dev/null 2>&1; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    echo "required Python 3.10+ host interpreter is missing" >&2
+    return 1
+}
+
+rememr1_find_host_python() {
+    local env_prefix="${1-}" env_python="" path_python3 path_python
+    [[ -z "${env_prefix}" ]] || env_python="${env_prefix}/bin/python"
+    path_python3="$(type -P python3 2>/dev/null || true)"
+    path_python="$(type -P python 2>/dev/null || true)"
+    rememr1_select_host_python \
+        "${env_python}" \
+        "${path_python3}" \
+        "${path_python}" \
+        /root/miniconda3/bin/python \
+        /opt/conda/bin/python
+}
+
 atomic_write() {
     if [[ $# -lt 1 || $# -gt 2 ]]; then
         echo "usage: atomic_write PATH [VALUE]" >&2

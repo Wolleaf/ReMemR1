@@ -353,6 +353,51 @@ def test_run_logged_preserves_the_command_exit_status(tmp_path):
     assert (tmp_path / "command.log").read_text(encoding="ascii") == "command-output"
 
 
+def test_host_python_selector_falls_back_and_fails_closed(tmp_path):
+    runtime = shlex.quote(
+        _bash_path(REPO_ROOT / "scripts" / "cloud" / "lib" / "runtime.sh")
+    )
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    for name, exit_code in (("python3", 1), ("python", 0)):
+        candidate = fake_bin / name
+        candidate.write_bytes(f"#!/bin/sh\nexit {exit_code}\n".encode("ascii"))
+        candidate.chmod(0o755)
+
+    compatible = shlex.quote(_bash_path(fake_bin / "python"))
+    incompatible = shlex.quote(_bash_path(fake_bin / "python3"))
+    missing = shlex.quote(_bash_path(tmp_path / "missing-python"))
+    missing_prefix = shlex.quote(_bash_path(tmp_path / "missing-prefix"))
+    error_file = shlex.quote(_bash_path(tmp_path / "selector.err"))
+    fake_path = shlex.quote(_bash_path(fake_bin))
+    probe = tmp_path / "host-python-probe.sh"
+    probe.write_bytes(
+        f"""set -euo pipefail
+source {runtime}
+[[ "$(rememr1_select_host_python {missing} {compatible})" == {compatible} ]]
+[[ "$(rememr1_select_host_python {incompatible} {compatible})" == {compatible} ]]
+if rememr1_select_host_python {missing} {incompatible} 2>{error_file}; then
+    exit 91
+fi
+[[ "$(<{error_file})" == "required Python 3.10+ host interpreter is missing" ]]
+PATH={fake_path}
+[[ "$(rememr1_find_host_python {missing_prefix})" == {compatible} ]]
+""".encode("ascii")
+    )
+
+    result = subprocess.run(
+        [shutil.which("bash"), _bash_path(probe)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_shutdown_markers_distinguish_skips_from_backend_failure(tmp_path):
     runtime = shlex.quote(
         _bash_path(REPO_ROOT / "scripts" / "cloud" / "lib" / "runtime.sh")

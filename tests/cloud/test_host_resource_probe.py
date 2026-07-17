@@ -327,5 +327,14 @@ def test_cpu_preflight_uses_probe_with_profile_defaults():
 
     assert 'min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-1/2}"' in preflight
     assert 'min_ram_gib="${REMEMR1_MIN_RAM_GIB:-2}"' in preflight
-    assert "python3 scripts/cloud/host_resource_probe.py" in preflight
+    assert 'rememr1_find_host_python "${REMEMR1_ENV_PREFIX}"' in preflight
+    assert '"${host_python}" scripts/cloud/host_resource_probe.py' in preflight
     assert preflight.index("run_logged checkout") < preflight.index("host-resource-preflight")
+
+    runtime = (REPO_ROOT / "scripts" / "cloud" / "lib" / "runtime.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "sys.version_info[0] == 3" in runtime
+    assert "sys.version_info[:2] >= (3, 10)" in runtime
+    assert "type -P python3" in runtime
+    assert '[[ -n "${candidate}" && -f "${candidate}" && -x "${candidate}" ]]' in runtime

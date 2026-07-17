@@ -626,12 +626,13 @@ case "${STAGE}" in
                 exit 1
             fi
         fi
-        for command_name in curl findmnt flock git python3 sha256sum setsid timeout; do
+        for command_name in curl findmnt flock git sha256sum setsid timeout; do
             command -v "${command_name}" >/dev/null 2>&1 || {
                 echo "required command is missing: ${command_name}" >&2
                 exit 1
             }
         done
+        host_python="$(rememr1_find_host_python "${REMEMR1_ENV_PREFIX}")" || exit 1
         free_bytes="$(df --output=avail -B1 "${REMEMR1_PERSIST_ROOT}" | awk 'NR == 2 {print $1}')"
         min_free_gib="${REMEMR1_MIN_FREE_GIB:-200}"
         [[ "${min_free_gib}" =~ ^[0-9]+$ ]] || {
@@ -654,7 +655,7 @@ case "${STAGE}" in
             exit 2
         }
         run_logged host-resource-preflight 5m \
-            python3 scripts/cloud/host_resource_probe.py \
+            "${host_python}" scripts/cloud/host_resource_probe.py \
             --min-cpu-cores "${min_cpu_cores}" \
             --min-ram-gib "${min_ram_gib}"
         df -h "${REMEMR1_PERSIST_ROOT}" | tee -a "${LOG_FILE}"
