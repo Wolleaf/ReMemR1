@@ -32,6 +32,32 @@ _shutdown_parse_capability() {
     done
 }
 
+_shutdown_verify_terminal_marker() {
+    local launcher="$1"
+    local exit_code="$2"
+    local name marker_count=0
+    for name in .success .failed .scientific-stop .capacity-stop; do
+        if [[ -e "${launcher}/${name}" || -L "${launcher}/${name}" ]]; then
+            marker_count=$((marker_count + 1))
+        fi
+    done
+    [[ "${marker_count}" -eq 1 ]] || {
+        _shutdown_reject "launcher terminal marker is ambiguous"
+        return
+    }
+    case "${exit_code}" in
+        0) name=.success ;;
+        42) name=.scientific-stop ;;
+        43) name=.capacity-stop ;;
+        *) name=.failed ;;
+    esac
+    [[ -f "${launcher}/${name}" && ! -L "${launcher}/${name}" && \
+       "$(<"${launcher}/${name}")" == "${exit_code}" ]] || {
+        _shutdown_reject "launcher terminal marker does not match exit-code"
+        return
+    }
+}
+
 verify_guest_shutdown_preflight() {
     rememr1_require_cloud_env || return
     rememr1_validate_test_mode || return
@@ -190,16 +216,7 @@ verify_guest_shutdown_authorization() {
     exit_code="$(<"${launcher}/exit-code")"
     [[ "${exit_code}" =~ ^[0-9]+$ && "${exit_code}" -le 255 ]] || \
         _shutdown_reject "launcher exit-code is invalid" || return
-    if [[ -f "${launcher}/.success" && ! -e "${launcher}/.failed" ]]; then
-        [[ "${exit_code}" == "0" && "$(<"${launcher}/.success")" == "0" ]] || \
-            _shutdown_reject "success marker has nonzero exit" || return
-    elif [[ -f "${launcher}/.failed" && ! -e "${launcher}/.success" ]]; then
-        [[ "${exit_code}" != "0" && "$(<"${launcher}/.failed")" == "${exit_code}" ]] || \
-            _shutdown_reject "failure marker does not match exit-code" || return
-    else
-        _shutdown_reject "launcher terminal marker is ambiguous"
-        return
-    fi
+    _shutdown_verify_terminal_marker "${launcher}" "${exit_code}" || return
     [[ -f "${launcher}/launcher.log" && ! -L "${launcher}/launcher.log" ]] || \
         _shutdown_reject "launcher log is missing or unsafe" || return
     /usr/bin/grep -Fq "terminal-state-published exit_code=${exit_code}" \

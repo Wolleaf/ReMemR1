@@ -88,6 +88,7 @@ _GPU_HARDWARE_KEYS = {
     "gpu_uuid",
     "host_cpu_count",
     "host_total_memory_bytes",
+    "minimum_persistent_disk_free_bytes",
     "other_compute_process_count",
     "persistent_disk_free_bytes",
     "persistent_disk_probe_path",

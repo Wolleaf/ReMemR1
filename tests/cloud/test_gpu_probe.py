@@ -1,6 +1,7 @@
 import hashlib
 import json
 from fractions import Fraction
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +9,22 @@ import pytest
 from scripts.cloud import gpu_probe
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_gpu_kernel_install_forces_causal_conv1d_offline_source_build():
+    source = (REPO_ROOT / "scripts" / "cloud" / "install_gpu_kernels.sh").read_text(
+        encoding="utf-8"
+    )
+
+    force_build = "export CAUSAL_CONV1D_FORCE_BUILD=TRUE"
+    assert "export PIP_NO_INDEX=1" in source
+    assert force_build in source
+    assert source.index(force_build) < source.index('"${PYTHON}" -m pip install')
 
 
 class _FakeCuda:
@@ -60,13 +75,22 @@ def _hardware_inputs():
     return torch_module, smi, resources
 
 
-def _probe_with(torch_module, smi, resources, *, profile="R0", toolkit="13.0"):
+def _probe_with(
+    torch_module,
+    smi,
+    resources,
+    *,
+    profile="R0",
+    toolkit="13.0",
+    min_disk_free_gib=200,
+):
     return gpu_probe._probe_hardware(
         profile=profile,
         torch_module=torch_module,
         nvidia_smi_probe=lambda: smi,
         toolkit_probe=lambda: toolkit,
         host_resource_probe=lambda: resources,
+        min_disk_free_bytes=min_disk_free_gib * 1024**3,
     )
 
 
@@ -93,6 +117,47 @@ def test_rtx5090_r0_accepts_autodl_16_core_90_gb_profile():
 
     assert result["host_cpu_count"] == 16
     assert result["host_total_memory_bytes"] == 90_000_000_000
+
+
+def test_gpu_disk_gate_uses_the_requested_phase_budget():
+    torch_module, smi, resources = _hardware_inputs()
+    resources["persistent_disk_free_bytes"] = 127 * 1024**3
+
+    result = _probe_with(
+        torch_module,
+        smi,
+        resources,
+        min_disk_free_gib=80,
+    )
+    assert result["minimum_persistent_disk_free_bytes"] == 80 * 1024**3
+    with pytest.raises(gpu_probe.ProbeError, match="128 GiB"):
+        _probe_with(
+            torch_module,
+            smi,
+            resources,
+            min_disk_free_gib=128,
+        )
+
+
+def test_gpu_stage_assigns_phase_specific_disk_budgets():
+    source = (REPO_ROOT / "scripts" / "cloud" / "run_stage.sh").read_text(
+        encoding="utf-8"
+    )
+    preflight = source.split("    gpu-preflight)", 1)[1].split("    g0)", 1)[0]
+
+    assert "gpu-gates) min_gpu_disk_free_gib=128" in preflight
+    assert "gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)" in preflight
+    assert "min_gpu_disk_free_gib=80" in preflight
+    assert '"${REMEMR1_PHASE_REVALIDATION_ONLY:-no}" == yes' in preflight
+    assert "min_gpu_disk_free_gib=8" in preflight
+    assert '--min-disk-free-gib "${min_gpu_disk_free_gib}"' in preflight
+    pipeline = (REPO_ROOT / "scripts" / "cloud" / "run_pipeline.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        'if [[ "${PHASE}" == "cpu-finalize" ]]; then\n'
+        "    export REMEMR1_MIN_FREE_GIB=128"
+    ) in pipeline
 
 
 def test_rtx5090_r0_rejects_15_cores_and_less_than_80_gib():
@@ -215,6 +280,7 @@ def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monke
         "gpu_uuid": "GPU-test-uuid",
         "host_cpu_count": 32,
         "host_total_memory_bytes": 128 * 1024**3,
+        "minimum_persistent_disk_free_bytes": 200 * 1024**3,
         "other_compute_process_count": 0,
         "persistent_disk_free_bytes": 250 * 1024**3,
         "persistent_disk_probe_path": "/persistent",
@@ -278,6 +344,31 @@ def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monke
         hardware_probe=lambda: hardware,
     )
     assert result["status"] == "verified-existing"
+
+    legacy_path = evidence_root / "causal-conv1d" / "bf16-forward.json"
+    original_legacy_evidence = legacy_path.read_text(encoding="ascii")
+    legacy_evidence = json.loads(original_legacy_evidence)
+    del legacy_evidence["hardware"]["minimum_persistent_disk_free_bytes"]
+    legacy_path.write_text(json.dumps(legacy_evidence), encoding="ascii")
+    build_info["kernels"]["causal-conv1d"]["bf16_forward_log_sha256"] = _sha256(
+        legacy_path
+    )
+    build_info_path.write_text(json.dumps(build_info), encoding="ascii")
+    with pytest.raises(gpu_probe.ProbeError, match="evidence identity changed"):
+        gpu_probe.verify_existing_evidence(
+            root,
+            evidence_root,
+            build_log,
+            freeze,
+            build_info_path,
+            minimum_optimizer_steps=20,
+            hardware_probe=lambda: hardware,
+        )
+    legacy_path.write_text(original_legacy_evidence, encoding="ascii")
+    build_info["kernels"]["causal-conv1d"]["bf16_forward_log_sha256"] = _sha256(
+        legacy_path
+    )
+    build_info_path.write_text(json.dumps(build_info), encoding="ascii")
 
     r1_hardware = {
         **hardware,

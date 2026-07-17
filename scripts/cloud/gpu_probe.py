@@ -301,9 +301,16 @@ def _probe_hardware(
     nvidia_smi_probe: Callable[[], Mapping[str, Any]] = _query_nvidia_smi,
     toolkit_probe: Callable[[], str] = _query_cuda_toolkit,
     host_resource_probe: Callable[[], Mapping[str, Any]] | None = None,
+    min_disk_free_bytes: int = MIN_DISK_FREE_BYTES,
 ) -> dict[str, Any]:
     if profile not in MIN_HOST_MEMORY_BYTES:
         raise ProbeError(f"unsupported capacity profile {profile!r}")
+    if (
+        not isinstance(min_disk_free_bytes, int)
+        or isinstance(min_disk_free_bytes, bool)
+        or min_disk_free_bytes <= 0
+    ):
+        raise ProbeError("minimum persistent disk space must be a positive integer")
     if torch_module is None:
         import torch as torch_module
 
@@ -376,9 +383,10 @@ def _probe_hardware(
             if isinstance(host_memory, int)
             else f"{profile} host RAM inventory is invalid"
         )
-    if not isinstance(disk_free, int) or disk_free < MIN_DISK_FREE_BYTES:
+    if not isinstance(disk_free, int) or disk_free < min_disk_free_bytes:
         raise ProbeError(
-            f"expected at least 200 GiB free persistent disk, observed {disk_free / GIB:.1f} GiB"
+            f"expected at least {min_disk_free_bytes / GIB:.0f} GiB free persistent disk, "
+            f"observed {disk_free / GIB:.1f} GiB"
             if isinstance(disk_free, int)
             else "persistent disk inventory is invalid"
         )
@@ -398,6 +406,7 @@ def _probe_hardware(
         "gpu_uuid": gpu_uuid,
         "host_cpu_count": cpu_count,
         "host_total_memory_bytes": host_memory,
+        "minimum_persistent_disk_free_bytes": min_disk_free_bytes,
         "other_compute_process_count": 0,
         "persistent_disk_free_bytes": disk_free,
         "persistent_disk_probe_path": resources.get("persistent_disk_probe_path", str(disk_path)),
@@ -421,12 +430,17 @@ def run_probe(
     *,
     optimizer_steps: int,
     profile: str = "R0",
+    minimum_disk_free_bytes: int = MIN_DISK_FREE_BYTES,
     hardware_probe: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     hardware = (
         hardware_probe()
         if hardware_probe is not None
-        else _probe_hardware(profile=profile, disk_path=evidence_root)
+        else _probe_hardware(
+            profile=profile,
+            disk_path=evidence_root,
+            min_disk_free_bytes=minimum_disk_free_bytes,
+        )
     )
     probes: dict[str, dict[str, Path]] = {}
     functions: dict[str, Callable[[str, int], dict[str, Any]]] = {
@@ -525,6 +539,7 @@ def verify_existing_evidence(
     *,
     minimum_optimizer_steps: int,
     profile: str = "R0",
+    minimum_disk_free_bytes: int = MIN_DISK_FREE_BYTES,
     hardware_probe: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     lock = environment.load_environment_lock(
@@ -539,7 +554,11 @@ def verify_existing_evidence(
     hardware = (
         hardware_probe()
         if hardware_probe is not None
-        else _probe_hardware(profile=profile, disk_path=evidence_root)
+        else _probe_hardware(
+            profile=profile,
+            disk_path=evidence_root,
+            min_disk_free_bytes=minimum_disk_free_bytes,
+        )
     )
     if hardware.get("capacity_profile") != profile:
         raise ProbeError("current host capacity profile differs from requested profile")
@@ -584,13 +603,32 @@ def verify_existing_evidence(
             }
             hardware_changed = not isinstance(evidence_hardware, Mapping) or any(
                 evidence_hardware.get(key) != hardware.get(key)
-                for key in stable_hardware_fields
+            for key in stable_hardware_fields
+            )
+            evidence_minimum_disk_free = (
+                evidence_hardware.get("minimum_persistent_disk_free_bytes")
+                if isinstance(evidence_hardware, Mapping)
+                else None
+            )
+            evidence_observed_disk_free = (
+                evidence_hardware.get("persistent_disk_free_bytes")
+                if isinstance(evidence_hardware, Mapping)
+                else None
+            )
+            disk_contract_invalid = (
+                not isinstance(evidence_minimum_disk_free, int)
+                or isinstance(evidence_minimum_disk_free, bool)
+                or evidence_minimum_disk_free <= 0
+                or not isinstance(evidence_observed_disk_free, int)
+                or isinstance(evidence_observed_disk_free, bool)
+                or evidence_observed_disk_free < evidence_minimum_disk_free
             )
             if (
                 evidence.get("kernel") != kernel
                 or evidence.get("mode") != mode
                 or evidence.get("status") != "verified"
                 or hardware_changed
+                or disk_contract_invalid
             ):
                 raise ProbeError(f"{kernel} {mode} evidence identity changed")
             steps = evidence.get("optimizer_steps")
@@ -608,6 +646,10 @@ def verify_existing_evidence(
     return {
         "build_info_sha256": info["build_info_sha256"],
         "driver_version": hardware["driver_version"],
+        "minimum_persistent_disk_free_bytes": hardware[
+            "minimum_persistent_disk_free_bytes"
+        ],
+        "persistent_disk_free_bytes": hardware["persistent_disk_free_bytes"],
         "status": "verified-existing",
     }
 
@@ -620,6 +662,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--build-info", type=Path, required=True)
     parser.add_argument("--optimizer-steps", type=int, default=20)
     parser.add_argument("--profile", choices=sorted(MIN_HOST_MEMORY_BYTES), default="R0")
+    parser.add_argument("--min-disk-free-gib", type=int, default=200)
     parser.add_argument("--verify-existing", action="store_true")
     return parser.parse_args(argv)
 
@@ -629,6 +672,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.optimizer_steps < 2:
             raise ProbeError("--optimizer-steps must be at least 2")
+        if args.min_disk_free_gib <= 0:
+            raise ProbeError("--min-disk-free-gib must be positive")
+        minimum_disk_free_bytes = args.min_disk_free_gib * GIB
         root = Path(__file__).resolve().parents[2]
         build_log = args.build_log.resolve(strict=True)
         freeze = args.pip_freeze.resolve(strict=True)
@@ -641,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.build_info,
                 minimum_optimizer_steps=args.optimizer_steps,
                 profile=args.profile,
+                minimum_disk_free_bytes=minimum_disk_free_bytes,
             )
             print(json.dumps(verified, sort_keys=True))
             return 0
@@ -648,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             args.evidence_root.resolve(),
             optimizer_steps=args.optimizer_steps,
             profile=args.profile,
+            minimum_disk_free_bytes=minimum_disk_free_bytes,
         )
         sealed = build_info(root, args.evidence_root, build_log, freeze, result)
         _atomic_json(args.build_info, sealed)

@@ -814,6 +814,18 @@ if [[ -f "${PIPELINE_STATE_DIR}/.failed" && "${RETRY_FAILED_STAGE}" != "yes" ]];
     echo "pipeline previously failed at ${failed_stage}; use --retry-failed-stage after inspection" >&2
     exit 1
 fi
+PHASE_WAS_SUCCESSFUL=no
+if [[ -e "${PIPELINE_STATE_DIR}/.success" || \
+      -L "${PIPELINE_STATE_DIR}/.success" ]]; then
+    [[ -f "${PIPELINE_STATE_DIR}/.success" && \
+       ! -L "${PIPELINE_STATE_DIR}/.success" && \
+       "$(<"${PIPELINE_STATE_DIR}/.success")" == 0 ]] || {
+        echo "pipeline success marker is unsafe or invalid" >&2
+        exit 1
+    }
+    PHASE_WAS_SUCCESSFUL=yes
+fi
+export REMEMR1_PHASE_REVALIDATION_ONLY="${PHASE_WAS_SUCCESSFUL}"
 if [[ ( "${PHASE}" == "cpu" || "${PHASE}" == "cpu-finalize" ) && \
       -f "${PIPELINE_DIR}/.gpu-started" ]]; then
     if [[ -f "${PIPELINE_STATE_DIR}/.success" ]]; then
@@ -1660,6 +1672,7 @@ if [[ "${PHASE}" == "cpu" ]]; then
 fi
 
 if [[ "${PHASE}" == "cpu-finalize" ]]; then
+    export REMEMR1_MIN_FREE_GIB=128
     CURRENT_STAGE="cpu-env-ready-revalidation"
     verify_cpu_env_ready || {
         echo "CPU finalization requires valid .cpu-env-ready evidence" >&2
@@ -1888,11 +1901,19 @@ case "${PHASE}" in
         ;;
     gpu-capacity)
         require_phase_predecessor "${PIPELINE_DIR}/.gpu-gates-ready" "GPU gates"
-        [[ ! -e "${PIPELINE_DIR}/.capacity-ready" && \
-           ! -L "${PIPELINE_DIR}/.capacity-ready" ]] || {
+        expected_capacity_profile="${REMEMR1_CAPACITY_OUTPUT_DIR}/capacity-profile.json"
+        if [[ -e "${PIPELINE_DIR}/.capacity-ready" || \
+              -L "${PIPELINE_DIR}/.capacity-ready" ]] && \
+           [[ "${PHASE_WAS_SUCCESSFUL}" != yes || \
+              ! -f "${PIPELINE_DIR}/.capacity-ready" || \
+              -L "${PIPELINE_DIR}/.capacity-ready" || \
+              "$(<"${PIPELINE_DIR}/.capacity-ready")" != \
+                  "${expected_capacity_profile}" || \
+              ! -f "${expected_capacity_profile}" || \
+              -L "${expected_capacity_profile}" ]]; then
             echo "capacity profile is already sealed; refusing another capacity run" >&2
             exit 1
-        }
+        fi
         export REMEMR1_OFFLOAD_PROFILE="${OFFLOAD_PROFILE}"
         export REMEMR1_R1_APPROVAL="${R1_APPROVAL}"
         if [[ -f "${PIPELINE_STATE_DIR}/last-capacity-stop-pointer" && \

@@ -314,6 +314,7 @@ def _gpu_fixture(pipeline: Path, profile="r0", host_memory_gib=128):
         "gpu_uuid": "GPU-test-uuid",
         "host_cpu_count": 32,
         "host_total_memory_bytes": host_memory_gib * GIB,
+        "minimum_persistent_disk_free_bytes": 128 * GIB,
         "other_compute_process_count": 0,
         "persistent_disk_free_bytes": 250 * GIB,
         "persistent_disk_probe_path": str(pipeline),

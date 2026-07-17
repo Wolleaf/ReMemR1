@@ -64,7 +64,9 @@ B/C40、B/C80、费用投影、R1 一次性批准和结果导出仍保留在内�
 
 - CPU 和 GPU 实例必须挂载同一个 provider volume，路径固定为 `/root/autodl-tmp`，且任何时刻只允许一个 host 写入。
 - 系统为 Ubuntu 22.04、root、非 WSL；`/root/autodl-tmp` 必须是独立持久挂载，不能是 `/`、overlay、tmpfs、ramfs 或 squashfs。
-- 无卡 CPU 准备按实时 cgroup 配额最低支持 `0.5 core / 2 GiB RAM`，并强制单线程/低并发；active profile 持久盘初始至少 200 GiB 可用。
+- 无卡 CPU 准备按实时 cgroup 配额最低支持 `0.5 core / 2 GiB RAM`，并强制单线程/低并发；
+  active profile 持久盘初始至少 200 GiB 可用。GPU 内部 `cpu-finalize`、gates、capacity 会按
+  剩余不可变产物预算分别要求至少 128/128/80 GiB，而不是错误地每次重要求 200 GiB。
 - GPU 必须恰好一张 NVIDIA GeForce RTX 5090，可见显存至少 31 GiB，启动空闲显存至少 29 GiB，无其它 compute process。
 - GPU compute capability 固定 `sm_120`；CUDA runtime/toolkit 固定 13.0；镜像为 12.8 时必须停止并重新封环境，不能视为等价。
 - 已记录机器的 GPU 态有效配额为 `16 cores / 90 GiB RAM`；R0 门禁为 80 GiB，因此可准入，实际峰值仍须由 G2 证明。该机器不满足 R1 的 128 GiB，正常 GPU 入口固定 R0 且不提供自动 R1。

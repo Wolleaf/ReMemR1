@@ -10,6 +10,7 @@ from scripts.reproduction import verify_environment as environment
 ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "environment" / "reproduction-cu130.lock.json"
 BUILD_INFO_TEMPLATE_PATH = ROOT / "environment" / "build-info.template.json"
+CLOUD_REQUIREMENTS_PATH = ROOT / "environment" / "reproduction-cloud.requirements.txt"
 
 
 def _load_lock():
@@ -66,6 +67,13 @@ def test_environment_lock_pins_critical_versions_and_unverified_kernels():
     }
     assert all(item["verification_status"] == "UNVERIFIED" for item in lock["kernels"])
     assert all(item["training_gate"] == "BLOCKED" for item in lock["kernels"])
+
+
+def test_cloud_requirements_pin_transformers_compatible_safetensors():
+    packages, vcs = environment._parse_requirements(CLOUD_REQUIREMENTS_PATH)
+
+    assert not vcs
+    assert packages["safetensors"] == "0.8.0"
 
 
 def test_lock_rejects_resealed_pin_that_diverges_from_requirements():

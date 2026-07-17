@@ -44,6 +44,8 @@ export GIT_CONFIG_VALUE_0="https://github.com/fla-org/flash-linear-attention.git
 export GIT_CONFIG_KEY_1="url.file://${SOURCE_ROOT}/causal-conv1d/.insteadOf"
 export GIT_CONFIG_VALUE_1="https://github.com/Dao-AILab/causal-conv1d.git"
 export PIP_NO_INDEX=1
+# The pinned causal-conv1d setup otherwise tries to download a release wheel.
+export CAUSAL_CONV1D_FORCE_BUILD=TRUE
 
 tmp_log="${BUILD_LOG}.tmp.$$"
 set +e

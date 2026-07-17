@@ -726,6 +726,17 @@ case "${STAGE}" in
             r1) probe_profile=R1 ;;
             *) echo "GPU preflight received an invalid offload profile" >&2; exit 2 ;;
         esac
+        if [[ "${REMEMR1_PHASE_REVALIDATION_ONLY:-no}" == yes ]]; then
+            min_gpu_disk_free_gib=8
+        else
+            case "${REMEMR1_PHASE}" in
+                gpu-gates) min_gpu_disk_free_gib=128 ;;
+                gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
+                    min_gpu_disk_free_gib=80
+                    ;;
+                *) echo "GPU preflight received an invalid phase" >&2; exit 2 ;;
+            esac
+        fi
         if [[ -f "${GPU_BUILD_INFO}" ]] && \
            run_logged environment-revalidation 20m \
                "${PYTHON}" scripts/reproduction/verify_environment.py \
@@ -738,6 +749,7 @@ case "${STAGE}" in
                --pip-freeze "${GPU_FREEZE}" \
                --build-info "${GPU_BUILD_INFO}" \
                --profile "${probe_profile}" \
+               --min-disk-free-gib "${min_gpu_disk_free_gib}" \
                --optimizer-steps 20; then
             echo "Existing sm_120 build evidence is valid on this GPU host" | tee -a "${LOG_FILE}"
         else
@@ -749,6 +761,7 @@ case "${STAGE}" in
                 --pip-freeze "${GPU_FREEZE}" \
                 --build-info "${GPU_BUILD_INFO}" \
                 --profile "${probe_profile}" \
+                --min-disk-free-gib "${min_gpu_disk_free_gib}" \
                 --optimizer-steps 20
             run_logged environment-gate 20m \
                 "${PYTHON}" scripts/reproduction/verify_environment.py \
@@ -761,6 +774,7 @@ case "${STAGE}" in
                 --pip-freeze "${GPU_FREEZE}" \
                 --build-info "${GPU_BUILD_INFO}" \
                 --profile "${probe_profile}" \
+                --min-disk-free-gib "${min_gpu_disk_free_gib}" \
                 --optimizer-steps 20
         fi
         ;;

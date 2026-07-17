@@ -163,6 +163,9 @@ CPU 和 RAM 门禁均取宿主可见资源与 cgroup quota/cpuset/memory limit �
 checkpoint、模型 cache 和评测结果必须全部落在持久盘。禁止把显存压力转化为系统盘 swap 或
 `/tmp/ray` 爆盘。R0 不应仅因实例 RAM 低于 128 GiB 被预先排除；R1 则必须满足更高
 RAM 门禁，并在 G2 中证明峰值低于可用内存 80%、无 swap 和无持续 page-fault 抖动。
+持久盘的 200 GiB 是 CPU 首次准备的初始门槛；按当前不可变 checkpoint 预算，GPU 内部
+`cpu-finalize`、gates 和 capacity 分别重验至少 128、128 和 80 GiB 剩余空间，避免在 250 GiB
+固定盘上把“初始门槛”错误重复为每阶段门槛，同时为 G2 的六份 checkpoint 保留安全余量。
 
 ### 2.3 自动关机与计费边界
 

@@ -427,6 +427,52 @@ request_guest_shutdown "${{root}}/success" gpu-gates 0
     assert result.returncode == 0, result.stderr
 
 
+def test_shutdown_authorizes_all_four_exact_terminal_marker_classes(tmp_path):
+    shutdown = shlex.quote(
+        _bash_path(REPO_ROOT / "scripts" / "cloud" / "lib" / "shutdown.sh")
+    )
+    root = shlex.quote(_bash_path(tmp_path / "terminal-markers"))
+    script = f"""
+set -euo pipefail
+source {shutdown}
+root={root}
+mkdir -p "${{root}}"
+
+for spec in '.success 0' '.failed 17' '.scientific-stop 42' '.capacity-stop 43'; do
+    rm -f -- "${{root}}"/.*-stop "${{root}}"/.success "${{root}}"/.failed
+    read -r marker exit_code <<< "${{spec}}"
+    printf '%s\n' "${{exit_code}}" > "${{root}}/${{marker}}"
+    _shutdown_verify_terminal_marker "${{root}}" "${{exit_code}}"
+done
+
+rm -f -- "${{root}}"/.*-stop "${{root}}"/.success "${{root}}"/.failed
+printf '42\n' > "${{root}}/.failed"
+if _shutdown_verify_terminal_marker "${{root}}" 42; then exit 91; fi
+rm -f -- "${{root}}/.failed"
+printf '43\n' > "${{root}}/.capacity-stop"
+printf '43\n' > "${{root}}/.failed"
+if _shutdown_verify_terminal_marker "${{root}}" 43; then exit 92; fi
+rm -f -- "${{root}}/.capacity-stop" "${{root}}/.failed"
+printf '42\n' > "${{root}}/target"
+ln -s target "${{root}}/.scientific-stop"
+if _shutdown_verify_terminal_marker "${{root}}" 42; then exit 93; fi
+"""
+
+    probe = tmp_path / "shutdown-terminal-marker-probe.sh"
+    probe.write_bytes(script.encode("ascii"))
+    result = subprocess.run(
+        [shutil.which("bash"), _bash_path(probe)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_bootstrap_log_drain_fails_closed_with_a_leaked_fifo_writer(tmp_path):
     source = BOOTSTRAP.read_text(encoding="utf-8")
     start = source.index("drain_bootstrap_log() {")

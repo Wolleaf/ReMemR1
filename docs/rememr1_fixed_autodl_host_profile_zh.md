@@ -23,6 +23,9 @@
 | 基础镜像 | Python 3.12.3，torch 2.12.1+cu130 |
 | 项目隔离环境 | CPU 准备另建 Python 3.12.2 锁定环境，不直接复用基础镜像 torch |
 
+该 250 GiB 盘按“CPU 初始 200 GiB、GPU `cpu-finalize`/gates 128 GiB、R0 capacity 80 GiB”
+的阶段剩余空间门槛使用；这些值是不可变产物预算，不是设备身份校验。
+
 ## 固定运行决策
 
 - Git clone/fetch/checkout 由操作者完成；CPU 命令固定当前 clean `HEAD`。

@@ -107,6 +107,13 @@ def _write_cloud_fixture(tmp_path: Path):
         bundle_paths.append(_bash_path(bundle))
     resolved_configs = persist / "resolved-configs"
     resolved_configs.mkdir()
+    for name in (
+        "g2a_qwen35_2b_5090_r0",
+        "g2b_qwen35_2b_5090_step1_r0",
+        "g2b_qwen35_2b_5090_resume5_r0",
+        "g2_length_stress_qwen35_2b_5090_r0",
+    ):
+        (resolved_configs / f"{name}.yaml").write_text("{}\n", encoding="ascii")
 
     fake_python = env_prefix / "bin" / "python"
     fake_python_script = (
@@ -206,6 +213,23 @@ def _write_cloud_fixture(tmp_path: Path):
         "fi\n"
         "if [[ \"${stage}\" == cpu-handoff ]]; then\n"
         "  printf '{}\\n' > \"${REMEMR1_PIPELINE_DIR}/cpu-handoff.json\"\n"
+        "fi\n"
+        "case \"${stage}\" in\n"
+        "  g2a|g2b-step1|g2b-resume5|g2-length-stress)\n"
+        "    printf '{}\\n' > \"${run}/telemetry.json\"\n"
+        "    ;;\n"
+        "  g2-artifacts)\n"
+        "    mkdir -p \"${run}/artifacts/capacity-inputs\" \"${REMEMR1_CAPACITY_OUTPUT_DIR}\"\n"
+        "    printf '{}\\n' > \"${run}/artifacts/g2-artifacts.json\"\n"
+        "    for name in identity selected-configs attempt-metadata telemetry; do\n"
+        "      printf '{}\\n' > \"${run}/artifacts/capacity-inputs/${name}.json\"\n"
+        "      printf '{}\\n' > \"${REMEMR1_CAPACITY_OUTPUT_DIR}/${name}.json\"\n"
+        "    done\n"
+        "    ;;\n"
+        "esac\n"
+        "if [[ \"${stage}\" == capacity-seal ]]; then\n"
+        "  mkdir -p \"${REMEMR1_CAPACITY_OUTPUT_DIR}\"\n"
+        "  printf '{}\\n' > \"${REMEMR1_CAPACITY_OUTPUT_DIR}/capacity-profile.json\"\n"
         "fi\n"
         "if [[ \"${stage}\" == g0 ]]; then\n"
         f"  if [[ ! -e {shlex.quote(_bash_path(g0_sentinel))} ]]; then\n"
@@ -742,6 +766,73 @@ def test_successful_cpu_finalization_is_reusable_after_gpu_start(tmp_path):
     assert repeated.returncode == 0, repeated.stderr
     assert "already finalized before GPU start" in repeated.stdout
     assert len(events.read_text(encoding="utf-8").splitlines()) == event_count
+
+
+def test_successful_r0_capacity_rerun_revalidates_without_downgrading(tmp_path):
+    env, persist, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+    initialized = _run_pipeline(env, lock_file, "--phase", "cpu", "--dry-run")
+    assert initialized.returncode == 0, initialized.stderr
+    pipeline = next(pipeline_root.iterdir())
+    handoff = pipeline / "cpu-handoff.json"
+    handoff.write_text("{}\n", encoding="ascii")
+    (pipeline / ".cpu-ready").write_bytes(
+        (_bash_path(handoff) + "\n").encode("ascii")
+    )
+
+    first_gates = _run_pipeline(env, lock_file, "--phase", "gpu-gates")
+    assert first_gates.returncode == 23, first_gates.stderr
+    gates = _run_pipeline(
+        env,
+        lock_file,
+        "--phase",
+        "gpu-gates",
+        "--retry-failed-stage",
+    )
+    assert gates.returncode == 0, gates.stderr
+    first_capacity = _run_pipeline(
+        env,
+        lock_file,
+        "--phase",
+        "gpu-capacity",
+        "--offload-profile",
+        "r0",
+    )
+    assert first_capacity.returncode == 0, first_capacity.stderr
+    capacity_state = pipeline / "terminals" / "gpu-capacity" / "r0" / "base"
+    assert _native_path(capacity_state / ".success").read_text(
+        encoding="ascii"
+    ).strip() == "0"
+
+    repeated = _run_pipeline(
+        env,
+        lock_file,
+        "--phase",
+        "gpu-capacity",
+        "--offload-profile",
+        "r0",
+    )
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert _native_path(capacity_state / ".success").read_text(
+        encoding="ascii"
+    ).strip() == "0"
+    assert not _native_path(capacity_state / ".failed").exists()
+    stage_events = [
+        line
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.startswith("stage:")
+    ]
+    assert stage_events.count("stage:gpu-preflight") == 4
+    for stage in (
+        "g2a",
+        "g2b-step1",
+        "g2b-resume5",
+        "g2-length-stress",
+        "g2-artifacts",
+        "capacity-seal",
+    ):
+        assert stage_events.count(f"stage:{stage}") == 1
+    assert _native_path(persist / "pipeline-result.terminal").is_file()
 
 
 def test_r1_approval_is_claimed_once_and_dry_run_does_not_consume(tmp_path):
