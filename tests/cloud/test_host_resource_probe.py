@@ -1,3 +1,5 @@
+import argparse
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from scripts.cloud.host_resource_probe import (
     GIB,
     ProbeError,
+    _positive_fraction,
     check_minimums,
     create_memory_telemetry_probe,
     probe_resources,
@@ -59,7 +62,7 @@ def test_v2_unlimited_limits_use_host_resources(tmp_path):
     assert check_minimums(result, min_cpu_cores=24, min_ram_gib=48) == []
 
 
-def test_v2_half_core_and_two_gib_fail_both_minimums(tmp_path):
+def test_v2_half_core_and_two_gib_support_low_resource_minimums(tmp_path):
     _v2_fixture(
         tmp_path,
         memory_max=str(2 * GIB),
@@ -76,6 +79,41 @@ def test_v2_half_core_and_two_gib_fail_both_minimums(tmp_path):
     assert len(violations) == 2
     assert "500 millicores" in violations[0]
     assert "2147483648 bytes" in violations[1]
+    assert check_minimums(
+        result,
+        min_cpu_cores=Fraction(1, 2),
+        min_ram_gib=2,
+    ) == []
+
+
+def test_low_resource_minimums_reject_less_than_half_core_or_two_gib(tmp_path):
+    _v2_fixture(
+        tmp_path,
+        memory_max=str(2 * GIB - 1),
+        cpu_max="49999 100000",
+    )
+
+    result = probe_resources(tmp_path, host_cpu_count=32)
+    violations = check_minimums(
+        result,
+        min_cpu_cores=Fraction(1, 2),
+        min_ram_gib=2,
+    )
+
+    assert len(violations) == 2
+    assert "requires at least 1/2 effective CPU cores" in violations[0]
+    assert "requires at least 2 GiB effective RAM" in violations[1]
+
+
+def test_positive_fraction_accepts_integer_and_fraction_values():
+    assert _positive_fraction("1/2") == Fraction(1, 2)
+    assert _positive_fraction("16") == Fraction(16, 1)
+
+
+@pytest.mark.parametrize("value", ["0", "-1/2", "1/0", "not-a-number"])
+def test_positive_fraction_rejects_nonpositive_or_malformed_values(value):
+    with pytest.raises(argparse.ArgumentTypeError, match="positive integer or fraction"):
+        _positive_fraction(value)
 
 
 def test_active_profile_accepts_16_cores_and_90_gb_but_rejects_15_cores(tmp_path):
@@ -287,7 +325,7 @@ def test_cpu_preflight_uses_probe_with_profile_defaults():
     )
     preflight = source.split("    cpu-preflight)", 1)[1].split("        ;;", 1)[0]
 
-    assert 'min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-16}"' in preflight
-    assert 'min_ram_gib="${REMEMR1_MIN_RAM_GIB:-48}"' in preflight
+    assert 'min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-1/2}"' in preflight
+    assert 'min_ram_gib="${REMEMR1_MIN_RAM_GIB:-2}"' in preflight
     assert "python3 scripts/cloud/host_resource_probe.py" in preflight
     assert preflight.index("run_logged checkout") < preflight.index("host-resource-preflight")

@@ -132,7 +132,7 @@ commit `36f7166` 的 `run_pipeline.sh` 只列出 CPU stages 和 `gpu-preflight -
 
 - 从 2026-07-18 起有 5-6 周；
 - 单人每周可以稳定投入约 15-25 小时；
-- 使用单张 RTX 5090 32GB；R0 按 cgroup 有效资源至少 `16 cores / 80 GiB RAM`（标准 `16 cores / 90 GB` AutoDL 机型可准入），如容量证据要求转 R1，则至少 128 GiB RAM；
+- 使用已采集的单张 RTX 5090 32GB 固定机器；GPU 开启态 cgroup 为 `16 cores / 90 GiB RAM`，可准入 R0，但不满足 R1 的 128 GiB；无卡 CPU 阶段另按 `0.5 core / 2 GiB` 低资源环境准备模式设计；
 - 总预算 500 元，GPU 硬停止线 450 元；
 - 每个门禁最多做两次“保留完整证据、先定位原因”的重试；
 - 不在训练中途静默降 dtype、换 seed、挑 checkpoint 或修改一边的配置；

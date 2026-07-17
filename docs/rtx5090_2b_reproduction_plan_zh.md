@@ -9,8 +9,9 @@
 
 本文给出从当前“RTX PRO 6000 96GB + Qwen3.5-4B”方案迁移到“单 RTX 5090 32GB +
 Qwen3.5-2B”的完整实施契约。配置、云端门禁、训练、评测、恢复、费用控制和对外表述均以本文
-为准。代码适配完成不等于已经取得 GPU 实测结果；仍须严格按 G-1 -> G0/G1 -> G2 -> B/C40
--> B/C80 的独立付费阶段执行，任何长训练都必须由操作者显式启动。
+为准。代码适配完成不等于已经取得 GPU 实测结果。正常操作面固定为“用户手动 Git +
+一条 CPU 准备命令 + 一条 GPU 训练命令”；GPU 命令内部完成 G-1/G0/G1/G2 并停在 L0。
+B/C40 与 B/C80 仍是可选、显式费用批准的高级研究阶段，不由正常 GPU 命令自动启动。
 
 本轮明确排除《项目推荐》中建议的新增压缩工具：不增加 `compress_context`，不改成 JSON action，
 也不改变 Agent 动作语义。中间轮次继续要求恰好一个非空 `<update>`，允许至多一个非空
@@ -54,8 +55,9 @@ ReMemR1 的核心机制与对照：
 
 ### 0.3 当前实现边界
 
-仓库已按 active profile 增加 CPU preparation、5090 G0/G1、G2 capacity、B/C40、B/C80 和结果
-导出的独立入口，并将 4B 资产排除出 active handoff。这里的“已实现”仅表示代码、配置和本地
+仓库已按 active profile 增加无卡 CPU 环境准备、GPU 交接封存、5090 G0/G1、R0 G2 capacity、
+B/C40、B/C80 和结果导出的内部阶段，并将 4B 资产排除出 active handoff。正常对外只暴露
+`prepare_cpu.sh` 和 `run_gpu.sh`。这里的“已实现”仅表示代码、配置和本地
 验证可交付，不表示已在真实 5090 上完成训练。正式容量、耗时、费用和科学结论仍为空，必须由
 云端 immutable attempts、self-hashed evidence 和 verified package 填充，禁止用规划值冒充实测值。
 
@@ -145,16 +147,19 @@ GPU preflight 还要求恰好一张可见 GPU、启动时无其它 compute proce
 
 | 资源 | 最低 | 推荐 |
 |---|---:|---:|
-| CPU | 16 cores | 24-32 cores |
-| CPU preparation RAM | 48 GiB | 64-90 GiB |
+| 无卡 CPU prepare | 0.5 core / 2 GiB RAM | 2-4 cores / 8 GiB RAM |
+| GPU host CPU（含 cpu-finalize 与 R0） | 16 cores | 24-32 cores |
 | GPU host RAM（R0） | 80 GiB | 90 GiB 或以上 |
 | GPU host RAM（R1） | 128 GiB | 160-192 GiB |
 | 持久盘可用空间 | 200 GiB | 250 GiB |
 | 系统 | Ubuntu 22.04 | 同左 |
 | Python | 3.12.2 持久隔离环境 | 同左 |
 
-CPU 和 RAM 门禁均取宿主可见资源与 cgroup quota/cpuset/memory limit 的有效较小值。标准
-AutoDL 标称 `16 cores / 90 GB`（十进制 90 GB 约为 83.8 GiB）的 5090 实例可进入 R0，但不能据此预设训练一定通过。offload、Ray 临时目录、
+无卡 CPU prepare 只安装持久环境、准备 kernel 源码和下载资产，强制隐藏 CUDA、单线程运行，
+不在 2 GiB RAM 中构建正式数据；数据、测试、配置和 handoff 留到 GPU 实例上的 `cpu-finalize`。
+CPU 和 RAM 门禁均取宿主可见资源与 cgroup quota/cpuset/memory limit 的有效较小值。已采集
+固定机器在 GPU 开启态的 cgroup 实值为 `16 cores / 90 GiB`，可进入 R0，但不能据此预设训练一定通过。
+其 R1 128 GiB 门禁确定不满足。offload、Ray 临时目录、
 checkpoint、模型 cache 和评测结果必须全部落在持久盘。禁止把显存压力转化为系统盘 swap 或
 `/tmp/ray` 爆盘。R0 不应仅因实例 RAM 低于 128 GiB 被预先排除；R1 则必须满足更高
 RAM 门禁，并在 G2 中证明峰值低于可用内存 80%、无 swap 和无持续 page-fault 抖动。
@@ -163,11 +168,11 @@ RAM 门禁，并在 G2 中证明峰值低于可用内存 80%、无 swap 和无�
 
 沿用现有云端状态机：
 
-- 每个 CPU/GPU phase 使用全局持久锁、`nohup + setsid`、独立 launcher 和原始退出码；
+- 公开 CPU 和 GPU 命令各使用一个全局持久锁、`nohup + setsid`、独立 launcher 和原始退出码；
 - 成功、non-retryable scientific-stop 和终态失败均先同步日志、匹配的 terminal marker、checkpoint/evidence，再请求 guest shutdown；
 - 锁冲突、状态无法落盘、sync 失败、授权复验失败、`--keep-running` 和 `--dry-run` 不关机；
 - guest shutdown 后仍必须在 AutoDL 控制台确认停止计费；
-- G2、B/C40、B/C80 必须是三个独立付费决策，不允许一条命令无门控地跑完全部长训练。
+- 正常 GPU 命令只跑到 G2/L0；B/C40 和 B/C80 仍需新费用投影与显式决策，不会被自动连跑。
 
 ---
 
@@ -747,40 +752,37 @@ R0、所有 retry 和此前训练/评测 attempt；`C_non_gpu_done` 记录已发
 
 ## 9. 云端执行拓扑
 
-候选目标入口按付费决策拆分：
+正常操作入口按用户定义收口为 Git + CPU + GPU：
 
 ~~~text
-CPU 一键 preparation
-  -> 固定 commit/env/assets/data/config/handoff
+Git（用户自行处理）
+  -> /root/autodl-tmp/ReMemR1 已是目标 clean checkout
+
+CPU prepare（一条命令，无卡 0.5 core / 2 GiB）
+  -> 固定当前 40 位 HEAD
+  -> 持久 Python env / dependency freeze
+  -> 预取 kernel sources / models / datasets
+  -> 发布 .cpu-env-ready
   -> 成功或终态失败后关机
 
-5090 bounded gates
+GPU train（一条命令，固定 R0）
+  -> 隐藏 CUDA，离线构建 data/config 并密封 cpu-handoff
   -> hardware/kernel G0
   -> 2B G1 step1/resume2/artifacts
-  -> 成功或终态失败后关机
-
-5090 2B capacity R0 launcher
   -> G2a R0
   -> G2b R0
   -> length stress R0
   -> 发布 capacity-profile.json
   -> 成功或终态失败后关机
 
-若且仅若 R0 是容量黄色/失败：人工检查并显式批准
-  -> 新 5090 capacity R1 launcher
-  -> 从头 G2a -> G2b -> length stress R1
-  -> 发布 R1 capacity-profile.json
-  -> 成功或终态失败后关机
-
-5090 B/C40
+可选高级研究（不由正常 GPU 命令触发）
+  -> 人工检查 L0 容量/耗时/费用证据
+  -> 新投影批准 B/C40
   -> B pilot -> C pilot
   -> B20 -> C20 -> B40 -> C40
   -> endpoint resume probe/checkpoint/export/merge
   -> 32 QA/格 + callback 消融
   -> verified package
-  -> 成功或终态失败后关机
-
-人工检查费用与结果门禁
   -> 可选 5090 B/C80
   -> B60 -> C60 -> B80 -> C80
   -> endpoint resume probe
@@ -789,8 +791,8 @@ CPU 一键 preparation
   -> 成功或终态失败后关机
 ~~~
 
-G2、B/C40 和 B/C80 绝不合并为一次无界启动。每段 launcher 必须持久化原始退出码、显式 predecessor、
-resolved config、capacity profile、GPU ledger 和关机状态。
+正常 GPU launcher 只合并有界的 L0 闭环，不进入 B/C 长训练。内部 cpu-finalize、gates 和 capacity
+仍各自持久化原始退出码、显式 predecessor、resolved config、capacity profile 和 GPU ledger；任一失败立即短路。
 
 ---
 
@@ -818,12 +820,12 @@ inventory、G2/B/C DAG、matrix dispatcher、跨 cell 配对校验、聚合和 v
 | 权威文档 | 评审通过后将本方案提升为权威，并更新 handoff/README |
 | Profile namespace | 将 active profile ID 纳入 persistent root、pipeline identity、handoff 和 output 路径，隔离旧 4B state |
 | Hardware profile | 严格验证 RTX 5090、单卡、>=31 GiB、sm_120/CUDA13、无其它 compute process、启动空闲显存 >=29 GiB |
-| Host resources | CPU preflight 新增 >=16 cores、>=48 GiB RAM、初始 >=200 GiB 持久盘；每个 GPU phase 按 cgroup 有效配额重验 CPU、profile RAM 和“预计写入量 + 终态 reserve”的剩余盘 |
+| Host resources | 无卡 CPU prepare 支持 0.5 core/2 GiB 低资源模式、初始 >=200 GiB 持久盘；GPU 固定实测的 16 cores/90 GiB R0，并重验剩余盘 |
 | Asset profile | 新建仅含 0.8B、2B 和所需数据的 active manifest；旧含 4B manifest 留在 inactive profile，不能在旧 manifest 中运行时跳过 4B |
 | Formal bundles | 在 2B namespace 使用固定 2B tokenizer identity 重建 train/validation/eval，并单独封存 non-scientific length-stress bundle；不能沿用 4B identity |
 | Config/handoff | resolver 封存 33 份 active resolved configs；handoff 对 profile、config 和 asset exact-key 校验 |
 | Capacity evidence | 新增 `capacity-profile.json`、峰值显存/RAM/step-time ledger |
-| Pipeline | 在现有 G0/G1 后新增独立 G2、B/C40、B/C80 phases，并更新 phase adoption/verification 与 predecessor DAG |
+| Pipeline | 新增公开 CPU prepare 与 GPU L0 复合入口；内部 cpu-finalize -> G0/G1 -> R0 G2 仍保留独立状态，B/C40/B/C80 保留为高级 phase |
 | Recovery | 绑定 capacity profile、offload profile、step/predecessor 和 artifact identity；resume 实现错误不得靠切 R1 掩盖 |
 | Evaluation | 新增 eval40/eval80 fail-closed configs、matrix dispatcher、跨 cell QA 顺序验证、聚合和原子发布 |
 | Packaging | 输出 Base/B/C、callback 消融、资源账本、失败记录和 resume 证据 |
@@ -868,21 +870,18 @@ resolved YAML；加上沿用的 G0/G1 三份和 eval40/eval80 两份，共 33 �
 allowlist、resolved index、asset manifest 或 handoff。新测试既要证明旧 4B 文件未被意外改写，也要
 证明 2B B/C resolved configs 除预注册差异外完全相同。
 
-### 10.4 建议的新云端入口
+### 10.4 云端入口
 
-名称可在实施时按现有风格微调，但职责必须分离：
+正常操作只暴露两个脚本：
 
 ~~~text
-scripts/cloud/start_gpu_gates.sh             # G0/G1，改为 5090 profile
-scripts/cloud/start_gpu_2b_capacity.sh       # G2a/G2b/length stress + profile seal
-scripts/cloud/start_gpu_2b_bc40.sh           # pilots + B/C20->40 + 中期评测/包
-scripts/cloud/start_gpu_2b_bc80.sh           # B/C40->60->80 + 最终评测/包
-scripts/cloud/export_2b_results.sh            # 只验证/打包，不训练
+scripts/cloud/prepare_cpu.sh                  # 手动 Git 后的无卡环境/资产准备
+scripts/cloud/run_gpu.sh                      # 离线 cpu-finalize -> G0/G1 -> R0 G2/L0
 ~~~
 
-`start_gpu_2b_bc80.sh` 必须要求已验证的 B/C40 package 和显式、自哈希的 `bc80` 费用投影，不能因
-目录存在就自动续跑。Pipeline 还要独立重验 active profile/commit、capacity profile、B/C40 package
-和两边 step40 checkpoint；费用投影作为一次启动代的批准证据，旧投影不能在新增支出后继续复用。
+旧 `start_gpu_*`、`export_2b_results.sh` 和费用/R1 工具保留为高级研究、诊断与恢复入口，
+不出现在正常操作路径中。`start_gpu_2b_bc80.sh` 仍必须要求已验证的 B/C40 package 和新的自哈希
+`bc80` 费用投影，不能因目录存在就自动续跑。
 
 新增入口并不够；以下共享路径必须同步修改和测试：
 
@@ -890,15 +889,15 @@ scripts/cloud/export_2b_results.sh            # 只验证/打包，不训练
 |---|---|
 | `init_cloud.sh` / `lib/runtime.sh` | 从 active profile ID 派生并验证独立 cache/data/cloud/output roots，写入持久 runtime env |
 | `launch.sh` / `launcher_worker.sh` / `status.sh` / `lib/shutdown.sh` | 新 phase allowlist、request identity、success/failure/scientific-stop/capacity-stop 四类 terminal marker、全程持锁、终态先同步再决定关机及正确状态展示 |
-| `run_pipeline.sh` | G2、B/C40、B/C80 的有序 DAG、显式 predecessor、成功复验、保守 retry/adoption |
+| `run_pipeline.sh` | 低资源 CPU env/assets、离线 cpu-finalize、G0/G1/R0 G2 的有序 DAG，以及高级 B/C40/B/C80 的显式 predecessor/retry |
 | `run_stage.sh` | 各 stage 命令、timeout、离线环境、config/capacity/checkpoint verifier 和 telemetry |
 | `cloud_state.py` / `resolve_configs.py` | active profile schema、33-config exact inventory、2B asset/data namespace 与自哈希 handoff |
 | `gpu_probe.py` | 5090 identity、host RAM/disk、空闲显存、其它 compute process、整卡峰值和 CUDA13 门禁 |
 | artifact/eval helpers | resume5、selected profile、matrix cell、checkpoint 与 package identity 校验 |
 | `cloud-audit-policy.json` / tests | 精确入口、shutdown owner、test hook，以及 success/failure/signal/lock/sync/authorization 负例 |
 
-`scripts/cloud/README.md` 顶部必须保留最短正常路径：一个完整 CPU bootstrap block，以及当前人工批准
-付费阶段的一条 GPU 命令；stage-level 命令只用于诊断。G2、B/C40、B/C80 每段都在 success、
+`scripts/cloud/README.md` 顶部必须保留最短正常路径：用户手动 Git 后的一条 CPU 命令和一条 GPU 命令；
+stage-level 命令只用于诊断或高级科学实验。各内部 phase 都在 success、
 `capacity-stop`、`scientific-stop` 或 terminal failure 证据 durable sync 后才可请求关机，锁冲突、dry-run、keep-running、test mode、sync/authorization 失败
 必须保持实例运行。Guest poweroff 后仍需人工确认 AutoDL 控制面已停止计费。
 
@@ -908,8 +907,8 @@ CUDA 编译、模型加载或付费长任务前重新验证 sealed handoff、pre
 `HF_HUB_OFFLINE/HF_DATASETS_OFFLINE/TRANSFORMERS_OFFLINE` 下运行，缺资产时失败而不是联网补齐。
 
 每个新入口还必须在 README 给出对应 `status`、日志 tail、显式 retry 和 `--keep-running` 诊断命令，
-并解释 launcher admission 不等于 phase success。外层 bootstrap 下载失败时仓库脚本尚未运行，无法
-自动关机，操作者必须立即回控制台停止实例。
+并解释 launcher admission 不等于 phase success。用户手工 Git 失败时仓库脚本尚未运行，无法
+自动关机，操作者需自行修复 checkout；CPU/GPU 实例是否继续计费仍须在控制台确认。
 
 当前 `run_stage.sh` 的统一 6 小时训练 timeout 不适用于正式阶段：即使 `T_compute=15` 分钟，单个
 20-step segment 的纯计算也约 5 小时。G2 封存 profile 时必须根据实测分项发布每类 stage 的有界
@@ -937,7 +936,8 @@ verifier 生成新的 synthetic success attempt；partial checkpoint、OOM、NaN
 - `bash -n`/可行时 ShellCheck、Python `compileall` 与相关测试、33 份生产 config compose、静态 cloud audit、`git diff --check` 和新 shell mode `100755`。
 
 交付 commit push 后还必须验证远端分支解析到预期 40 位 SHA，并实际读取该 SHA 对应的 raw
-`bootstrap.sh`；README 的 exact commands/literals 与 `cloud-audit-policy.json` entrypoints 必须一致。
+`prepare_cpu.sh` 和 `run_gpu.sh`；README 的 exact commands/literals 与
+`cloud-audit-policy.json` entrypoints 必须一致。
 
 ---
 

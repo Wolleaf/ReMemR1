@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${PHASE}" in
-    cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
+    cpu|cpu-finalize|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
     *) usage; exit 2 ;;
 esac
 if [[ "${PHASE}" == "gpu-capacity" ]]; then
@@ -275,7 +275,10 @@ phase_stages() {
     case "$1" in
         cpu)
             printf '%s\n' cpu-preflight cpu-environment cpu-kernel-sources \
-                cpu-assets cpu-data cpu-tests cpu-configs cpu-handoff
+                cpu-assets
+            ;;
+        cpu-finalize)
+            printf '%s\n' cpu-preflight cpu-data cpu-tests cpu-configs cpu-handoff
             ;;
         gpu-gates)
             printf '%s\n' gpu-preflight g0 g1-step1 g1-resume2 g1-artifacts
@@ -386,7 +389,7 @@ fi
 
 SCOPE_OFFLOAD="${OFFLOAD_PROFILE:-none}"
 case "${PHASE}" in
-    cpu) SCOPE_OFFLOAD=none ;;
+    cpu|cpu-finalize) SCOPE_OFFLOAD=none ;;
     gpu-gates) SCOPE_OFFLOAD=r0 ;;
     gpu-bc40|gpu-bc80|gpu-export)
         SCOPE_OFFLOAD=unresolved
@@ -811,9 +814,14 @@ if [[ -f "${PIPELINE_STATE_DIR}/.failed" && "${RETRY_FAILED_STAGE}" != "yes" ]];
     echo "pipeline previously failed at ${failed_stage}; use --retry-failed-stage after inspection" >&2
     exit 1
 fi
-if [[ "${PHASE}" == "cpu" && -f "${PIPELINE_DIR}/.gpu-started" ]]; then
+if [[ ( "${PHASE}" == "cpu" || "${PHASE}" == "cpu-finalize" ) && \
+      -f "${PIPELINE_DIR}/.gpu-started" ]]; then
     if [[ -f "${PIPELINE_STATE_DIR}/.success" ]]; then
         publish_early_terminal_snapshot || exit "$?"
+        if [[ "${PHASE}" == "cpu-finalize" ]]; then
+            echo "[pipeline] CPU handoff was already finalized before GPU start" || true
+            exit 0
+        fi
     fi
     echo "GPU gates have already started; refusing to rerun or downgrade CPU state" >&2
     exit 1
@@ -877,7 +885,22 @@ stage_record_path() {
     local origin_profile="${OFFLOAD_PROFILE:-none}"
     local origin_dir=""
     case "${stage}" in
-        cpu-*) origin_phase=cpu; origin_profile=none ;;
+        cpu-preflight)
+            if [[ "${PHASE}" == cpu-finalize ]]; then
+                origin_phase=cpu-finalize
+            else
+                origin_phase=cpu
+            fi
+            origin_profile=none
+            ;;
+        cpu-environment|cpu-kernel-sources|cpu-assets)
+            origin_phase=cpu
+            origin_profile=none
+            ;;
+        cpu-data|cpu-tests|cpu-configs|cpu-handoff)
+            origin_phase=cpu-finalize
+            origin_profile=none
+            ;;
         g0|g1-step1|g1-resume2|g1-artifacts)
             origin_phase=gpu-gates
             origin_profile=r0
@@ -1517,31 +1540,150 @@ finish_phase() {
     }
 }
 
+CPU_ENV_STAGE_RECORD_DIR="${PIPELINE_DIR}/stages/cpu/none/base"
+CPU_ENV_SEAL="${PIPELINE_DIR}/cpu-env-ready.seal"
+
+build_cpu_env_seal() {
+    local destination="$1"
+    local stage record run resolved pointer_sha meta_sha success_sha
+    [[ -d "${CPU_ENV_STAGE_RECORD_DIR}" && \
+       ! -L "${CPU_ENV_STAGE_RECORD_DIR}" ]] || return 1
+    {
+        printf 'schema_version=1\n'
+        printf 'git_commit=%s\n' "${REMEMR1_EXPECTED_COMMIT}"
+        printf 'experiment_profile_id=%s\n' "${REMEMR1_EXPERIMENT_PROFILE}"
+        printf 'stage_record_dir=%s\n' "${CPU_ENV_STAGE_RECORD_DIR}"
+        for stage in cpu-preflight cpu-environment cpu-kernel-sources cpu-assets; do
+            record="${CPU_ENV_STAGE_RECORD_DIR}/${stage}.run"
+            [[ -f "${record}" && ! -L "${record}" && \
+               "$(wc -l < "${record}")" -eq 1 ]] || return 1
+            IFS= read -r run < "${record}" || return
+            [[ -d "${run}" && ! -L "${run}" ]] || return 1
+            resolved="$(realpath -e -- "${run}")" || return
+            case "${resolved}" in
+                "${STAGE_RUN_ROOT}/"*) ;;
+                *) return 1 ;;
+            esac
+            [[ -f "${resolved}/run.meta" && ! -L "${resolved}/run.meta" && \
+               -f "${resolved}/.success" && ! -L "${resolved}/.success" && \
+               "$(<"${resolved}/.success")" == 0 && \
+               ! -e "${resolved}/.running" && ! -e "${resolved}/.failed" && \
+               ! -e "${resolved}/.scientific-stop" && \
+               ! -e "${resolved}/.capacity-stop" ]] || return 1
+            grep -Fqx 'schema_version=1' "${resolved}/run.meta" || return
+            grep -Fqx "stage=${stage}" "${resolved}/run.meta" || return
+            grep -Fqx "git_commit=${REMEMR1_EXPECTED_COMMIT}" \
+                "${resolved}/run.meta" || return
+            grep -Fqx \
+                "experiment_profile_id=${REMEMR1_EXPERIMENT_PROFILE}" \
+                "${resolved}/run.meta" || return
+            grep -Fqx 'phase=cpu' "${resolved}/run.meta" || return
+            grep -Fqx 'offload_profile=' "${resolved}/run.meta" || return
+            grep -Fqx 'budget_projection_sha256=' "${resolved}/run.meta" || return
+            grep -Fqx 'r1_approval_marker_sha256=' "${resolved}/run.meta" || return
+            grep -Fqx 'scope_generation=base' "${resolved}/run.meta" || return
+            grep -Fqx "pipeline_dir=${PIPELINE_DIR}" "${resolved}/run.meta" || return
+            pointer_sha="$(sha256sum "${record}" | awk '{print $1}')" || return
+            meta_sha="$(sha256sum "${resolved}/run.meta" | awk '{print $1}')" || return
+            success_sha="$(sha256sum "${resolved}/.success" | awk '{print $1}')" || return
+            printf 'stage.%s.pointer_sha256=%s\n' "${stage}" "${pointer_sha}"
+            printf 'stage.%s.run_meta_sha256=%s\n' "${stage}" "${meta_sha}"
+            printf 'stage.%s.success_sha256=%s\n' "${stage}" "${success_sha}"
+        done
+    } > "${destination}"
+}
+
+publish_cpu_env_seal() {
+    local temporary="${CPU_ENV_SEAL}.tmp.$$"
+    [[ ! -e "${temporary}" && ! -L "${temporary}" ]] || return 1
+    build_cpu_env_seal "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+    if [[ -e "${CPU_ENV_SEAL}" || -L "${CPU_ENV_SEAL}" ]]; then
+        [[ -f "${CPU_ENV_SEAL}" && ! -L "${CPU_ENV_SEAL}" ]] && \
+            cmp -s "${temporary}" "${CPU_ENV_SEAL}" || {
+                rm -f -- "${temporary}"
+                return 1
+            }
+        rm -f -- "${temporary}"
+    else
+        mv -- "${temporary}" "${CPU_ENV_SEAL}" || return
+    fi
+    rememr1_sync_file "${CPU_ENV_SEAL}"
+}
+
+verify_cpu_env_ready() {
+    local marker="${PIPELINE_DIR}/.cpu-env-ready"
+    local temporary="${CPU_ENV_SEAL}.verify.$$"
+    [[ -f "${marker}" && ! -L "${marker}" && \
+       "$(wc -l < "${marker}")" -eq 1 && \
+       "$(<"${marker}")" == "${CPU_ENV_SEAL}" && \
+       -f "${CPU_ENV_SEAL}" && ! -L "${CPU_ENV_SEAL}" ]] || return 1
+    build_cpu_env_seal "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+    local rc=0
+    cmp -s "${temporary}" "${CPU_ENV_SEAL}" || rc="$?"
+    rm -f -- "${temporary}"
+    return "${rc}"
+}
+
 if [[ "${PHASE}" == "cpu" ]]; then
+    if [[ -e "${PIPELINE_DIR}/.cpu-env-ready" || \
+          -L "${PIPELINE_DIR}/.cpu-env-ready" ]]; then
+        CURRENT_STAGE="cpu-env-revalidation"
+        verify_cpu_env_ready || {
+            echo "persisted CPU environment readiness evidence is invalid" >&2
+            exit 1
+        }
+        finish_phase "${PIPELINE_DIR}/.cpu-env-ready" "${CPU_ENV_SEAL}" \
+            "${PIPELINE_STATE_DIR}/.success"
+        PIPELINE_FINISHED="yes"
+        echo "[pipeline] CPU environment was already prepared: ${CPU_ENV_SEAL}" || true
+        exit 0
+    fi
+    for stage in $(phase_stages "${PHASE}"); do
+        run_stage "${stage}"
+    done
+    CURRENT_STAGE="cpu-env-finalization"
+    publish_cpu_env_seal || {
+        echo "CPU environment readiness evidence could not be sealed" >&2
+        exit 1
+    }
+    finish_phase "${PIPELINE_DIR}/.cpu-env-ready" "${CPU_ENV_SEAL}" \
+        "${PIPELINE_STATE_DIR}/.success"
+    PIPELINE_FINISHED="yes"
+    echo "[pipeline] CPU environment ready: ${CPU_ENV_SEAL}" || true
+    exit 0
+fi
+
+if [[ "${PHASE}" == "cpu-finalize" ]]; then
+    CURRENT_STAGE="cpu-env-ready-revalidation"
+    verify_cpu_env_ready || {
+        echo "CPU finalization requires valid .cpu-env-ready evidence" >&2
+        exit 1
+    }
+    export CUDA_VISIBLE_DEVICES=''
+    export NVIDIA_VISIBLE_DEVICES=void
+    export REMEMR1_ALLOW_GPU_CPU_PHASE=yes
+    export HF_HUB_OFFLINE=1
+    export HF_DATASETS_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
     if [[ -f "${PIPELINE_DIR}/.cpu-ready" ]]; then
         CURRENT_STAGE="cpu-handoff-revalidation"
         handoff="$(<"${PIPELINE_DIR}/.cpu-ready")"
-        set +e
         timeout --verbose --signal=TERM --kill-after=5m 4h \
             "${REMEMR1_ENV_PREFIX}/bin/python" scripts/cloud/cloud_state.py verify-handoff \
             --handoff "${handoff}" --expected-commit "${REMEMR1_EXPECTED_COMMIT}"
-        ready_rc="$?"
-        set -e
-        if [[ "${ready_rc}" -eq 0 ]]; then
-            finish_phase "${PIPELINE_DIR}/.cpu-ready" "${handoff}" \
-                "${PIPELINE_STATE_DIR}/.success"
-            PIPELINE_FINISHED="yes"
-            echo "[pipeline] CPU preparation was already complete: ${handoff}" || true
-            exit 0
-        fi
-        if [[ "${RETRY_FAILED_STAGE}" != "yes" ]]; then
-            exit "${ready_rc}"
-        fi
-        echo "[pipeline] retrying after invalid CPU handoff" >&2
+        finish_phase "${PIPELINE_DIR}/.cpu-ready" "${handoff}" \
+            "${PIPELINE_STATE_DIR}/.success"
+        PIPELINE_FINISHED="yes"
+        echo "[pipeline] CPU handoff was already finalized: ${handoff}" || true
+        exit 0
     fi
-    for stage in \
-        cpu-preflight cpu-environment cpu-kernel-sources cpu-assets \
-        cpu-data cpu-tests cpu-configs cpu-handoff; do
+    for stage in $(phase_stages "${PHASE}"); do
         run_stage "${stage}"
     done
     CURRENT_STAGE="cpu-finalization"

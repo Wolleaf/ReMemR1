@@ -43,10 +43,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${phase}" in
-    cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
+    cpu|gpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
     *) echo "invalid worker phase: ${phase}" >&2; exit 2 ;;
 esac
-if [[ "${phase}" == "gpu-capacity" ]]; then
+if [[ "${phase}" == "gpu" ]]; then
+    [[ "${offload_profile}" == "r0" && -z "${r1_approval}" && \
+       -z "${r1_approval_file_sha256}" && -z "${budget_projection}" && \
+       -z "${budget_projection_file_sha256}" ]] || exit 2
+elif [[ "${phase}" == "gpu-capacity" ]]; then
     [[ "${offload_profile}" == "r0" || "${offload_profile}" == "r1" ]] || exit 2
     [[ "${offload_profile}" != "r1" || \
        ( -n "${r1_approval}" && \
@@ -103,6 +107,9 @@ lock_acquired=no
 outcome=failed
 terminal_publish_failure=write
 pipeline_invoked=no
+primary_result_file=""
+composite_active_phase=""
+composite_active_result_file=""
 
 launcher_test_failure_requested() {
     [[ "${REMEMR1_TEST_MODE:-no}" == "yes" && \
@@ -138,6 +145,62 @@ remove_running_marker() {
         return 1
     fi
     rememr1_test_event "running-marker-removed launcher_dir=${launcher_dir}"
+}
+
+replace_pointer_from_file() {
+    local source="$1"
+    local destination="$2"
+    local label="$3"
+    local value resolved
+    if [[ ! -e "${source}" && ! -L "${source}" ]]; then
+        rm -f -- "${destination}"
+        return 0
+    fi
+    [[ -f "${source}" && ! -L "${source}" ]] || {
+        echo "${label} source is unsafe: ${source}" >&2
+        return 1
+    }
+    value="$(<"${source}")"
+    [[ "${value}" == /* && "${value}" != *$'\n'* && \
+       -d "${value}" && ! -L "${value}" ]] || {
+        echo "${label} source contains an invalid directory pointer" >&2
+        return 1
+    }
+    resolved="$(rememr1_realpath_existing "${value}")" || return
+    rememr1_path_is_within "${resolved}" "${persist_real}" || {
+        echo "${label} source escaped persistent storage" >&2
+        return 1
+    }
+    atomic_write "${destination}" "${resolved}"
+}
+
+publish_active_composite_result() {
+    [[ "${phase}" == "gpu" && -n "${composite_active_result_file}" && \
+       -n "${primary_result_file}" ]] || return 0
+    [[ -f "${composite_active_result_file}" && \
+       ! -L "${composite_active_result_file}" ]] || {
+        rm -f -- "${primary_result_file}" "${primary_result_file}.terminal"
+        echo "composite subphase did not publish a safe pipeline result" >&2
+        return 1
+    }
+    replace_pointer_from_file "${composite_active_result_file}" \
+        "${primary_result_file}" "composite pipeline result" || return
+    local terminal_source="${composite_active_result_file}.terminal"
+    if [[ -e "${terminal_source}" || -L "${terminal_source}" ]]; then
+        [[ -e "${composite_active_result_file}" && \
+           ! -L "${composite_active_result_file}" ]] || {
+            echo "composite terminal pointer exists without a pipeline result" >&2
+            return 1
+        }
+    fi
+    if [[ ! -e "${terminal_source}" && ! -L "${terminal_source}" && \
+          "${dry_run}" != "yes" ]]; then
+        rm -f -- "${primary_result_file}.terminal"
+        echo "composite subphase did not publish a pipeline terminal pointer" >&2
+        return 1
+    fi
+    replace_pointer_from_file "${terminal_source}" \
+        "${primary_result_file}.terminal" "composite pipeline terminal"
 }
 
 publish_terminal_state() {
@@ -228,6 +291,12 @@ finish_worker() {
     trap - EXIT INT TERM
     set +e
     local publish_ok=no reserve sync_rc pipeline_state pipeline_shutdown_inhibited=no
+    if [[ "${phase}" == "gpu" && -n "${composite_active_phase}" ]] && \
+       ! publish_active_composite_result; then
+        pipeline_shutdown_inhibited=yes
+        atomic_write "${launcher_dir}/composite-result-transfer-failed" \
+            "${composite_active_phase}" 2>/dev/null || true
+    fi
     if publish_terminal_state "${rc}" "${outcome}"; then
         publish_ok=yes
     else
@@ -330,25 +399,85 @@ rm -f -- "${launcher_dir}/.starting" || exit 74
 atomic_write "${launcher_dir}/status" "running" || exit 74
 REMEMR1_RESULT_FILE="${launcher_dir}/pipeline-result"
 export REMEMR1_RESULT_FILE
+primary_result_file="${REMEMR1_RESULT_FILE}"
 
 pipeline="${REMEMR1_PROJECT_DIR}/scripts/cloud/run_pipeline.sh"
-pipeline_args=(--phase "${phase}")
-[[ -n "${offload_profile}" ]] && pipeline_args+=(--offload-profile "${offload_profile}")
-[[ -n "${r1_approval}" ]] && pipeline_args+=(--r1-approval "${r1_approval}")
-if [[ -n "${budget_projection}" ]]; then
-    pipeline_args+=(--budget-projection "${budget_projection}" \
-        --budget-projection-file-sha256 "${budget_projection_file_sha256}")
-fi
-[[ "${retry_failed_stage}" == "yes" ]] && pipeline_args+=(--retry-failed-stage)
-[[ "${dry_run}" == "yes" ]] && pipeline_args+=(--dry-run)
+run_pipeline_phase() {
+    local subphase="$1"
+    shift
+    local launcher_key invocation_root synthetic_launcher subphase_result rc
+    local -a args=(--phase "${subphase}" "$@")
+    launcher_key="$(basename -- "${launcher_dir}")"
+    invocation_root="${launcher_dir}/pipeline-invocations"
+    if [[ ! -e "${invocation_root}" && ! -L "${invocation_root}" ]]; then
+        mkdir -- "${invocation_root}" || return 74
+    fi
+    [[ -d "${invocation_root}" && ! -L "${invocation_root}" ]] || return 74
+    synthetic_launcher="${invocation_root}/${launcher_key}-${subphase}"
+    mkdir -- "${synthetic_launcher}" || return 74
+    subphase_result="${launcher_dir}/pipeline-result.${subphase}"
+    composite_active_phase="${subphase}"
+    composite_active_result_file="${subphase_result}"
+    atomic_write "${launcher_dir}/composite-subphase" "${subphase}" || return 74
+    rm -f -- "${primary_result_file}" "${primary_result_file}.terminal" || return 74
+    [[ "${retry_failed_stage}" == "yes" ]] && args+=(--retry-failed-stage)
+    [[ "${dry_run}" == "yes" ]] && args+=(--dry-run)
+    if [[ "${subphase}" == "cpu-finalize" ]]; then
+        (
+            export CUDA_VISIBLE_DEVICES=''
+            export NVIDIA_VISIBLE_DEVICES=void
+            export REMEMR1_ALLOW_GPU_CPU_PHASE=yes
+            export HF_HUB_OFFLINE=1
+            export HF_DATASETS_OFFLINE=1
+            export TRANSFORMERS_OFFLINE=1
+            export WANDB_MODE=disabled
+            export REMEMR1_RESULT_FILE="${subphase_result}"
+            export REMEMR1_LAUNCHER_DIR="${synthetic_launcher}"
+            /usr/bin/bash "${pipeline}" "${args[@]}"
+        )
+        rc=$?
+    else
+        (
+            export REMEMR1_RESULT_FILE="${subphase_result}"
+            export REMEMR1_LAUNCHER_DIR="${synthetic_launcher}"
+            /usr/bin/bash "${pipeline}" "${args[@]}"
+        )
+        rc=$?
+    fi
+    publish_active_composite_result || return 74
+    return "${rc}"
+}
+
 if [[ ! -f "${pipeline}" ]]; then
     echo "pipeline script is missing: ${pipeline}" >&2
     pipeline_rc=66
 else
-    set +e
     pipeline_invoked=yes
-    /usr/bin/bash "${pipeline}" "${pipeline_args[@]}"
-    pipeline_rc=$?
+    if [[ "${phase}" == "gpu" ]]; then
+        pipeline_rc=0
+        run_pipeline_phase cpu-finalize
+        pipeline_rc=$?
+        if [[ "${pipeline_rc}" -eq 0 ]]; then
+            run_pipeline_phase gpu-gates
+            pipeline_rc=$?
+        fi
+        if [[ "${pipeline_rc}" -eq 0 ]]; then
+            run_pipeline_phase gpu-capacity --offload-profile r0
+            pipeline_rc=$?
+        fi
+    else
+        pipeline_args=(--phase "${phase}")
+        [[ -n "${offload_profile}" ]] && pipeline_args+=(--offload-profile "${offload_profile}")
+        [[ -n "${r1_approval}" ]] && pipeline_args+=(--r1-approval "${r1_approval}")
+        if [[ -n "${budget_projection}" ]]; then
+            pipeline_args+=(--budget-projection "${budget_projection}" \
+                --budget-projection-file-sha256 "${budget_projection_file_sha256}")
+        fi
+        [[ "${retry_failed_stage}" == "yes" ]] && pipeline_args+=(--retry-failed-stage)
+        [[ "${dry_run}" == "yes" ]] && pipeline_args+=(--dry-run)
+        /usr/bin/bash "${pipeline}" "${pipeline_args[@]}"
+        pipeline_rc=$?
+    fi
 fi
 if [[ "${pipeline_rc}" -eq 0 ]]; then
     outcome=success

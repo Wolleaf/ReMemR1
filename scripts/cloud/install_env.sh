@@ -51,6 +51,8 @@ PYTHON="${ENV_PREFIX}/bin/python"
 # These imports cover the CPU builder and the unconditional trainer import
 # chain. GPU kernels are deliberately installed and evidenced on the GPU host.
 "${PYTHON}" - <<'PY'
+import os
+
 import datasets
 import hydra
 import huggingface_hub
@@ -64,9 +66,15 @@ import uvloop
 
 from taskutils.data_synthesis import reproduction_builder
 
+if os.environ.get("CUDA_VISIBLE_DEVICES") != "":
+    raise RuntimeError("CPU preparation requires CUDA_VISIBLE_DEVICES to be empty")
+if os.environ.get("NVIDIA_VISIBLE_DEVICES") != "void":
+    raise RuntimeError("CPU preparation requires NVIDIA_VISIBLE_DEVICES=void")
+if torch.cuda.is_available() or torch.cuda.device_count() != 0:
+    raise RuntimeError("CPU preparation unexpectedly exposed a CUDA device")
 if not reproduction_builder.BUNDLE_KIND:
     raise RuntimeError("reproduction bundle contract is unavailable")
-print("CPU import preflight passed")
+print("CPU import preflight passed with CUDA unavailable")
 PY
 
 freeze="${REMEMR1_PERSIST_ROOT}/evidence/pip-freeze.cpu.txt"

@@ -21,6 +21,26 @@ case "${STAGE}" in
     *) echo "unknown cloud stage: ${STAGE}" >&2; exit 2 ;;
 esac
 
+case "${STAGE}" in
+    cpu-*)
+        export CUDA_VISIBLE_DEVICES=''
+        export NVIDIA_VISIBLE_DEVICES=void
+        export REMEMR1_ALLOW_GPU_CPU_PHASE=yes
+        export OMP_NUM_THREADS=1
+        export MKL_NUM_THREADS=1
+        export OPENBLAS_NUM_THREADS=1
+        export NUMEXPR_NUM_THREADS=1
+        export VECLIB_MAXIMUM_THREADS=1
+        export BLIS_NUM_THREADS=1
+        export RAYON_NUM_THREADS=1
+        export TOKENIZERS_PARALLELISM=false
+        export MAX_JOBS=1
+        export CMAKE_BUILD_PARALLEL_LEVEL=1
+        export MAKEFLAGS=-j1
+        export MALLOC_ARENA_MAX=2
+        ;;
+esac
+
 [[ -n "${REMEMR1_PIPELINE_DIR:-}" && -n "${REMEMR1_STAGE_RESULT_FILE:-}" ]] || {
     echo "run_stage.sh must be called by the locked cloud pipeline" >&2
     exit 1
@@ -267,6 +287,15 @@ GPU_EVIDENCE_ROOT="${REMEMR1_PIPELINE_DIR}/gpu-evidence"
 GPU_BUILD_LOG="${REMEMR1_PERSIST_ROOT}/evidence/gpu-environment/kernel-build.log"
 GPU_FREEZE="${REMEMR1_PERSIST_ROOT}/evidence/pip-freeze.txt"
 GPU_BUILD_INFO="${REMEMR1_PIPELINE_DIR}/build-info.json"
+
+is_positive_cpu_fraction() {
+    local value="$1"
+    local numerator denominator
+    [[ "${value}" =~ ^([0-9]+)(/([0-9]+))?$ ]] || return 1
+    numerator="${BASH_REMATCH[1]}"
+    denominator="${BASH_REMATCH[3]:-1}"
+    [[ "${numerator}" =~ [1-9] && "${denominator}" =~ [1-9] ]]
+}
 
 require_verified_handoff_context() {
     [[ "${REMEMR1_VERIFIED_HANDOFF:-}" == "${HANDOFF}" ]] || {
@@ -614,12 +643,12 @@ case "${STAGE}" in
             echo "CPU preparation requires at least ${min_free_gib} GiB free on the persistent volume" >&2
             exit 1
         }
-        min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-16}"
-        [[ "${min_cpu_cores}" =~ ^[0-9]+$ && "${min_cpu_cores}" -gt 0 ]] || {
-            echo "REMEMR1_MIN_CPU_CORES must be a positive integer" >&2
+        min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-1/2}"
+        is_positive_cpu_fraction "${min_cpu_cores}" || {
+            echo "REMEMR1_MIN_CPU_CORES must be a positive integer or fraction" >&2
             exit 2
         }
-        min_ram_gib="${REMEMR1_MIN_RAM_GIB:-48}"
+        min_ram_gib="${REMEMR1_MIN_RAM_GIB:-2}"
         [[ "${min_ram_gib}" =~ ^[0-9]+$ && "${min_ram_gib}" -gt 0 ]] || {
             echo "REMEMR1_MIN_RAM_GIB must be a positive integer" >&2
             exit 2
@@ -631,17 +660,20 @@ case "${STAGE}" in
         df -h "${REMEMR1_PERSIST_ROOT}" | tee -a "${LOG_FILE}"
         ;;
     cpu-environment)
-        run_logged environment-install 4h bash scripts/cloud/install_env.sh
+        run_logged environment-install "${REMEMR1_CPU_ENV_TIMEOUT:-12h}" \
+            bash scripts/cloud/install_env.sh
         ;;
     cpu-kernel-sources)
-        run_logged kernel-source-prefetch 2h bash scripts/cloud/prepare_kernel_sources.sh
+        run_logged kernel-source-prefetch \
+            "${REMEMR1_CPU_KERNEL_SOURCES_TIMEOUT:-6h}" \
+            bash scripts/cloud/prepare_kernel_sources.sh
         ;;
     cpu-assets)
         run_logged asset-metadata-resolution 30m \
             "${PYTHON}" scripts/cloud/cloud_state.py resolve-assets \
             --manifest environment/reproduction-assets.json \
             --output "${RUNTIME_ASSET_MANIFEST}"
-        run_logged asset-prefetch 18h \
+        run_logged asset-prefetch "${REMEMR1_CPU_ASSETS_TIMEOUT:-48h}" \
             "${PYTHON}" scripts/reproduction/prefetch_assets.py \
             --manifest "${RUNTIME_ASSET_MANIFEST}" \
             --cache-dir "${HUGGINGFACE_HUB_CACHE}" \
@@ -649,7 +681,7 @@ case "${STAGE}" in
             --report "${ASSET_REPORT}"
         ;;
     cpu-data)
-        run_logged data-bundles 12h \
+        run_logged data-bundles "${REMEMR1_CPU_DATA_TIMEOUT:-96h}" \
             "${PYTHON}" scripts/cloud/cloud_state.py build-data \
             --manifest "${RUNTIME_ASSET_MANIFEST}" \
             --cache-dir "${HUGGINGFACE_HUB_CACHE}" \
@@ -657,19 +689,20 @@ case "${STAGE}" in
             --summary "${REMEMR1_PIPELINE_DIR}/data-summary.json"
         ;;
     cpu-tests)
-        run_logged reproduction-and-cloud-tests 2h \
+        run_logged reproduction-and-cloud-tests \
+            "${REMEMR1_CPU_TESTS_TIMEOUT:-24h}" \
             "${PYTHON}" -m pytest -q tests/reproduction tests/cloud
         run_logged compileall 30m \
             "${PYTHON}" -m compileall -q scripts taskutils recurrent verl
         ;;
     cpu-configs)
-        run_logged resolve-configs 30m \
+        run_logged resolve-configs "${REMEMR1_CPU_CONFIGS_TIMEOUT:-4h}" \
             "${PYTHON}" scripts/cloud/resolve_configs.py \
             --data-root "${DATA_ROOT}" \
             --output "${RESOLVED_CONFIG_ROOT}"
         ;;
     cpu-handoff)
-        run_logged publish-handoff 4h \
+        run_logged publish-handoff "${REMEMR1_CPU_HANDOFF_TIMEOUT:-24h}" \
             "${PYTHON}" scripts/cloud/cloud_state.py publish-handoff \
             --output "${HANDOFF}" \
             --commit "${REMEMR1_EXPECTED_COMMIT}" \

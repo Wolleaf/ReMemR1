@@ -99,6 +99,21 @@ case "${CLOUD_ENV}" in
         exit 1
         ;;
 esac
+if [[ -e "${CLOUD_ENV}" || -L "${CLOUD_ENV}" ]]; then
+    [[ -f "${CLOUD_ENV}" && ! -L "${CLOUD_ENV}" && \
+       "$(stat -c '%u' "${CLOUD_ENV}")" -eq 0 && \
+       "$(stat -c '%a' "${CLOUD_ENV}")" == 600 ]] || {
+        echo "existing cloud env must be a root-owned 0600 regular file" >&2
+        exit 1
+    }
+    expected_persist_export="$(printf 'export REMEMR1_PERSIST_ROOT=%q' "${PERSIST_ROOT}")"
+    expected_lock_export="$(printf 'export REMEMR1_LOCK_FILE=%q' "${PERSIST_ROOT}/cloud/pipeline.lock")"
+    grep -Fqx "${expected_persist_export}" "${CLOUD_ENV}" && \
+        grep -Fqx "${expected_lock_export}" "${CLOUD_ENV}" || {
+            echo "existing cloud env targets another persistent root; refusing to overwrite it" >&2
+            exit 1
+        }
+fi
 [[ "$(git rev-parse HEAD)" == "${EXPECTED_COMMIT}" ]] || {
     echo "checkout HEAD differs from --expected-commit" >&2
     exit 1
@@ -140,7 +155,25 @@ CAPABILITY_FILE="${PERSIST_ROOT}/cloud/shutdown-capability"
 LOCK_FILE="${PERSIST_ROOT}/cloud/pipeline.lock"
 LAUNCHER_ROOT="${PERSIST_ROOT}/cloud/launchers"
 RESERVE_FILE="${PERSIST_ROOT}/cloud/terminal-reserve"
-touch "${LOCK_FILE}"
+if [[ -e "${LOCK_FILE}" || -L "${LOCK_FILE}" ]]; then
+    [[ -f "${LOCK_FILE}" && ! -L "${LOCK_FILE}" ]] || {
+        echo "pipeline lock must be a regular non-symlink file" >&2
+        exit 1
+    }
+else
+    : > "${LOCK_FILE}"
+    chmod 600 "${LOCK_FILE}"
+    chown 0:0 "${LOCK_FILE}"
+fi
+[[ -x /usr/bin/flock ]] || {
+    echo "/usr/bin/flock is required for safe cloud initialization" >&2
+    exit 1
+}
+exec {init_lock_fd}>>"${LOCK_FILE}"
+/usr/bin/flock -n "${init_lock_fd}" || {
+    echo "refusing to initialize cloud state while another launcher is active" >&2
+    exit 75
+}
 if [[ -e "${RESERVE_FILE}" ]]; then
     [[ -f "${RESERVE_FILE}" && ! -L "${RESERVE_FILE}" ]] || {
         echo "terminal reserve must be a regular non-symlink file" >&2

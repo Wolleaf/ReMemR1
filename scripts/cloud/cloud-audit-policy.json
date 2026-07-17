@@ -20,85 +20,25 @@
   },
   "entrypoints": [
     {
-      "id": "bootstrap",
-      "path": "scripts/cloud/bootstrap.sh",
+      "id": "cpu-preparation",
+      "path": "scripts/cloud/prepare_cpu.sh",
       "documentation": [
         {
           "path": "scripts/cloud/README.md",
           "required_literals": [
-            "scripts/cloud/bootstrap.sh"
+            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/prepare_cpu.sh"
           ]
         }
       ]
     },
     {
-      "id": "cpu",
-      "path": "scripts/cloud/start_cpu_prep.sh",
+      "id": "gpu-training",
+      "path": "scripts/cloud/run_gpu.sh",
       "documentation": [
         {
           "path": "scripts/cloud/README.md",
           "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_cpu_prep.sh --retry-failed-stage"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "gpu-gates",
-      "path": "scripts/cloud/start_gpu_gates.sh",
-      "documentation": [
-        {
-          "path": "scripts/cloud/README.md",
-          "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_gpu_gates.sh"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "gpu-capacity",
-      "path": "scripts/cloud/start_gpu_2b_capacity.sh",
-      "documentation": [
-        {
-          "path": "scripts/cloud/README.md",
-          "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_gpu_2b_capacity.sh --offload-profile r0"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "gpu-bc40",
-      "path": "scripts/cloud/start_gpu_2b_bc40.sh",
-      "documentation": [
-        {
-          "path": "scripts/cloud/README.md",
-          "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_gpu_2b_bc40.sh --budget-projection"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "gpu-bc80",
-      "path": "scripts/cloud/start_gpu_2b_bc80.sh",
-      "documentation": [
-        {
-          "path": "scripts/cloud/README.md",
-          "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/start_gpu_2b_bc80.sh --budget-projection"
-          ]
-        }
-      ]
-    },
-    {
-      "id": "gpu-export",
-      "path": "scripts/cloud/export_2b_results.sh",
-      "documentation": [
-        {
-          "path": "scripts/cloud/README.md",
-          "required_literals": [
-            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/export_2b_results.sh"
+            "bash /root/autodl-tmp/ReMemR1/scripts/cloud/run_gpu.sh"
           ]
         }
       ]

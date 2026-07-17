@@ -133,3 +133,6 @@ logs
 log
 outputs
 deduplication
+
+# Local AutoDL inventory contains machine identifiers and must never be published.
+/docs/rememr1-host-inventory.txt

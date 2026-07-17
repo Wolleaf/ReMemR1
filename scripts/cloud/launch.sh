@@ -16,7 +16,7 @@ usage() {
 Usage: launch.sh --phase PHASE [OPTIONS]
 
 Phases:
-  cpu, gpu-gates, gpu-capacity, gpu-bc40, gpu-bc80, gpu-export
+  cpu, gpu, gpu-gates, gpu-capacity, gpu-bc40, gpu-bc80, gpu-export
 
 Options:
   --offload-profile P  Required for gpu-capacity; P is r0 or r1.
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             phase="$2"
             shift 2
             ;;
-        cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
+        cpu|gpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
             [[ -z "${phase}" ]] || { echo "phase was provided more than once" >&2; exit 2; }
             phase="$1"
             shift
@@ -99,10 +99,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${phase}" in
-    cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
+    cpu|gpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
     *) echo "invalid phase: ${phase}" >&2; usage >&2; exit 2 ;;
 esac
-if [[ "${phase}" == "gpu-capacity" ]]; then
+if [[ "${phase}" == "gpu" ]]; then
+    [[ -z "${offload_profile}" && -z "${r1_approval}" && \
+       -z "${budget_projection}" ]] || {
+        echo "gpu is fixed to R0 and rejects offload, R1 approval, and budget arguments" >&2
+        exit 2
+    }
+    offload_profile=r0
+elif [[ "${phase}" == "gpu-capacity" ]]; then
     [[ "${offload_profile}" == "r0" || "${offload_profile}" == "r1" ]] || {
         echo "gpu-capacity requires --offload-profile r0 or r1" >&2
         exit 2

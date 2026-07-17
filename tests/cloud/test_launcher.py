@@ -14,6 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCH = REPO_ROOT / "scripts" / "cloud" / "launch.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "cloud" / "bootstrap.sh"
+RUN_GPU = REPO_ROOT / "scripts" / "cloud" / "run_gpu.sh"
 STATUS = REPO_ROOT / "scripts" / "cloud" / "status.sh"
 
 
@@ -125,6 +126,107 @@ exit \"${{FAKE_PIPELINE_RC}}\"
     return env, launcher_root, shutdown_log, lock_file
 
 
+def _write_composite_gpu_fixture(
+    tmp_path: Path,
+    *,
+    cpu_finalize_rc: int = 0,
+    gpu_gates_rc: int = 0,
+    gpu_capacity_rc: int = 0,
+    omit_terminal_phase: str = "",
+):
+    env, launcher_root, shutdown_log, lock_file = _write_cloud_fixture(tmp_path)
+    project = tmp_path / "project"
+    pipeline = project / "scripts" / "cloud" / "run_pipeline.sh"
+    cloud_dir = pipeline.parent
+    fixture_library = cloud_dir / "lib"
+    fixture_library.mkdir()
+    for source in (
+        LAUNCH,
+        REPO_ROOT / "scripts" / "cloud" / "launcher_worker.sh",
+    ):
+        shutil.copy2(source, cloud_dir / source.name)
+    for name in ("runtime.sh", "lock.sh", "shutdown.sh"):
+        shutil.copy2(
+            REPO_ROOT / "scripts" / "cloud" / "lib" / name,
+            fixture_library / name,
+        )
+    lock_library = shlex.quote(
+        _bash_path(REPO_ROOT / "scripts" / "cloud" / "lib" / "lock.sh")
+    )
+    pipeline.write_bytes(
+        f"""#!/usr/bin/env bash
+set -u
+source {lock_library}
+require_cloud_lock
+arguments="$*"
+phase=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --phase) phase="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case "${{phase}}" in
+    cpu-finalize) rc="${{FAKE_CPU_FINALIZE_RC}}" ;;
+    gpu-gates) rc="${{FAKE_GPU_GATES_RC}}" ;;
+    gpu-capacity) rc="${{FAKE_GPU_CAPACITY_RC}}" ;;
+    *) exit 91 ;;
+esac
+run_dir="${{PERSIST_ROOT}}/fake-composite-${{phase}}-${{rc}}"
+terminal_dir="${{run_dir}}/terminal"
+mkdir -p "${{terminal_dir}}"
+printf '%s\n' "${{arguments}}" > "${{run_dir}}/args"
+printf '%s\n' "${{phase}}" > "${{run_dir}}/phase"
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "${{phase}}" "${{arguments}}" "${{REMEMR1_RESULT_FILE}}" \
+    "${{REMEMR1_LAUNCHER_DIR}}" "${{CUDA_VISIBLE_DEVICES-__unset__}}" \
+    "${{NVIDIA_VISIBLE_DEVICES-__unset__}}" \
+    "${{REMEMR1_ALLOW_GPU_CPU_PHASE-__unset__}}" \
+    "${{HF_HUB_OFFLINE-__unset__}}" "${{HF_DATASETS_OFFLINE-__unset__}}" \
+    "${{TRANSFORMERS_OFFLINE-__unset__}}" "${{WANDB_MODE-__unset__}}" \
+    "${{rc}}" >> "${{PERSIST_ROOT}}/composite-calls.log"
+printf '%s\n' "${{run_dir}}" > "${{REMEMR1_RESULT_FILE}}"
+if [[ "${{FAKE_OMIT_TERMINAL_PHASE}}" != "${{phase}}" ]]; then
+    printf '%s\n' "${{terminal_dir}}" > "${{REMEMR1_RESULT_FILE}}.terminal"
+fi
+exit "${{rc}}"
+""".encode("ascii")
+    )
+    env.update(
+        {
+            "FAKE_CPU_FINALIZE_RC": str(cpu_finalize_rc),
+            "FAKE_GPU_GATES_RC": str(gpu_gates_rc),
+            "FAKE_GPU_CAPACITY_RC": str(gpu_capacity_rc),
+            "FAKE_OMIT_TERMINAL_PHASE": omit_terminal_phase,
+            "CUDA_VISIBLE_DEVICES": "base-cuda",
+            "NVIDIA_VISIBLE_DEVICES": "base-nvidia",
+            "REMEMR1_ALLOW_GPU_CPU_PHASE": "base-allow",
+            "HF_HUB_OFFLINE": "base-hf",
+            "HF_DATASETS_OFFLINE": "base-datasets",
+            "TRANSFORMERS_OFFLINE": "base-transformers",
+            "WANDB_MODE": "base-wandb",
+        }
+    )
+    if os.name == "nt":
+        forwarded = [
+            "FAKE_CPU_FINALIZE_RC",
+            "FAKE_GPU_GATES_RC",
+            "FAKE_GPU_CAPACITY_RC",
+            "FAKE_OMIT_TERMINAL_PHASE",
+            "CUDA_VISIBLE_DEVICES",
+            "NVIDIA_VISIBLE_DEVICES",
+            "REMEMR1_ALLOW_GPU_CPU_PHASE",
+            "HF_HUB_OFFLINE",
+            "HF_DATASETS_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "WANDB_MODE",
+        ]
+        env["WSLENV"] = ":".join(
+            part for part in [env.get("WSLENV", ""), *forwarded] if part
+        )
+    return env, launcher_root, shutdown_log, lock_file
+
+
 def _launch(env, *args, expected_returncodes=(0,)):
     result = subprocess.run(
         [shutil.which("bash"), _bash_path(LAUNCH), *args],
@@ -142,6 +244,34 @@ def _launch(env, *args, expected_returncodes=(0,)):
     )
     assert "launcher_dir" in fields
     return fields
+
+
+def _run_public_gpu(env, *args, expected_returncodes=(0,)):
+    result = subprocess.run(
+        [shutil.which("bash"), _bash_path(RUN_GPU), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode in expected_returncodes, result.stderr
+    fields = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line
+    )
+    assert "launcher_dir" in fields
+    return fields
+
+
+def _composite_calls(tmp_path: Path):
+    rows = (tmp_path / "persist" / "composite-calls.log").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    return [row.split("|") for row in rows]
 
 
 def _wait_for_terminal(launcher_root: Path, timeout: float = 15.0) -> Path:
@@ -795,3 +925,202 @@ def test_status_uses_each_launchers_scoped_terminal_pointer(launcher_tmp_path):
     assert "pipeline_failed-stage=b20" in outputs[0]
     assert "pipeline_failed-stage=b60" not in outputs[0]
     assert "pipeline_failed-stage=b60" in outputs[1]
+
+
+def test_public_gpu_runs_finalize_gates_and_r0_capacity_under_one_launcher(
+    launcher_tmp_path,
+):
+    env, launcher_root, _, _ = _write_composite_gpu_fixture(launcher_tmp_path)
+
+    _run_public_gpu(env, "--retry-failed-stage", "--keep-running")
+    launcher = _wait_for_terminal(launcher_root)
+    calls = _composite_calls(launcher_tmp_path)
+
+    assert [call[0] for call in calls] == [
+        "cpu-finalize",
+        "gpu-gates",
+        "gpu-capacity",
+    ]
+    assert all("--retry-failed-stage" in call[1] for call in calls)
+    assert "--offload-profile r0" in calls[2][1]
+    assert calls[0][4:11] == ["", "void", "yes", "1", "1", "1", "disabled"]
+    assert calls[1][4:11] == [
+        "base-cuda",
+        "base-nvidia",
+        "base-allow",
+        "base-hf",
+        "base-datasets",
+        "base-transformers",
+        "base-wandb",
+    ]
+    assert calls[2][4:11] == calls[1][4:11]
+    assert len({call[2] for call in calls}) == 3
+    assert len({call[3] for call in calls}) == 3
+    assert all(launcher.name in Path(call[3]).name for call in calls)
+
+    final_result = _bash_path(
+        launcher_tmp_path / "persist" / "fake-composite-gpu-capacity-0"
+    )
+    final_terminal = f"{final_result}/terminal"
+    assert (launcher / "pipeline-result").read_text(encoding="ascii").strip() == final_result
+    assert (
+        launcher / "pipeline-result.terminal"
+    ).read_text(encoding="ascii").strip() == final_terminal
+    assert (
+        launcher / "pipeline-result.gpu-capacity"
+    ).read_text(encoding="ascii").strip() == final_result
+    request = json.loads((launcher / "request.json").read_text(encoding="utf-8"))
+    assert request["phase"] == "gpu"
+    assert request["offload_profile"] == "r0"
+    terminal = _terminal_json(launcher)
+    assert terminal["phase"] == "gpu"
+    assert terminal["offload_profile"] == "r0"
+    assert terminal["pipeline_result"] == final_result
+    assert terminal["pipeline_terminal_dir"] == final_terminal
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "keep-running"
+
+
+@pytest.mark.parametrize(
+    (
+        "cpu_finalize_rc",
+        "gpu_gates_rc",
+        "gpu_capacity_rc",
+        "expected_phases",
+        "expected_rc",
+        "terminal_marker",
+    ),
+    [
+        (23, 0, 0, ["cpu-finalize"], 23, ".failed"),
+        (0, 42, 0, ["cpu-finalize", "gpu-gates"], 42, ".scientific-stop"),
+        (
+            0,
+            0,
+            43,
+            ["cpu-finalize", "gpu-gates", "gpu-capacity"],
+            43,
+            ".capacity-stop",
+        ),
+    ],
+)
+def test_public_gpu_short_circuits_and_preserves_the_failing_subphase(
+    launcher_tmp_path,
+    cpu_finalize_rc,
+    gpu_gates_rc,
+    gpu_capacity_rc,
+    expected_phases,
+    expected_rc,
+    terminal_marker,
+):
+    env, launcher_root, _, _ = _write_composite_gpu_fixture(
+        launcher_tmp_path,
+        cpu_finalize_rc=cpu_finalize_rc,
+        gpu_gates_rc=gpu_gates_rc,
+        gpu_capacity_rc=gpu_capacity_rc,
+    )
+
+    _run_public_gpu(env, "--keep-running", expected_returncodes=(0, expected_rc))
+    launcher = _wait_for_terminal(launcher_root)
+    calls = _composite_calls(launcher_tmp_path)
+
+    assert [call[0] for call in calls] == expected_phases
+    failed_phase = expected_phases[-1]
+    expected_result = _bash_path(
+        launcher_tmp_path
+        / "persist"
+        / f"fake-composite-{failed_phase}-{expected_rc}"
+    )
+    assert (launcher / "pipeline-result").read_text(encoding="ascii").strip() == expected_result
+    assert (
+        launcher / "pipeline-result.terminal"
+    ).read_text(encoding="ascii").strip() == f"{expected_result}/terminal"
+    assert (launcher / "composite-subphase").read_text(encoding="ascii").strip() == failed_phase
+    assert (launcher / "exit-code").read_text(encoding="ascii").strip() == str(expected_rc)
+    assert (launcher / terminal_marker).read_text(encoding="ascii").strip() == str(
+        expected_rc
+    )
+    terminal = _terminal_json(launcher)
+    assert terminal["exit_code"] == expected_rc
+    assert terminal["pipeline_result"] == expected_result
+    if expected_rc in {42, 43}:
+        assert terminal["retryable"] is False
+
+
+def test_public_gpu_does_not_reuse_a_stale_terminal_pointer(launcher_tmp_path):
+    env, launcher_root, _, _ = _write_composite_gpu_fixture(
+        launcher_tmp_path,
+        omit_terminal_phase="gpu-capacity",
+    )
+
+    _run_public_gpu(env, "--keep-running", expected_returncodes=(0, 74))
+    launcher = _wait_for_terminal(launcher_root)
+
+    final_result = _bash_path(
+        launcher_tmp_path / "persist" / "fake-composite-gpu-capacity-0"
+    )
+    assert (launcher / "pipeline-result").read_text(encoding="ascii").strip() == final_result
+    assert not (launcher / "pipeline-result.terminal").exists()
+    terminal = _terminal_json(launcher)
+    assert terminal["exit_code"] == 74
+    assert terminal["outcome"] == "failed"
+    assert terminal["pipeline_result"] == final_result
+    assert terminal["pipeline_terminal_dir"] == ""
+    assert (launcher / "composite-result-transfer-failed").is_file()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (
+        launcher / "shutdown-skipped"
+    ).read_text(encoding="ascii").strip() == "pipeline-state-incomplete"
+
+
+def test_public_gpu_forwards_dry_run_and_retry_to_every_subphase(launcher_tmp_path):
+    env, launcher_root, _, _ = _write_composite_gpu_fixture(launcher_tmp_path)
+
+    _run_public_gpu(env, "--dry-run", "--retry-failed-stage")
+    launcher = _wait_for_terminal(launcher_root)
+    calls = _composite_calls(launcher_tmp_path)
+
+    assert [call[0] for call in calls] == [
+        "cpu-finalize",
+        "gpu-gates",
+        "gpu-capacity",
+    ]
+    assert all("--dry-run" in call[1] for call in calls)
+    assert all("--retry-failed-stage" in call[1] for call in calls)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "dry-run"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--offload-profile", "r0"),
+        ("--r1-approval", "/tmp/forbidden-r1-approval.json"),
+        ("--budget-projection", "/tmp/forbidden-budget.json"),
+    ],
+)
+def test_public_gpu_rejects_profile_and_paid_phase_authority(
+    launcher_tmp_path,
+    arguments,
+):
+    env, launcher_root, _, _ = _write_composite_gpu_fixture(launcher_tmp_path)
+
+    result = subprocess.run(
+        [shutil.which("bash"), _bash_path(RUN_GPU), *arguments],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 2
+    assert "gpu is fixed to R0" in result.stderr
+    assert list(launcher_root.iterdir()) == []

@@ -204,6 +204,9 @@ def _write_cloud_fixture(tmp_path: Path):
         "  printf 'false\n' > \"${run}/retryable\"\n"
         "  exit 43\n"
         "fi\n"
+        "if [[ \"${stage}\" == cpu-handoff ]]; then\n"
+        "  printf '{}\\n' > \"${REMEMR1_PIPELINE_DIR}/cpu-handoff.json\"\n"
+        "fi\n"
         "if [[ \"${stage}\" == g0 ]]; then\n"
         f"  if [[ ! -e {shlex.quote(_bash_path(g0_sentinel))} ]]; then\n"
         f"    printf first > {shlex.quote(_bash_path(g0_sentinel))}\n"
@@ -567,6 +570,12 @@ def test_all_phase_dry_runs_publish_the_exact_ordered_dag(tmp_path):
                 "cpu-environment",
                 "cpu-kernel-sources",
                 "cpu-assets",
+            ],
+        ),
+        (
+            ("--phase", "cpu-finalize", "--dry-run"),
+            [
+                "cpu-preflight",
                 "cpu-data",
                 "cpu-tests",
                 "cpu-configs",
@@ -628,6 +637,111 @@ def test_all_phase_dry_runs_publish_the_exact_ordered_dag(tmp_path):
         result = _run_pipeline(env, lock_file, *arguments)
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines() == expected
+
+
+def test_cpu_preparation_and_internal_finalization_publish_distinct_evidence(tmp_path):
+    env, _, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+
+    prepared = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert prepared.returncode == 0, prepared.stderr
+    pipeline = next(pipeline_root.iterdir())
+    seal = pipeline / "cpu-env-ready.seal"
+    env_ready = pipeline / ".cpu-env-ready"
+    assert seal.is_file()
+    assert env_ready.read_text(encoding="utf-8").strip() == _bash_path(seal)
+    assert not (pipeline / ".cpu-ready").exists()
+    assert events.read_text(encoding="utf-8").splitlines() == [
+        "stage:cpu-preflight",
+        "stage:cpu-environment",
+        "stage:cpu-kernel-sources",
+        "stage:cpu-assets",
+    ]
+
+    finalized = _run_pipeline(env, lock_file, "--phase", "cpu-finalize")
+    assert finalized.returncode == 0, finalized.stderr
+    handoff = pipeline / "cpu-handoff.json"
+    assert handoff.is_file()
+    assert (pipeline / ".cpu-ready").read_text(
+        encoding="utf-8"
+    ).strip() == _bash_path(handoff)
+    stage_events = [
+        line
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.startswith("stage:")
+    ]
+    assert stage_events[-5:] == [
+        "stage:cpu-preflight",
+        "stage:cpu-data",
+        "stage:cpu-tests",
+        "stage:cpu-configs",
+        "stage:cpu-handoff",
+    ]
+    assert stage_events.count("stage:cpu-preflight") == 2
+    assert _native_path(
+        pipeline
+        / "stages"
+        / "cpu-finalize"
+        / "none"
+        / "base"
+        / "cpu-handoff.run"
+    ).is_file()
+
+
+def test_cpu_finalization_rejects_tampered_environment_evidence_before_stages(
+    tmp_path,
+):
+    env, _, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+    prepared = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert prepared.returncode == 0, prepared.stderr
+    pipeline = next(pipeline_root.iterdir())
+    (pipeline / "cpu-env-ready.seal").write_text("tampered\n", encoding="ascii")
+    event_count = len(events.read_text(encoding="utf-8").splitlines())
+
+    finalized = _run_pipeline(env, lock_file, "--phase", "cpu-finalize")
+
+    assert finalized.returncode != 0
+    assert "requires valid .cpu-env-ready evidence" in finalized.stderr
+    assert len(events.read_text(encoding="utf-8").splitlines()) == event_count
+    assert not (pipeline / ".cpu-ready").exists()
+
+
+def test_cpu_finalization_is_refused_after_gpu_start(tmp_path):
+    env, _, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+    prepared = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert prepared.returncode == 0, prepared.stderr
+    pipeline = next(pipeline_root.iterdir())
+    (pipeline / ".gpu-started").write_text("now\n", encoding="ascii")
+    event_count = len(events.read_text(encoding="utf-8").splitlines())
+
+    finalized = _run_pipeline(env, lock_file, "--phase", "cpu-finalize")
+
+    assert finalized.returncode != 0
+    assert "GPU gates have already started" in finalized.stderr
+    assert len(events.read_text(encoding="utf-8").splitlines()) == event_count
+    assert not (pipeline / ".cpu-ready").exists()
+
+
+def test_successful_cpu_finalization_is_reusable_after_gpu_start(tmp_path):
+    env, _, pipeline_root, events, _, lock_file = _write_cloud_fixture(tmp_path)
+    prepared = _run_pipeline(env, lock_file, "--phase", "cpu")
+    assert prepared.returncode == 0, prepared.stderr
+    finalized = _run_pipeline(env, lock_file, "--phase", "cpu-finalize")
+    assert finalized.returncode == 0, finalized.stderr
+    pipeline = next(pipeline_root.iterdir())
+    (pipeline / ".gpu-started").write_text("now\n", encoding="ascii")
+    event_count = len(events.read_text(encoding="utf-8").splitlines())
+
+    repeated = _run_pipeline(
+        env,
+        lock_file,
+        "--phase",
+        "cpu-finalize",
+        "--retry-failed-stage",
+    )
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert "already finalized before GPU start" in repeated.stdout
+    assert len(events.read_text(encoding="utf-8").splitlines()) == event_count
 
 
 def test_r1_approval_is_claimed_once_and_dry_run_does_not_consume(tmp_path):

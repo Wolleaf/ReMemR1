@@ -721,19 +721,22 @@ def _format_fraction(value: Fraction) -> str:
 
 
 def check_minimums(
-    probe: ResourceProbe, min_cpu_cores: int, min_ram_gib: int
+    probe: ResourceProbe, min_cpu_cores: int | Fraction, min_ram_gib: int
 ) -> List[str]:
     violations = []
-    if probe.effective_cpu_cores < min_cpu_cores:
+    required_cpu = Fraction(min_cpu_cores)
+    if required_cpu <= 0:
+        raise ValueError("minimum CPU cores must be positive")
+    if probe.effective_cpu_cores < required_cpu:
         millicores = (
             probe.effective_cpu_cores.numerator * 1000
             // probe.effective_cpu_cores.denominator
         )
         violations.append(
-            "CPU preparation requires at least %d effective CPU cores; detected %s "
+            "CPU preparation requires at least %s effective CPU cores; detected %s "
             "cores (%d millicores) after host, cgroup quota, and cpuset limits"
             % (
-                min_cpu_cores,
+                _format_fraction(required_cpu),
                 _format_fraction(probe.effective_cpu_cores),
                 millicores,
             )
@@ -748,13 +751,27 @@ def check_minimums(
     return violations
 
 
+def _positive_fraction(value: str) -> Fraction:
+    try:
+        parsed = Fraction(value)
+    except (ValueError, ZeroDivisionError) as error:
+        raise argparse.ArgumentTypeError(
+            "CPU cores must be a positive integer or fraction"
+        ) from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "CPU cores must be a positive integer or fraction"
+        )
+    return parsed
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--min-cpu-cores", required=True, type=int)
+    parser.add_argument("--min-cpu-cores", required=True, type=_positive_fraction)
     parser.add_argument("--min-ram-gib", required=True, type=int)
     args = parser.parse_args(argv)
-    if args.min_cpu_cores <= 0 or args.min_ram_gib <= 0:
-        parser.error("minimum CPU cores and RAM must be positive integers")
+    if args.min_ram_gib <= 0:
+        parser.error("minimum RAM must be a positive integer")
     try:
         probe = probe_resources()
     except ProbeError as error:
