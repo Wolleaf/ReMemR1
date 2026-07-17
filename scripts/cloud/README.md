@@ -9,7 +9,8 @@ G0/G1/G2 脚本。
 存在时，才可声明已经达到 L0、L1 或 L2。本 profile 不增加 `compress_context`，不改 JSON action，
 继续使用强制 `<update>`、可选 `<recall>` 和 final answer 的既有 Agent 协议。
 
-> Guest 内执行 `shutdown` 不等于 AutoDL 控制面已经停止计费。每个阶段结束后都必须回到
+> 本流程使用 AutoDL 官方的 `/usr/bin/shutdown` wrapper（无参数），不是容器内不可用的
+> systemd `poweroff`。wrapper 返回或 SSH 断开仍不等于控制面确认；每个阶段结束后都必须回到
 > AutoDL 控制台确认实例已停止，并核对余额和账单。
 
 ## 正常流程：Git + 两条命令
@@ -214,7 +215,9 @@ bash /root/autodl-tmp/ReMemR1/scripts/cloud/run_gpu.sh --retry-failed-stage --ke
 
 自动关机顺序固定为：stage/pipeline 终态 -> launcher log sentinel/terminal/original exit code -> durable
 sync -> `shutdown-safe` -> 复验 Linux/root/mount/path/commit/capability/flock/state ->
-`shutdown-requested` -> 绝对路径 shutdown backend。
+`shutdown-backend`/`shutdown-requested` -> 已绑定 SHA-256 的 AutoDL `/usr/bin/shutdown` wrapper。
+成功、普通失败、scientific-stop 42 和 capacity-stop 43 都走同一终态关机路径；wrapper 会结束容器，
+因此 `shutdown-dispatched` 可能来不及落盘，`shutdown-requested` 只证明已发出请求，最终仍以控制台为准。
 
 以下情况故意保持实例运行：参数校验失败、锁冲突、终态或日志无法持久化、sync 失败、mount/path/
 symlink/capability/commit/flock 复验失败、test mode、`--keep-running` 或 `--dry-run`。SIGKILL、宿主掉电

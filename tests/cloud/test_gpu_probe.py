@@ -245,6 +245,8 @@ def test_rtx5090_preflight_requires_exact_runtime_toolkit_and_r1_ram():
 
 
 def test_nvidia_smi_and_nvcc_parsers_are_injectable(monkeypatch):
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    commands = []
     outputs = iter(
         [
             "NVIDIA GeForce RTX 5090, 999.1, GPU-test, 32640, 30720\n",
@@ -252,11 +254,33 @@ def test_nvidia_smi_and_nvcc_parsers_are_injectable(monkeypatch):
             "Cuda compilation tools, release 13.0, V13.0.1\n",
         ]
     )
-    monkeypatch.setattr(gpu_probe, "_run_text", lambda command: next(outputs))
+    def fake_run_text(command):
+        commands.append(command)
+        return next(outputs)
+
+    monkeypatch.setattr(gpu_probe, "_run_text", fake_run_text)
     inventory = gpu_probe._query_nvidia_smi()
     assert inventory["gpus"][0]["gpu_free_memory_bytes"] == 30720 * 1024**2
     assert inventory["compute_processes"] == []
     assert gpu_probe._query_cuda_toolkit() == "13.0"
+    assert commands[-1] == ["nvcc", "--version"]
+
+
+def test_nvcc_probe_uses_cuda_home_for_noninteractive_autodl_shells(
+    tmp_path, monkeypatch
+):
+    cuda_home = tmp_path / "cuda"
+    monkeypatch.setenv("CUDA_HOME", str(cuda_home))
+    commands = []
+    monkeypatch.setattr(
+        gpu_probe,
+        "_run_text",
+        lambda command: commands.append(command)
+        or "Cuda compilation tools, release 13.0, V13.0.88\n",
+    )
+
+    assert gpu_probe._query_cuda_toolkit() == "13.0"
+    assert commands == [[str(cuda_home / "bin" / "nvcc"), "--version"]]
 
 
 def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monkeypatch):

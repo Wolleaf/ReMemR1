@@ -11,4 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runtime.sh"
 rememr1_load_cloud_env "${CLOUD_ENV}"
 rememr1_require_cloud_env
+# AutoDL images can install CUDA under /usr/local/cuda without adding nvcc to
+# non-interactive SSH shells. Keep the complete GPU workflow on one toolchain.
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
 exec bash "${REMEMR1_PROJECT_DIR}/scripts/cloud/launch.sh" --phase gpu "$@"

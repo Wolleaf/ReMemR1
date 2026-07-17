@@ -426,7 +426,9 @@ set -euo pipefail
 source {runtime}
 source {shutdown}
 root={root}
-mkdir -p "${{root}}"/authorization "${{root}}"/sync "${{root}}"/backend "${{root}}"/success
+mkdir -p "${{root}}"/authorization "${{root}}"/sync "${{root}}"/revalidation \
+    "${{root}}"/backend "${{root}}"/success
+declare -gA _REMEMR1_CAPABILITY=([shutdown_backend]=test-backend)
 REMEMR1_TEST_MODE=no
 unset REMEMR1_TEST_SHUTDOWN_LOG || true
 
@@ -436,6 +438,7 @@ _dispatch_guest_shutdown_backend() {{ : > "${{root}}/authorization/backend-calle
 if request_guest_shutdown "${{root}}/authorization" cpu 23; then exit 91; fi
 [[ "$(<"${{root}}/authorization/shutdown-skipped")" == authorization-failed ]]
 [[ ! -e "${{root}}/authorization/shutdown-requested" ]]
+[[ ! -e "${{root}}/authorization/shutdown-backend" ]]
 [[ ! -e "${{root}}/authorization/shutdown-failed" ]]
 [[ ! -e "${{root}}/authorization/backend-called" ]]
 
@@ -445,10 +448,18 @@ _dispatch_guest_shutdown_backend() {{ : > "${{root}}/sync/backend-called"; retur
 if request_guest_shutdown "${{root}}/sync" cpu 23; then exit 92; fi
 [[ "$(<"${{root}}/sync/shutdown-skipped")" == pre-dispatch-sync-failed ]]
 [[ ! -e "${{root}}/sync/shutdown-requested" ]]
+[[ ! -e "${{root}}/sync/shutdown-backend" ]]
 [[ ! -e "${{root}}/sync/shutdown-failed" ]]
 [[ ! -e "${{root}}/sync/backend-called" ]]
 
 rememr1_sync_all() {{ return 0; }}
+_dispatch_guest_shutdown_backend() {{ return 2; }}
+if request_guest_shutdown "${{root}}/revalidation" gpu-gates 17; then exit 94; fi
+[[ "$(<"${{root}}/revalidation/shutdown-skipped")" == backend-revalidation-failed ]]
+[[ ! -e "${{root}}/revalidation/shutdown-requested" ]]
+[[ ! -e "${{root}}/revalidation/shutdown-backend" ]]
+[[ ! -e "${{root}}/revalidation/shutdown-failed" ]]
+
 _dispatch_guest_shutdown_backend() {{
     [[ -f "${{root}}/backend/shutdown-requested" ]] || return 98
     : > "${{root}}/backend/backend-called"
@@ -456,6 +467,7 @@ _dispatch_guest_shutdown_backend() {{
 }}
 if request_guest_shutdown "${{root}}/backend" gpu-gates 17; then exit 93; fi
 [[ -f "${{root}}/backend/shutdown-requested" ]]
+[[ "$(<"${{root}}/backend/shutdown-backend")" == test-backend ]]
 [[ -f "${{root}}/backend/shutdown-failed" ]]
 [[ -f "${{root}}/backend/backend-called" ]]
 [[ ! -e "${{root}}/backend/shutdown-skipped" ]]
@@ -467,6 +479,7 @@ _dispatch_guest_shutdown_backend() {{
 }}
 request_guest_shutdown "${{root}}/success" gpu-gates 0
 [[ -f "${{root}}/success/shutdown-requested" ]]
+[[ "$(<"${{root}}/success/shutdown-backend")" == test-backend ]]
 [[ -f "${{root}}/success/backend-called" ]]
 [[ ! -e "${{root}}/success/shutdown-failed" ]]
 [[ ! -e "${{root}}/success/shutdown-skipped" ]]
@@ -485,6 +498,70 @@ request_guest_shutdown "${{root}}/success" gpu-gates 0
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_autodl_shutdown_backend_is_pinned_and_invoked_without_systemd_arguments(
+    tmp_path,
+):
+    shutdown_source = (
+        REPO_ROOT / "scripts" / "cloud" / "lib" / "shutdown.sh"
+    ).read_text(encoding="utf-8")
+    init_source = (REPO_ROOT / "scripts" / "cloud" / "init_cloud.sh").read_text(
+        encoding="utf-8"
+    )
+    bootstrap_source = BOOTSTRAP.read_text(encoding="utf-8")
+
+    dispatch = shutdown_source.split("_dispatch_guest_shutdown_backend() {", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert "/usr/bin/env -i PATH=/usr/bin:/bin HOME=/root" in dispatch
+    assert "/usr/bin/bash --noprofile --norc /usr/bin/shutdown" in dispatch
+    assert "-h now" not in dispatch
+    assert "systemctl" not in dispatch
+    assert "schema_version=2" in init_source
+    assert "SHUTDOWN_BACKEND=\"autodl-wrapper-v1\"" in init_source
+    assert "shutdown_backend_sha256=${SHUTDOWN_BACKEND_SHA256}" in init_source
+    assert "/usr/bin/bash --noprofile --norc /usr/bin/shutdown" in bootstrap_source
+
+    shutdown = shlex.quote(
+        _bash_path(REPO_ROOT / "scripts" / "cloud" / "lib" / "shutdown.sh")
+    )
+    probe = tmp_path / "shutdown-backend-digest-probe.sh"
+    probe.write_bytes(
+        f"""
+set -euo pipefail
+source {shutdown}
+_shutdown_autodl_wrapper_sha256() {{ printf '%s\\n' "${{FAKE_DIGEST}}"; }}
+FAKE_DIGEST="$(printf 'a%.0s' {{1..64}})"
+declare -gA _REMEMR1_CAPABILITY=(
+    [shutdown_backend]=autodl-wrapper-v1
+    [shutdown_backend_path]=/usr/bin/shutdown
+    [shutdown_backend_sha256]="${{FAKE_DIGEST}}"
+)
+_shutdown_verify_capability_backend
+_REMEMR1_CAPABILITY[shutdown_backend_sha256]="$(printf 'b%.0s' {{1..64}})"
+if _shutdown_verify_capability_backend; then exit 91; fi
+""".encode("ascii")
+    )
+    result = subprocess.run(
+        [shutil.which("bash"), _bash_path(probe)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_public_gpu_exports_cuda_toolkit_for_noninteractive_shells():
+    source = RUN_GPU.read_text(encoding="utf-8")
+
+    assert 'export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"' in source
+    assert 'export PATH="${CUDA_HOME}/bin:${PATH}"' in source
+    assert source.index("export CUDA_HOME=") < source.index("exec bash")
 
 
 def test_shutdown_authorizes_all_four_exact_terminal_marker_classes(tmp_path):

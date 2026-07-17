@@ -65,7 +65,7 @@ fi
 
 printf 'launcher_dir=%s\n' "${launcher}"
 printf 'state=%s\n' "${state}"
-for field in launcher-pid worker-pid pid exit-code pipeline-result shutdown-skipped \
+for field in launcher-pid worker-pid pid exit-code pipeline-result shutdown-backend shutdown-skipped \
     shutdown-requested shutdown-dispatched shutdown-failed retryable; do
     if [[ -f "${launcher}/${field}" ]]; then
         value="$(<"${launcher}/${field}")"

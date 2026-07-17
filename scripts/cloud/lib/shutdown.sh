@@ -6,6 +6,40 @@ _shutdown_reject() {
     return 1
 }
 
+_shutdown_autodl_wrapper_sha256() {
+    if [[ $# -ne 1 ]]; then
+        _shutdown_reject "AutoDL shutdown wrapper path is required"
+        return
+    fi
+    local path="$1" mode
+    [[ "${path}" == /usr/bin/shutdown && -f "${path}" && ! -L "${path}" && \
+       -x "${path}" ]] || \
+        _shutdown_reject "AutoDL shutdown wrapper is missing or unsafe" || return
+    [[ "$(/usr/bin/stat -c '%u' -- "${path}")" == 0 ]] || \
+        _shutdown_reject "AutoDL shutdown wrapper must be root-owned" || return
+    mode="$(/usr/bin/stat -c '%a' -- "${path}")" || return
+    [[ "${mode}" =~ ^[0-7]{3}$ ]] || \
+        _shutdown_reject "AutoDL shutdown wrapper mode is invalid" || return
+    (( (8#${mode} & 8#022) == 0 )) || \
+        _shutdown_reject "AutoDL shutdown wrapper is group/world writable" || return
+    [[ -f /etc/autodl-init && ! -L /etc/autodl-init && \
+       "$(/usr/bin/stat -c '%u' -- /etc/autodl-init)" == 0 ]] || \
+        _shutdown_reject "AutoDL guest marker is missing or unsafe" || return
+    sha256_file "${path}"
+}
+
+_shutdown_verify_capability_backend() {
+    local observed
+    [[ "${_REMEMR1_CAPABILITY[shutdown_backend]}" == autodl-wrapper-v1 && \
+       "${_REMEMR1_CAPABILITY[shutdown_backend_path]}" == /usr/bin/shutdown && \
+       "${_REMEMR1_CAPABILITY[shutdown_backend_sha256]}" =~ ^[0-9a-f]{64}$ ]] || \
+        _shutdown_reject "capability does not select the AutoDL shutdown wrapper" || return
+    observed="$(_shutdown_autodl_wrapper_sha256 \
+        "${_REMEMR1_CAPABILITY[shutdown_backend_path]}")" || return
+    [[ "${observed}" == "${_REMEMR1_CAPABILITY[shutdown_backend_sha256]}" ]] || \
+        _shutdown_reject "AutoDL shutdown wrapper digest changed" || return
+}
+
 _shutdown_parse_capability() {
     local capability_file="$1"
     declare -gA _REMEMR1_CAPABILITY=()
@@ -16,7 +50,7 @@ _shutdown_parse_capability() {
         key="${line%%=*}"
         value="${line#*=}"
         case "${key}" in
-            schema_version|project_dir|persist_root|expected_commit|lock_file|allow_guest_shutdown) ;;
+            schema_version|project_dir|persist_root|expected_commit|lock_file|allow_guest_shutdown|shutdown_backend|shutdown_backend_path|shutdown_backend_sha256) ;;
             *) _shutdown_reject "unknown capability key: ${key}" || return ;;
         esac
         if [[ -n "${_REMEMR1_CAPABILITY[${key}]+set}" ]]; then
@@ -26,7 +60,8 @@ _shutdown_parse_capability() {
     done < "${capability_file}"
     local required
     for required in schema_version project_dir persist_root expected_commit lock_file \
-        allow_guest_shutdown; do
+        allow_guest_shutdown shutdown_backend shutdown_backend_path \
+        shutdown_backend_sha256; do
         [[ -n "${_REMEMR1_CAPABILITY[${required}]+set}" ]] || \
             _shutdown_reject "missing capability key: ${required}" || return
     done
@@ -72,13 +107,11 @@ verify_guest_shutdown_preflight() {
     fi
     [[ "${EUID}" -eq 0 ]] || _shutdown_reject "EUID must be 0" || return
     local executable
-    for executable in /usr/bin/findmnt /usr/bin/git /usr/bin/realpath \
+    for executable in /usr/bin/bash /usr/bin/env /usr/bin/findmnt /usr/bin/git /usr/bin/realpath \
         /usr/bin/stat /usr/bin/sync /usr/bin/timeout; do
         [[ -x "${executable}" ]] || \
             _shutdown_reject "required shutdown executable is missing: ${executable}" || return
     done
-    [[ -x /usr/sbin/shutdown || -x /sbin/shutdown || -x /usr/bin/systemctl ]] || \
-        _shutdown_reject "no supported shutdown backend is available" || return
     autodl_root="$(/usr/bin/realpath -e -- /root/autodl-tmp)" || return
     project="$(/usr/bin/realpath -e -- "${REMEMR1_PROJECT_DIR}")" || return
     persist="$(/usr/bin/realpath -e -- "${PERSIST_ROOT}")" || return
@@ -103,9 +136,10 @@ verify_guest_shutdown_preflight() {
        "$(/usr/bin/stat -c '%a' -- "${capability}")" == "600" ]] || \
         _shutdown_reject "capability must be root-owned mode 0600" || return
     _shutdown_parse_capability "${capability}" || return
-    [[ "${_REMEMR1_CAPABILITY[schema_version]}" == "1" && \
+    [[ "${_REMEMR1_CAPABILITY[schema_version]}" == "2" && \
        "${_REMEMR1_CAPABILITY[allow_guest_shutdown]}" == "yes" ]] || \
         _shutdown_reject "capability does not authorize guest shutdown" || return
+    _shutdown_verify_capability_backend || return
     [[ "$(/usr/bin/realpath -e -- "${_REMEMR1_CAPABILITY[project_dir]}")" == "${project}" && \
        "$(/usr/bin/realpath -e -- "${_REMEMR1_CAPABILITY[persist_root]}")" == "${persist}" && \
        "$(/usr/bin/realpath -e -- "${_REMEMR1_CAPABILITY[lock_file]}")" == "${lock}" && \
@@ -135,13 +169,11 @@ verify_guest_shutdown_authorization() {
     fi
     [[ "${EUID}" -eq 0 ]] || _shutdown_reject "EUID must be 0" || return
     local executable
-    for executable in /usr/bin/findmnt /usr/bin/git /usr/bin/realpath \
+    for executable in /usr/bin/bash /usr/bin/env /usr/bin/findmnt /usr/bin/git /usr/bin/realpath \
         /usr/bin/stat /usr/bin/sync /usr/bin/timeout; do
         [[ -x "${executable}" ]] || \
             _shutdown_reject "required shutdown executable is missing: ${executable}" || return
     done
-    [[ -x /usr/sbin/shutdown || -x /sbin/shutdown || -x /usr/bin/systemctl ]] || \
-        _shutdown_reject "no supported shutdown backend is available" || return
     autodl_root="$(/usr/bin/realpath -e -- /root/autodl-tmp)" || \
         _shutdown_reject "AutoDL persistent mount path does not exist" || return
 
@@ -183,10 +215,11 @@ verify_guest_shutdown_authorization() {
     [[ "${capability_uid}" == "0" && "${capability_mode}" == "600" ]] || \
         _shutdown_reject "capability must be root-owned mode 0600" || return
     _shutdown_parse_capability "${capability}" || return
-    [[ "${_REMEMR1_CAPABILITY[schema_version]}" == "1" ]] || \
+    [[ "${_REMEMR1_CAPABILITY[schema_version]}" == "2" ]] || \
         _shutdown_reject "unsupported capability schema" || return
     [[ "${_REMEMR1_CAPABILITY[allow_guest_shutdown]}" == "yes" ]] || \
         _shutdown_reject "capability does not allow guest shutdown" || return
+    _shutdown_verify_capability_backend || return
     [[ "$(/usr/bin/realpath -e -- "${_REMEMR1_CAPABILITY[project_dir]}")" == "${project}" ]] || \
         _shutdown_reject "capability project mismatch" || return
     [[ "$(/usr/bin/realpath -e -- "${_REMEMR1_CAPABILITY[persist_root]}")" == "${persist}" ]] || \
@@ -227,22 +260,17 @@ verify_guest_shutdown_authorization() {
 _record_shutdown_skipped() {
     local launcher_dir="$1"
     local reason="$2"
-    rm -f -- "${launcher_dir}/shutdown-requested" 2>/dev/null || true
+    rm -f -- "${launcher_dir}/shutdown-backend" \
+        "${launcher_dir}/shutdown-requested" 2>/dev/null || true
     atomic_write "${launcher_dir}/shutdown-skipped" "${reason}" 2>/dev/null || true
     rememr1_sync_all >/dev/null 2>&1 || true
 }
 
 _dispatch_guest_shutdown_backend() {
-    if [[ -x /usr/sbin/shutdown ]] && \
-       /usr/bin/timeout --signal=TERM --kill-after=30s 2m /usr/sbin/shutdown -h now; then
-        return 0
-    fi
-    if [[ -x /sbin/shutdown ]] && \
-       /usr/bin/timeout --signal=TERM --kill-after=30s 2m /sbin/shutdown -h now; then
-        return 0
-    fi
-    if [[ -x /usr/bin/systemctl ]] && \
-       /usr/bin/timeout --signal=TERM --kill-after=30s 2m /usr/bin/systemctl poweroff; then
+    _shutdown_verify_capability_backend || return 2
+    if /usr/bin/timeout --signal=TERM --kill-after=30s 2m \
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root \
+        /usr/bin/bash --noprofile --norc /usr/bin/shutdown; then
         return 0
     fi
     return 1
@@ -271,6 +299,11 @@ request_guest_shutdown() {
         _record_shutdown_skipped "${launcher_dir}" "pre-dispatch-sync-failed"
         return 1
     fi
+    if ! atomic_write "${launcher_dir}/shutdown-backend" \
+        "${_REMEMR1_CAPABILITY[shutdown_backend]}"; then
+        _record_shutdown_skipped "${launcher_dir}" "backend-marker-write-failed"
+        return 1
+    fi
     if ! atomic_write "${launcher_dir}/shutdown-requested" \
         "$(rememr1_utc_now) phase=${phase} exit_code=${exit_code}"; then
         _record_shutdown_skipped "${launcher_dir}" "request-marker-write-failed"
@@ -281,8 +314,15 @@ request_guest_shutdown() {
         return 1
     fi
     echo "[shutdown] terminal state is durable; requesting guest shutdown"
+    local dispatch_rc
     if _dispatch_guest_shutdown_backend; then
         return 0
+    else
+        dispatch_rc=$?
+    fi
+    if [[ "${dispatch_rc}" -eq 2 ]]; then
+        _record_shutdown_skipped "${launcher_dir}" "backend-revalidation-failed"
+        return 1
     fi
     atomic_write "${launcher_dir}/shutdown-failed" "$(rememr1_utc_now)" || true
     rememr1_sync_all || true

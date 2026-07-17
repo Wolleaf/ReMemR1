@@ -68,7 +68,7 @@ if [[ "${REMEMR1_TEST_MODE:-no}" != "no" || \
     echo "bootstrap does not support the launcher test hook" >&2
     exit 2
 fi
-for command_name in find findmnt flock git mkfifo mv realpath sync tee timeout; do
+for command_name in bash env find findmnt flock git mkfifo mv realpath stat sync tee timeout; do
     command -v "${command_name}" >/dev/null 2>&1 || {
         echo "required command is missing: ${command_name}" >&2
         exit 1
@@ -92,9 +92,21 @@ verify_bootstrap_persistent_mount() {
        "${source}" != "${root_source}" && \
        "${major_minor}" != "${root_major_minor}" ]]
 }
-if [[ "${shutdown_disabled}" != "yes" && \
-      ! -x /usr/sbin/shutdown && ! -x /sbin/shutdown && ! -x /usr/bin/systemctl ]]; then
-    echo "no supported shutdown backend is available" >&2
+
+bootstrap_autodl_shutdown_backend_available() {
+    local mode
+    [[ -f /usr/bin/shutdown && ! -L /usr/bin/shutdown && \
+       -x /usr/bin/shutdown ]] || return 1
+    [[ "$(stat -c '%u' -- /usr/bin/shutdown)" == 0 ]] || return 1
+    mode="$(stat -c '%a' -- /usr/bin/shutdown)" || return
+    [[ "${mode}" =~ ^[0-7]{3}$ ]] || return 1
+    (( (8#${mode} & 8#022) == 0 )) || return 1
+    [[ -f /etc/autodl-init && ! -L /etc/autodl-init && \
+       "$(stat -c '%u' -- /etc/autodl-init)" == 0 ]]
+}
+if [[ "${shutdown_disabled}" != "yes" ]] && \
+   ! bootstrap_autodl_shutdown_backend_available; then
+    echo "AutoDL's official /usr/bin/shutdown wrapper is unavailable" >&2
     exit 1
 fi
 [[ "${PROJECT_DIR}" =~ ^/root/autodl-tmp/[^/]+$ ]] || {
@@ -204,6 +216,27 @@ bootstrap_failure_shutdown_authorized() {
     fi
 }
 
+bootstrap_dispatch_shutdown_backend() {
+    if [[ "${BOOTSTRAP_INITIALIZED}" == "yes" ]]; then
+        local cloud_env
+        cloud_env="${REMEMR1_CLOUD_ENV:-/root/autodl-tmp/rememr1-cloud.env}"
+        (
+            source "${PROJECT_DIR}/scripts/cloud/lib/runtime.sh"
+            source "${PROJECT_DIR}/scripts/cloud/lib/shutdown.sh"
+            rememr1_load_cloud_env "${cloud_env}" &&
+                rememr1_require_cloud_env &&
+                rememr1_validate_test_mode &&
+                verify_guest_shutdown_preflight &&
+                _dispatch_guest_shutdown_backend
+        )
+        return
+    fi
+    bootstrap_autodl_shutdown_backend_available || return
+    timeout --signal=TERM --kill-after=30s 2m \
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root \
+        /usr/bin/bash --noprofile --norc /usr/bin/shutdown
+}
+
 bootstrap_exit() {
     local rc="$?"
     trap - EXIT INT TERM
@@ -231,9 +264,7 @@ bootstrap_exit() {
                         "${BOOTSTRAP_RUN}/shutdown-requested"
                     if timeout --signal=TERM --kill-after=30s 2m \
                        /usr/bin/sync -f "${BOOTSTRAP_RUN}/shutdown-requested"; then
-                        timeout --signal=TERM --kill-after=30s 2m /usr/sbin/shutdown -h now || \
-                        timeout --signal=TERM --kill-after=30s 2m /sbin/shutdown -h now || \
-                        timeout --signal=TERM --kill-after=30s 2m /usr/bin/systemctl poweroff || \
+                        bootstrap_dispatch_shutdown_backend || \
                             printf '%s\n' "shutdown command failed" > "${BOOTSTRAP_RUN}/shutdown-failed"
                     else
                         printf '%s\n' "shutdown-request-marker-sync-failed" > \

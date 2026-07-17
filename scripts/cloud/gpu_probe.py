@@ -255,7 +255,9 @@ def _query_nvidia_smi() -> dict[str, Any]:
 
 
 def _query_cuda_toolkit() -> str:
-    output = _run_text(["nvcc", "--version"])
+    cuda_home = os.environ.get("CUDA_HOME", "").strip()
+    nvcc = str(Path(cuda_home) / "bin" / "nvcc") if cuda_home else "nvcc"
+    output = _run_text([nvcc, "--version"])
     match = _NVCC_RELEASE.search(output)
     if match is None:
         raise ProbeError("nvcc did not report a CUDA toolkit release")

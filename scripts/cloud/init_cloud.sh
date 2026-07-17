@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runtime.sh"
+source "${SCRIPT_DIR}/lib/shutdown.sh"
 
 PROJECT_DIR="${REMEMR1_PROJECT_DIR:-/root/autodl-tmp/ReMemR1}"
 EXPERIMENT_PROFILE="${REMEMR1_EXPERIMENT_PROFILE:-rtx5090-32g-qwen35-2b-v1}"
@@ -136,6 +137,19 @@ rememr1_verify_persistent_mount /root/autodl-tmp || {
     exit 1
 }
 
+SHUTDOWN_BACKEND="none"
+SHUTDOWN_BACKEND_PATH=""
+SHUTDOWN_BACKEND_SHA256="$(printf '0%.0s' {1..64})"
+if [[ "${ALLOW_GUEST_SHUTDOWN}" == "yes" ]]; then
+    SHUTDOWN_BACKEND="autodl-wrapper-v1"
+    SHUTDOWN_BACKEND_PATH="/usr/bin/shutdown"
+    SHUTDOWN_BACKEND_SHA256="$(_shutdown_autodl_wrapper_sha256 \
+        "${SHUTDOWN_BACKEND_PATH}")" || {
+        echo "AutoDL's official /usr/bin/shutdown wrapper is unavailable" >&2
+        exit 1
+    }
+fi
+
 umask 077
 mkdir -p \
     "${PERSIST_ROOT}/cache/huggingface" \
@@ -191,12 +205,15 @@ fi
 
 cap_tmp="${CAPABILITY_FILE}.tmp.$$"
 cat > "${cap_tmp}" <<EOF
-schema_version=1
+schema_version=2
 project_dir=${PROJECT_DIR}
 persist_root=${PERSIST_ROOT}
 expected_commit=${EXPECTED_COMMIT}
 lock_file=${LOCK_FILE}
 allow_guest_shutdown=${ALLOW_GUEST_SHUTDOWN}
+shutdown_backend=${SHUTDOWN_BACKEND}
+shutdown_backend_path=${SHUTDOWN_BACKEND_PATH}
+shutdown_backend_sha256=${SHUTDOWN_BACKEND_SHA256}
 EOF
 chmod 600 "${cap_tmp}"
 chown 0:0 "${cap_tmp}"
