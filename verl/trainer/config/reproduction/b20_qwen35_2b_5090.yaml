@@ -1,0 +1,31 @@
+# @package _global_
+defaults:
+  - /reproduction/g2b_qwen35_2b_5090_step1
+  - _self_
+
+reproduction:
+  step_zero_fingerprint_path: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/b20/evidence/step_zero_fingerprint.json
+  step_zero_reference_path: null
+  adapter_export_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/b20/artifacts/adapter
+
+actor_rollout_ref:
+  actor:
+    optim:
+      total_training_steps: 20
+
+critic:
+  optim:
+    total_training_steps: 20
+
+algorithm:
+  alpha: 1.0
+
+trainer:
+  total_training_steps: 20
+  experiment_name: qwen35-2b-5090-B-${reproduction.offload_profile}-seed42-b20
+  rollout_data_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/b20/logs/rollouts
+  validation_data_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/b20/logs/validation
+  save_freq: 20
+  resume_mode: disable
+  resume_from_path: null
+  default_local_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/b20/checkpoints

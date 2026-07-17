@@ -77,6 +77,23 @@ class PairedBootstrapResult:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class StratifiedPairedBootstrapResult:
+    stratum_count: int
+    sample_counts: tuple[int, ...]
+    resamples: int
+    seed: int
+    observed_delta: float
+    confidence_level: float
+    ci_low: float
+    ci_high: float
+
+    def to_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        value["sample_counts"] = list(self.sample_counts)
+        return value
+
+
 def normalize_answer(text: str) -> str:
     """Apply the SQuAD-style normalization used by EM and token F1."""
 
@@ -286,18 +303,85 @@ def paired_bootstrap_delta(
     )
 
 
+def stratified_paired_bootstrap_delta(
+    strata: Sequence[tuple[Iterable[float], Iterable[float]]],
+    *,
+    resamples: int = 10_000,
+    confidence_level: float = 0.95,
+    seed: int = 42,
+) -> StratifiedPairedBootstrapResult:
+    """Bootstrap paired deltas within strata, then macro-average strata equally."""
+
+    if isinstance(strata, (str, bytes)) or not isinstance(strata, Sequence):
+        raise TypeError("strata must be a sequence of baseline/candidate pairs")
+    validated: list[tuple[float, ...]] = []
+    sample_counts: list[int] = []
+    for index, pair in enumerate(strata):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise EvaluationContractError(
+                f"strata[{index}] must contain baseline and candidate metrics"
+            )
+        baseline = _validate_metric_values(pair[0], name=f"strata[{index}].baseline")
+        candidate = _validate_metric_values(pair[1], name=f"strata[{index}].candidate")
+        if len(baseline) != len(candidate):
+            raise EvaluationContractError(
+                f"strata[{index}] paired metrics must have the same length"
+            )
+        validated.append(
+            tuple(
+                candidate_value - baseline_value
+                for baseline_value, candidate_value in zip(baseline, candidate)
+            )
+        )
+        sample_counts.append(len(baseline))
+    if not validated:
+        raise EvaluationContractError("strata must not be empty")
+    if isinstance(resamples, bool) or not isinstance(resamples, int) or resamples <= 0:
+        raise EvaluationContractError("resamples must be a positive int")
+    if not isinstance(confidence_level, (int, float)) or not 0 < confidence_level < 1:
+        raise EvaluationContractError("confidence_level must be between zero and one")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+
+    observed = fmean(fmean(deltas) for deltas in validated)
+    rng = random.Random(seed)
+    bootstrap = []
+    for _ in range(resamples):
+        stratum_means = []
+        for deltas in validated:
+            count = len(deltas)
+            stratum_means.append(
+                fmean(deltas[rng.randrange(count)] for _ in range(count))
+            )
+        bootstrap.append(fmean(stratum_means))
+    bootstrap.sort()
+    tail = (1.0 - float(confidence_level)) / 2.0
+    return StratifiedPairedBootstrapResult(
+        stratum_count=len(validated),
+        sample_counts=tuple(sample_counts),
+        resamples=resamples,
+        seed=seed,
+        observed_delta=observed,
+        confidence_level=float(confidence_level),
+        ci_low=_quantile(bootstrap, tail),
+        ci_high=_quantile(bootstrap, 1.0 - tail),
+    )
+
+
 __all__ = [
     "AnswerScores",
     "EvaluatedAnswer",
     "EvaluationContractError",
     "ExtractedAnswer",
     "PairedBootstrapResult",
+    "StratifiedPairedBootstrapResult",
     "evaluate_output",
     "exact_match",
     "extract_answer",
     "normalize_answer",
     "paired_bootstrap_delta",
     "score_all_gold",
+    "stratified_paired_bootstrap_delta",
     "substring_exact_match",
     "token_f1",
 ]

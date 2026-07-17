@@ -154,6 +154,7 @@ class HFRollout(BaseRollout):
         response_length = int(response_length)
         if response_length <= 0:
             raise ValueError(f"max_tokens must be positive, got {response_length}")
+        generation_token_limit = response_length
 
         target_response_length = pad_to
         if target_response_length is None:
@@ -240,6 +241,10 @@ class HFRollout(BaseRollout):
         # used to construct attention_mask
         eos_token_id = prompts.meta_info["eos_token_id"]
         pad_token_id = prompts.meta_info["pad_token_id"]
+        ignore_eos = self.config.get("ignore_eos", False)
+        if not isinstance(ignore_eos, bool):
+            raise ValueError("rollout.ignore_eos must be a boolean")
+        generation_eos_token_id = None if ignore_eos else eos_token_id
 
         was_training = self.module.training
         self.module.eval()
@@ -265,7 +270,7 @@ class HFRollout(BaseRollout):
                     attention_mask=attention_mask,
                     do_sample=do_sample,
                     max_new_tokens=response_length,
-                    eos_token_id=eos_token_id,
+                    eos_token_id=generation_eos_token_id,
                     pad_token_id=pad_token_id,
                     generation_config=generation_config,
                     output_scores=False,  # this is potentially very large
@@ -327,9 +332,31 @@ class HFRollout(BaseRollout):
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         generated_token_mask = torch.arange(response_length, device=response.device) < generated_response_length
-        response_attention_mask = response_attention_mask * generated_token_mask.unsqueeze(0).to(attention_mask.dtype)
+        generated_token_mask = generated_token_mask.unsqueeze(0).to(attention_mask.dtype)
+        if ignore_eos:
+            response_attention_mask = generated_token_mask.expand(generated_batch_size, -1)
+        else:
+            response_attention_mask = get_response_mask(
+                response_id=response,
+                eos_token=eos_token_id,
+                dtype=attention_mask.dtype,
+            )
+            response_attention_mask = response_attention_mask * generated_token_mask
+        generated_token_counts = response_attention_mask.sum(dim=-1)
+        if ignore_eos:
+            reached_token_limit = generated_token_counts >= generation_token_limit
+        else:
+            eos_values = torch.as_tensor(
+                eos_token_id,
+                device=response.device,
+                dtype=response.dtype,
+            ).reshape(-1)
+            generated_region = response[:, :generation_token_limit]
+            contains_eos = torch.isin(generated_region, eos_values).any(dim=-1)
+            reached_token_limit = (
+                generated_token_counts >= generation_token_limit
+            ) & ~contains_eos
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         if not (seq.shape == attention_mask.shape == position_ids.shape):
@@ -345,6 +372,13 @@ class HFRollout(BaseRollout):
                 "responses": response,
                 "input_ids": seq,
                 "attention_mask": attention_mask,
+                "generation_reached_token_limit": reached_token_limit,
+                "generation_token_limit": torch.full(
+                    (generated_batch_size,),
+                    generation_token_limit,
+                    dtype=torch.long,
+                    device=response.device,
+                ),
                 "position_ids": position_ids,
             },
             batch_size=generated_batch_size,

@@ -14,6 +14,26 @@ from scripts.reproduction.prefetch_assets import seal_manifest, validate_asset_m
 COMMIT = "a" * 40
 REVISION = "b" * 40
 SHA256 = "c" * 64
+HANDOFF_KEYS = {
+    "asset_manifest",
+    "asset_report",
+    "bundles",
+    "config_files",
+    "config_root",
+    "config_tree_sha256",
+    "data_root",
+    "environment_lock",
+    "environment_lock_sha256",
+    "experiment_profile_id",
+    "git_commit",
+    "handoff_sha256",
+    "kernel_source_root",
+    "kernel_sources",
+    "pip_freeze",
+    "persist_root",
+    "schema_version",
+    "status",
+}
 
 
 def _write_json(path: Path, value) -> Path:
@@ -201,7 +221,140 @@ def test_synthetic_gate_source_has_twenty_distinct_qa_and_satisfies_fixture_cont
     assert 1025 <= minimum <= maximum <= 2048
 
 
+def test_length_stress_source_is_disjoint_non_scientific_fixed_capacity_fixture():
+    train = cloud_state._synthetic_length_stress_records("train", 120)
+    validation = cloud_state._synthetic_length_stress_records("validation", 120)
+    assert cloud_state._LENGTH_STRESS_CONTRACT.qa_count == 2
+    assert len(train) == len(validation) == 100
+    assert {record["_id"] for record in train}.isdisjoint(
+        record["_id"] for record in validation
+    )
+    assert len(
+        {
+            document["document_id"]
+            for record in train
+            for document in record["context"]
+        }
+    ) == 200
+    minimum, maximum = cloud_state._probe_length_stress_records(
+        train,
+        repeat_count=120,
+        tokenizer_name="owner/qwen2",
+        tokenizer_revision=REVISION,
+        encode=_whitespace_encoder,
+    )
+    assert 25_001 <= minimum <= maximum <= 30_000
+    payload = cloud_state._jsonl_bytes(train)
+    examples = tuple(
+        cloud_state.parse_source_record(record, dataset="hotpotqa", source_index=index)
+        for index, record in enumerate(train)
+    )
+    metadata = cloud_state.ManifestMetadata(
+        source_name="hotpotqa",
+        source_revision=(
+            f"{cloud_state._LENGTH_STRESS_SOURCE_REVISION_PREFIX}-r120"
+        ),
+        source_sha256=hashlib.sha256(payload).hexdigest(),
+        tokenizer_name="owner/qwen2",
+        tokenizer_revision=REVISION,
+        seed=cloud_state.SEED,
+    )
+    first = cloud_state.build_train_records(
+        examples,
+        metadata=metadata,
+        encode=_whitespace_encoder,
+        contract=cloud_state._LENGTH_STRESS_CONTRACT,
+    )
+    second = cloud_state.build_train_records(
+        examples,
+        metadata=metadata,
+        encode=_whitespace_encoder,
+        contract=cloud_state._LENGTH_STRESS_CONTRACT,
+    )
+    assert len(first) == 2
+    assert [record.qa.qa_id for record in first] == [
+        record.qa.qa_id for record in second
+    ]
+    assert [record.record_sha256 for record in first] == [
+        record.record_sha256 for record in second
+    ]
+    assert all(record.document_count == 200 for record in first)
+    assert all(25_001 <= record.context_token_count <= 30_000 for record in first)
+
+
+def test_active_profile_constants_and_bundle_identities_are_exact():
+    assert cloud_state.SCHEMA_VERSION == 3
+    assert cloud_state.EXPERIMENT_PROFILE_ID == "rtx5090-32g-qwen35-2b-v1"
+    assert len(cloud_state._CONFIG_IDS) == 33
+    assert len(cloud_state._TRAINING_SOURCE_IDS) == 14
+    assert all("4b" not in value.casefold() for value in cloud_state._CONFIG_IDS)
+    formal_specs = [spec for spec in cloud_state._BUNDLE_SPECS if spec.keys[0] == "formal"]
+    assert formal_specs
+    assert {spec.tokenizer_asset for spec in formal_specs} == {
+        "qwen35-2b-model-tokenizer"
+    }
+    length_specs = [
+        spec for spec in cloud_state._BUNDLE_SPECS if spec.length_stress_split is not None
+    ]
+    assert {spec.length_stress_split for spec in length_specs} == {
+        "train",
+        "validation",
+    }
+    assert all(spec.profile == "fixture" for spec in length_specs)
+    assert all(spec.tokenizer_asset == "qwen35-2b-model-tokenizer" for spec in length_specs)
+    assert all(spec.relative_path.startswith("capacity/length-stress/") for spec in length_specs)
+
+
+def test_length_stress_bundle_builds_two_verified_non_scientific_records(tmp_path):
+    parquet = pytest.importorskip(
+        "pyarrow.parquet", reason="pyarrow is required to verify Parquet bundles"
+    )
+    repeat_count = 120
+    source = tmp_path / "capacity" / "length-stress" / "source" / "train.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(
+        cloud_state._jsonl_bytes(
+            cloud_state._synthetic_length_stress_records("train", repeat_count)
+        )
+    )
+    bundle = tmp_path / "capacity" / "length-stress" / "train"
+
+    manifest = cloud_state.build_artifact_bundle(
+        dataset="hotpotqa",
+        encode=_whitespace_encoder,
+        input_path=source,
+        mode="train",
+        output_dir=bundle,
+        profile="fixture",
+        seed=cloud_state.SEED,
+        source_revision=(
+            f"{cloud_state._LENGTH_STRESS_SOURCE_REVISION_PREFIX}-r{repeat_count:03d}"
+        ),
+        split=None,
+        tokenizer_name="owner/qwen2",
+        tokenizer_revision=REVISION,
+        train_contract=cloud_state._LENGTH_STRESS_CONTRACT,
+    )
+    verified = cloud_state.validate_artifact_bundle(bundle)
+    rows = parquet.read_table(bundle / "train.parquet").to_pylist()
+
+    assert verified == manifest
+    assert manifest["profile"] == "fixture"
+    assert manifest["contract"] == cloud_state._LENGTH_STRESS_CONTRACT.to_dict()
+    assert manifest["source"]["record_count"] == 100
+    assert manifest["source"]["revision"].startswith(
+        cloud_state._LENGTH_STRESS_SOURCE_REVISION_PREFIX
+    )
+    assert len(rows) == 2
+    assert all(row["extra_info"]["document_count"] == 200 for row in rows)
+    assert all(
+        25_001 <= row["extra_info"]["context_token_count"] <= 30_000
+        for row in rows
+    )
+
+
 def test_g1_eval_fixture_builds_two_recurrent_records(tmp_path):
+    pytest.importorskip("pyarrow", reason="pyarrow is required to build Parquet fixtures")
     from taskutils.memory_eval.reproduction_runner import load_eval_records
 
     repeat_count = 64
@@ -261,13 +414,6 @@ def _build_data_manifest(tmp_path: Path):
             [{"path": "tokenizer.json", "sha256": "0" * 64, "size": 0}],
             "2" * 40,
         ),
-        _resolved_asset(
-            "qwen35-4b-model-tokenizer",
-            "model_and_tokenizer",
-            "owner/qwen4",
-            [{"path": "tokenizer.json", "sha256": "0" * 64, "size": 0}],
-            "4" * 40,
-        ),
     ]
     for asset_id, repo_id, filenames, kind in (
         (
@@ -319,7 +465,10 @@ def _fake_bundle_manifest(kwargs):
                 "qa_count": value.qa_count,
             }
     elif kwargs["mode"] == "train":
-        contract = cloud_state.TrainManifestContract().to_dict()
+        contract = kwargs.get(
+            "train_contract",
+            cloud_state.TrainManifestContract(),
+        ).to_dict()
     else:
         from taskutils.data_synthesis.reproduction_manifest import EvalManifestContract
 
@@ -370,6 +519,17 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
         "_select_gate_sources",
         lambda tokenizers: (64, gate_payloads, {"g0": {}, "g1": {}}),
     )
+    length_payloads = {
+        split: cloud_state._jsonl_bytes(
+            cloud_state._synthetic_length_stress_records(split, 120)
+        )
+        for split in ("train", "validation")
+    }
+    monkeypatch.setattr(
+        cloud_state,
+        "_select_length_stress_sources",
+        lambda tokenizer: (120, length_payloads, {"train": {}, "validation": {}}),
+    )
     monkeypatch.setattr(cloud_state, "_probe_formal_parquet", lambda *args, **kwargs: None)
 
     def downloader(**kwargs):
@@ -396,11 +556,22 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
         validator=validator,
         tracked_manifest_path=manifest_path,
     )
-    assert len(calls["build"]) == 9
+    assert len(calls["build"]) == 11
     assert len(calls["download"]) == 4
     assert all(call["local_files_only"] is True for call in calls["download"])
     assert result["bundles"]["gates"]["g0"]["train"]["action"] == "built"
     assert result["gate_source"]["repeat_count"] == 64
+    assert result["length_stress_source"]["non_scientific"] is True
+    assert result["length_stress_source"]["generator"] == (
+        cloud_state._LENGTH_STRESS_SOURCE_REVISION_PREFIX
+    )
+    for split in ("train", "validation"):
+        record = result["bundles"]["capacity"]["length_stress"][split]
+        assert record["profile"] == "fixture"
+        assert manifests[Path(record["path"]).resolve()]["contract"] == (
+            cloud_state._LENGTH_STRESS_CONTRACT.to_dict()
+        )
+        assert record["tokenizer_name"] == "owner/qwen2"
 
     second = cloud_state.build_data(
         manifest_path,
@@ -412,7 +583,7 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
         validator=validator,
         tracked_manifest_path=manifest_path,
     )
-    assert len(calls["build"]) == 9
+    assert len(calls["build"]) == 11
     assert second["bundles"]["formal"]["train"]["action"] == "verified"
 
 
@@ -442,6 +613,55 @@ def test_build_data_cli_atomically_writes_same_summary_it_prints(tmp_path, monke
     assert json.loads(capsys.readouterr().out) == summary
 
 
+def test_resolved_config_tree_requires_exact_33_ids_and_five_field_entries(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("hydra", reason="hydra-core is required to resolve configs")
+    from scripts.cloud import resolve_configs
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    def bundle(root, relative):
+        path = root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        return path, {
+            "manifest_sha256": hashlib.sha256(relative.encode("ascii")).hexdigest()
+        }
+
+    monkeypatch.setattr(resolve_configs, "_bundle", bundle)
+    config_root = tmp_path / "resolved"
+    result = resolve_configs.compose_all(data_root, config_root)
+    records = cloud_state._tree_records(
+        config_root,
+        expected_names=cloud_state._CONFIG_TREE_NAMES,
+    )
+
+    assert len(result["configs"]) == 33
+    assert set(result["configs"]) == cloud_state._CONFIG_IDS
+    assert all(len(entry) == 5 for entry in result["configs"].values())
+    cloud_state._validate_resolved_config_tree(
+        config_root,
+        records,
+        data_root.resolve(),
+    )
+
+    index_path = config_root / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["configs"]["g0_qwen35_08b"]["unexpected"] = True
+    _write_json(index_path, index)
+    records = cloud_state._tree_records(
+        config_root,
+        expected_names=cloud_state._CONFIG_TREE_NAMES,
+    )
+    with pytest.raises(cloud_state.CloudStateError, match="keys mismatch"):
+        cloud_state._validate_resolved_config_tree(
+            config_root,
+            records,
+            data_root.resolve(),
+        )
+
+
 def _minimal_handoff(tmp_path: Path):
     files = {}
     for name in ("asset-manifest", "asset-report", "environment", "pip-freeze"):
@@ -458,6 +678,7 @@ def _minimal_handoff(tmp_path: Path):
         "data_root": str(tmp_path),
         "environment_lock": {"file": files["environment"]},
         "environment_lock_sha256": "e" * 64,
+        "experiment_profile_id": cloud_state.EXPERIMENT_PROFILE_ID,
         "git_commit": COMMIT,
         "kernel_source_root": str(tmp_path),
         "kernel_sources": {},
@@ -508,11 +729,28 @@ def test_verify_handoff_checks_self_hash_canonical_form_and_printable_scalar(
         field="git_commit",
     )
     assert handoff["status"] == "cpu_ready"
+    assert set(handoff) == HANDOFF_KEYS
+    assert handoff["experiment_profile_id"] == cloud_state.EXPERIMENT_PROFILE_ID
     assert value == COMMIT
     with pytest.raises(cloud_state.CloudStateError, match="not a scalar"):
         cloud_state.verify_handoff(handoff_path, COMMIT, field="asset_manifest")
     with pytest.raises(cloud_state.CloudStateError, match="does not exist"):
         cloud_state.verify_handoff(handoff_path, COMMIT, field="missing.value")
+
+    extra = dict(sealed)
+    extra["unexpected"] = True
+    cloud_state._atomic_write_json(handoff_path, extra)
+    with pytest.raises(cloud_state.CloudStateError, match="keys mismatch"):
+        cloud_state.verify_handoff(handoff_path, COMMIT)
+
+    wrong_profile = dict(sealed)
+    wrong_profile["experiment_profile_id"] = "legacy-4b-profile"
+    unsigned = dict(wrong_profile)
+    unsigned.pop("handoff_sha256")
+    wrong_profile["handoff_sha256"] = cloud_state._canonical_sha256(unsigned)
+    cloud_state._atomic_write_json(handoff_path, wrong_profile)
+    with pytest.raises(cloud_state.CloudStateError, match="active 5090/2B"):
+        cloud_state.verify_handoff(handoff_path, COMMIT)
 
     tampered = dict(sealed)
     tampered["git_commit"] = "d" * 40
@@ -661,6 +899,7 @@ def test_publish_handoff_writes_canonical_self_hashed_json(tmp_path, monkeypatch
     unsigned = dict(handoff)
     digest = unsigned.pop("handoff_sha256")
     assert digest == cloud_state._canonical_sha256(unsigned)
+    assert set(handoff) == HANDOFF_KEYS
     assert handoff["status"] == "cpu_ready"
     assert handoff["data_root"] == str(data_root.resolve())
     assert output.read_bytes() == cloud_state._canonical_bytes(handoff) + b"\n"

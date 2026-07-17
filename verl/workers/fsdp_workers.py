@@ -20,6 +20,9 @@ import os
 import warnings
 import json
 import importlib.metadata
+import subprocess
+import threading
+import time
 from typing import Union
 
 import psutil
@@ -57,6 +60,46 @@ from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_REPRODUCTION_TELEMETRY_PHASES = (
+    "rollout",
+    "reward",
+    "actor_log_prob",
+    "reference_log_prob",
+    "update",
+    "save",
+)
+
+
+def _query_single_gpu_nvml_memory():
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=uuid,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nvidia-smi telemetry failed: {result.stderr.strip()}")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RuntimeError(f"telemetry requires exactly one physical GPU, got {lines}")
+    fields = [field.strip() for field in lines[0].split(",")]
+    if len(fields) != 3 or not fields[0].startswith("GPU-"):
+        raise RuntimeError(f"malformed nvidia-smi telemetry: {lines[0]!r}")
+    try:
+        used_mib, total_mib = (int(value) for value in fields[1:])
+    except ValueError as exc:
+        raise RuntimeError(f"non-integer nvidia-smi telemetry: {lines[0]!r}") from exc
+    return {
+        "gpu_uuid": fields[0],
+        "used_bytes": used_mib * 1024**2,
+        "total_bytes": total_mib * 1024**2,
+    }
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -823,6 +866,282 @@ class ActorRolloutRefWorker(Worker):
         return {
             "adapter_tensor_keys": list(tensor_keys),
             "adapter_state_sha256": canonical_tensor_state_sha256(adapter_state),
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_reproduction_step_telemetry(self, sample_nvml=True):
+        """Reset CUDA peaks and start whole-card sampling for one optimizer loop."""
+
+        if not self._is_actor or self._is_ref:
+            raise RuntimeError(
+                "whole-process resource telemetry requires an actor-only worker"
+            )
+        if type(sample_nvml) is not bool:
+            raise TypeError("sample_nvml must be boolean")
+        active = getattr(self, "_reproduction_telemetry_sampler", None)
+        if active is not None:
+            raise RuntimeError("a reproduction telemetry sampler is already active")
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        self.actor._reproduction_logits_evidence = None
+        initial = _query_single_gpu_nvml_memory()
+        host = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        stop_event = threading.Event()
+        started = time.monotonic()
+        state = {
+            "allocator_retry_start": int(
+                torch.cuda.memory_stats().get("num_alloc_retries", 0)
+            ),
+            "error": None,
+            "gpu_uuid": initial["gpu_uuid"],
+            "host_peak_used_bytes": host.used,
+            "lock": threading.Lock(),
+            "nvml_peak_used_bytes": initial["used_bytes"],
+            "nvml_total_bytes": initial["total_bytes"],
+            "phase_host_peak_used_bytes": host.used,
+            "phase_name": _REPRODUCTION_TELEMETRY_PHASES[0],
+            "phase_nvml_peak_used_bytes": initial["used_bytes"],
+            "phase_started_monotonic": started,
+            "phase_swap_peak_used_bytes": swap.used,
+            "phases": [],
+            "sample_nvml": sample_nvml,
+            "started_monotonic": started,
+            "stop_event": stop_event,
+            "swap_peak_used_bytes": swap.used,
+        }
+
+        def sample():
+            while not stop_event.wait(0.1):
+                try:
+                    observed = _query_single_gpu_nvml_memory()
+                    if (
+                        observed["gpu_uuid"] != state["gpu_uuid"]
+                        or observed["total_bytes"] != state["nvml_total_bytes"]
+                    ):
+                        raise RuntimeError("GPU identity changed during telemetry sampling")
+                    host_used = psutil.virtual_memory().used
+                    swap_used = psutil.swap_memory().used
+                    with state["lock"]:
+                        state["nvml_peak_used_bytes"] = max(
+                            state["nvml_peak_used_bytes"], observed["used_bytes"]
+                        )
+                        state["host_peak_used_bytes"] = max(
+                            state["host_peak_used_bytes"], host_used
+                        )
+                        state["swap_peak_used_bytes"] = max(
+                            state["swap_peak_used_bytes"], swap_used
+                        )
+                        state["phase_nvml_peak_used_bytes"] = max(
+                            state["phase_nvml_peak_used_bytes"], observed["used_bytes"]
+                        )
+                        state["phase_host_peak_used_bytes"] = max(
+                            state["phase_host_peak_used_bytes"], host_used
+                        )
+                        state["phase_swap_peak_used_bytes"] = max(
+                            state["phase_swap_peak_used_bytes"], swap_used
+                        )
+                except Exception as exc:
+                    state["error"] = f"{type(exc).__name__}: {exc}"
+                    stop_event.set()
+
+        thread = threading.Thread(
+            target=sample,
+            name="rememr1-nvml-telemetry",
+            daemon=True,
+        )
+        state["thread"] = thread if sample_nvml else None
+        self._reproduction_telemetry_sampler = state
+        if sample_nvml:
+            thread.start()
+        return {"rank": self.rank, "role": "actor", "status": "reset"}
+
+    def _close_reproduction_telemetry_phase(self, state):
+        torch.cuda.synchronize()
+        observed = _query_single_gpu_nvml_memory()
+        if (
+            observed["gpu_uuid"] != state["gpu_uuid"]
+            or observed["total_bytes"] != state["nvml_total_bytes"]
+        ):
+            raise RuntimeError("GPU identity changed during telemetry sampling")
+        host = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        ended = time.monotonic()
+        with state["lock"]:
+            state["nvml_peak_used_bytes"] = max(
+                state["nvml_peak_used_bytes"], observed["used_bytes"]
+            )
+            state["host_peak_used_bytes"] = max(
+                state["host_peak_used_bytes"], host.used
+            )
+            state["swap_peak_used_bytes"] = max(
+                state["swap_peak_used_bytes"], swap.used
+            )
+            phase = {
+                "duration_seconds": ended - state["phase_started_monotonic"],
+                "host_peak_used_bytes": max(
+                    state["phase_host_peak_used_bytes"], host.used
+                ),
+                "name": state["phase_name"],
+                "nvml_peak_used_bytes": max(
+                    state["phase_nvml_peak_used_bytes"], observed["used_bytes"]
+                ),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+                "post_allocated_bytes": torch.cuda.memory_allocated(),
+                "post_reserved_bytes": torch.cuda.memory_reserved(),
+                "swap_peak_used_bytes": max(
+                    state["phase_swap_peak_used_bytes"], swap.used
+                ),
+            }
+            state["phases"].append(phase)
+        return observed, host, swap
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def advance_reproduction_step_telemetry(self, next_phase):
+        """Seal one phase window and reset CUDA peaks for the next phase."""
+
+        state = getattr(self, "_reproduction_telemetry_sampler", None)
+        if state is None:
+            raise RuntimeError("reproduction telemetry was not reset for this step")
+        completed_count = len(state["phases"])
+        if completed_count >= len(_REPRODUCTION_TELEMETRY_PHASES) - 1:
+            raise RuntimeError("reproduction telemetry has no next phase")
+        expected_current = _REPRODUCTION_TELEMETRY_PHASES[completed_count]
+        expected_next = _REPRODUCTION_TELEMETRY_PHASES[completed_count + 1]
+        if state["phase_name"] != expected_current or next_phase != expected_next:
+            raise RuntimeError(
+                f"telemetry phase transition must be {expected_current}->{expected_next}"
+            )
+        observed, host, swap = self._close_reproduction_telemetry_phase(state)
+        torch.cuda.reset_peak_memory_stats()
+        with state["lock"]:
+            state["phase_name"] = next_phase
+            state["phase_started_monotonic"] = time.monotonic()
+            state["phase_nvml_peak_used_bytes"] = observed["used_bytes"]
+            state["phase_host_peak_used_bytes"] = host.used
+            state["phase_swap_peak_used_bytes"] = swap.used
+        return {"phase": expected_current, "rank": self.rank, "status": "sealed"}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def collect_reproduction_step_telemetry(self):
+        """Stop sampling and return JSON-safe CUDA/NVML evidence for this rank."""
+
+        state = getattr(self, "_reproduction_telemetry_sampler", None)
+        if state is None:
+            raise RuntimeError("reproduction telemetry was not reset for this step")
+        if state["phase_name"] != _REPRODUCTION_TELEMETRY_PHASES[-1]:
+            raise RuntimeError("reproduction telemetry did not reach the save phase")
+        state["stop_event"].set()
+        if state["thread"] is not None:
+            state["thread"].join(timeout=10)
+            if state["thread"].is_alive():
+                raise RuntimeError("NVML telemetry sampler did not stop")
+        final, host, swap = self._close_reproduction_telemetry_phase(state)
+        error = state["error"]
+        self._reproduction_telemetry_sampler = None
+        if error is not None:
+            raise RuntimeError(f"NVML telemetry sampler failed: {error}")
+        memory_stats = torch.cuda.memory_stats()
+        phases = state["phases"]
+        if [phase["name"] for phase in phases] != list(
+            _REPRODUCTION_TELEMETRY_PHASES
+        ):
+            raise RuntimeError("reproduction telemetry phase inventory is incomplete")
+        return {
+            "actor_logits": self.actor._reproduction_logits_evidence,
+            "allocator_retry_count": max(
+                0,
+                int(memory_stats.get("num_alloc_retries", 0))
+                - state["allocator_retry_start"],
+            ),
+            "gpu_uuid": state["gpu_uuid"],
+            "host_peak_used_bytes": max(state["host_peak_used_bytes"], host.used),
+            "host_total_memory_bytes": host.total,
+            "nvml_peak_used_bytes": state["nvml_peak_used_bytes"],
+            "nvml_total_bytes": state["nvml_total_bytes"],
+            "peak_allocated_bytes": max(
+                phase["peak_allocated_bytes"] for phase in phases
+            ),
+            "peak_reserved_bytes": max(
+                phase["peak_reserved_bytes"] for phase in phases
+            ),
+            "phase_records": phases,
+            "post_step_allocated_bytes": torch.cuda.memory_allocated(),
+            "post_step_nvml_used_bytes": final["used_bytes"],
+            "post_step_reserved_bytes": torch.cuda.memory_reserved(),
+            "rank": self.rank,
+            "reference_logits": None,
+            "role": "actor",
+            "step_wall_seconds": time.monotonic() - state["started_monotonic"],
+            "swap_used_bytes": max(state["swap_peak_used_bytes"], swap.used),
+            "world_size": self.world_size,
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_reproduction_reference_logits(self):
+        """Clear reference-logits evidence without touching process-wide CUDA peaks."""
+
+        if not self._is_ref or self._is_actor:
+            raise RuntimeError(
+                "reference logits telemetry requires a reference-only worker"
+            )
+        if getattr(self, "_reproduction_reference_logits_pending", False):
+            raise RuntimeError("reference logits telemetry is already active")
+        self.ref_policy._reproduction_logits_evidence = None
+        self._reproduction_reference_logits_pending = True
+        return {"rank": self.rank, "role": "reference", "status": "reset"}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def collect_reproduction_reference_logits(self):
+        """Return logits plus zero resource placeholders for the colocated reference."""
+
+        if not self._is_ref or self._is_actor:
+            raise RuntimeError(
+                "reference logits telemetry requires a reference-only worker"
+            )
+        if not getattr(self, "_reproduction_reference_logits_pending", False):
+            raise RuntimeError("reference logits telemetry was not reset for this step")
+        logits = self.ref_policy._reproduction_logits_evidence
+        if logits is None:
+            raise RuntimeError("reference worker produced no logits evidence")
+        gpu = _query_single_gpu_nvml_memory()
+        host = psutil.virtual_memory()
+        self._reproduction_reference_logits_pending = False
+        zero_phases = [
+            {
+                "duration_seconds": 0.0,
+                "host_peak_used_bytes": 0,
+                "name": name,
+                "nvml_peak_used_bytes": 0,
+                "peak_allocated_bytes": 0,
+                "peak_reserved_bytes": 0,
+                "post_allocated_bytes": 0,
+                "post_reserved_bytes": 0,
+                "swap_peak_used_bytes": 0,
+            }
+            for name in _REPRODUCTION_TELEMETRY_PHASES
+        ]
+        return {
+            "actor_logits": None,
+            "allocator_retry_count": 0,
+            "gpu_uuid": gpu["gpu_uuid"],
+            "host_peak_used_bytes": 0,
+            "host_total_memory_bytes": host.total,
+            "nvml_peak_used_bytes": 0,
+            "nvml_total_bytes": gpu["total_bytes"],
+            "peak_allocated_bytes": 0,
+            "peak_reserved_bytes": 0,
+            "phase_records": zero_phases,
+            "post_step_allocated_bytes": 0,
+            "post_step_nvml_used_bytes": 0,
+            "post_step_reserved_bytes": 0,
+            "rank": self.rank,
+            "reference_logits": logits,
+            "role": "reference",
+            "step_wall_seconds": 0.0,
+            "swap_used_bytes": 0,
+            "world_size": self.world_size,
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

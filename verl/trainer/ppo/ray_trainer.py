@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -95,6 +96,15 @@ from verl.utils.reproduction_fingerprint import (
     hash_sampled_token_rows,
     load_and_verify_step_zero_fingerprint,
     publish_step_zero_fingerprint,
+)
+from scripts.cloud.pilot_evidence import (
+    append_step_record as append_pilot_step_record,
+    create_step_record as create_pilot_step_record,
+    resolve_stable_prompt_group_ids,
+)
+from scripts.cloud.training_telemetry import (
+    append_step as append_training_telemetry_step,
+    create_step_record as create_training_telemetry_step,
 )
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
@@ -1871,6 +1881,10 @@ class RayPPOTrainer:
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
+                pilot_step_record = None
+                pilot_manifest_prompt_group_ids = None
+                pilot_runtime_prompt_group_ids = None
+                step_scientific_evidence = None
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -1897,6 +1911,67 @@ class RayPPOTrainer:
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
                 is_last_step = self.global_steps >= self.total_training_steps
+                runtime_telemetry_path = self.config.reproduction.get(
+                    "runtime_telemetry_path"
+                )
+                if runtime_telemetry_path is not None:
+                    if not self.use_reference_policy:
+                        raise RuntimeError(
+                            "formal telemetry requires a separate reference worker"
+                        )
+                    reset_results = (
+                        self.actor_rollout_wg.reset_reproduction_step_telemetry(
+                            sample_nvml=True
+                        )
+                    )
+                    if (
+                        not isinstance(reset_results, (list, tuple))
+                        or not reset_results
+                        or any(
+                            not isinstance(result, dict)
+                            or result.get("status") != "reset"
+                            for result in reset_results
+                        )
+                    ):
+                        raise RuntimeError(
+                            "actor ranks failed to reset reproduction telemetry"
+                        )
+                    reference_reset_results = (
+                        self.ref_policy_wg.reset_reproduction_reference_logits()
+                    )
+                    if (
+                        not isinstance(reference_reset_results, (list, tuple))
+                        or not reference_reset_results
+                        or any(
+                            not isinstance(result, dict)
+                            or result.get("status") != "reset"
+                            for result in reference_reset_results
+                        )
+                    ):
+                        raise RuntimeError(
+                            "reference ranks failed to reset reproduction telemetry"
+                        )
+
+                def advance_runtime_telemetry(next_phase):
+                    if runtime_telemetry_path is None:
+                        return
+                    results = (
+                        self.actor_rollout_wg.advance_reproduction_step_telemetry(
+                            next_phase
+                        )
+                    )
+                    if (
+                        not isinstance(results, (list, tuple))
+                        or not results
+                        or any(
+                            not isinstance(result, dict)
+                            or result.get("status") != "sealed"
+                            for result in results
+                        )
+                    ):
+                        raise RuntimeError(
+                            "actor ranks failed to seal telemetry phase"
+                        )
 
                 ####################
                 # original code here
@@ -1938,7 +2013,10 @@ class RayPPOTrainer:
                             batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                                     dtype=object)
                             capture_step_zero = self._should_record_step_zero_fingerprint()
-                            if capture_step_zero:
+                            pilot_evidence_path = self.config.reproduction.get(
+                                "pilot_evidence_path"
+                            )
+                            if capture_step_zero or pilot_evidence_path is not None:
                                 sample_ids = gen_batch.non_tensor_batch.get(
                                     "manifest_qa_id"
                                 )
@@ -1946,11 +2024,18 @@ class RayPPOTrainer:
                                     raise CheckpointContractError(
                                         "step-zero evidence requires ordered manifest QA IDs"
                                     )
-                                ordered_step_zero_sample_ids = (
+                                ordered_sample_ids = (
                                     sample_ids.tolist()
                                     if hasattr(sample_ids, "tolist")
                                     else list(sample_ids)
                                 )
+                                if capture_step_zero:
+                                    ordered_step_zero_sample_ids = ordered_sample_ids
+                                if pilot_evidence_path is not None:
+                                    pilot_runtime_prompt_group_ids = (
+                                        batch.non_tensor_batch["uid"].tolist()
+                                    )
+                                    pilot_manifest_prompt_group_ids = ordered_sample_ids
                             # Note that we repeat outside the loop, since the generated responses are not aligned and we cannot
                             # simply union them.
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
@@ -2000,6 +2085,7 @@ class RayPPOTrainer:
                             workflow_metrics = gen_batch_output.meta_info.pop("metrics", {})
                             metrics.update(workflow_metrics)
                     ####################
+                    advance_runtime_telemetry("reward")
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -2033,7 +2119,8 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
                             # pad for log_prob
                             batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
-                            
+
+                    advance_runtime_telemetry("actor_log_prob")
                     if self.config.recurrent.enable and self.config.algorithm.get("filter_groups", None):  
                         # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
@@ -2073,12 +2160,14 @@ class RayPPOTrainer:
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
+                    advance_runtime_telemetry("reference_log_prob")
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    advance_runtime_telemetry("update")
                     # compute values
                     if self.use_critic:
                         with _timer("values", timing_raw):
@@ -2134,14 +2223,15 @@ class RayPPOTrainer:
                             if not self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
                                 raise NotImplementedError("Only GRPO is implemented for recurrent.")
 
+                            uid_indexed = reward_batch.non_tensor_batch['uid'][sample_index.cpu().numpy()] # [num_actions], str
+                            outcome_advantage_scalar = compute_1D_grpo_advantage(
+                                token_level_rewards=reward_tensor, # [bsz, response_length]
+                                index=reward_batch.non_tensor_batch['uid'], # [bsz]
+                                use_adv=self.config.algorithm.grpo_use_adv # bool
+                            ) # [bsz]
+                            outcome_advantage_scalar = outcome_advantage_scalar[sample_index] # [num_actions]
+                            state_advantage_scalar = None
                             if self.config.algorithm.alpha != 1.0:
-                                outcome_advantage_scalar = compute_1D_grpo_advantage(
-                                    token_level_rewards=reward_tensor, # [bsz, response_length]
-                                    index=reward_batch.non_tensor_batch['uid'], # [bsz]
-                                    use_adv=self.config.algorithm.grpo_use_adv # bool
-                                ) # [bsz]
-                                outcome_advantage_scalar = outcome_advantage_scalar[sample_index] # [num_actions]
-
                                 scores_scalar = reward_tensor.sum(dim=-1)[sample_index] # [num_actions]
                                 all_responses_str = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
                                 all_prompt_str = self.tokenizer.batch_decode(batch.batch['prompts'], skip_special_tokens=True)
@@ -2150,8 +2240,10 @@ class RayPPOTrainer:
                                 batch.batch['rewards_action'] = compute_action_rewards(all_prompt_str, all_responses_str, all_recalled_memories_str, batch, reward_batch, sample_index, scores_scalar) # [num_actions]
 
                                 state_reward_scalar = batch.batch['rewards_action'] + batch.batch['rewards_format'] # [num_actions]
-                                uid_indexed = reward_batch.non_tensor_batch['uid'][sample_index.cpu().numpy()] # [num_actions], str
-                                step_uid_indexed = [str(uid)+str(int(step_id)) for uid, step_id in zip(uid_indexed, batch.batch['step_id'])] # [num_actions]. for each step in each question, we have a unique uid.
+                                step_uid_indexed = [
+                                    json.dumps([str(uid), int(step_id)], separators=(",", ":"))
+                                    for uid, step_id in zip(uid_indexed, batch.batch['step_id'])
+                                ] # [num_actions]. Each question-step pair is one state-advantage group.
 
                                 state_advantage_scalar = compute_1D_grpo_advantage(
                                     # Keep one scalar reward per action. Duplicating this column
@@ -2165,16 +2257,131 @@ class RayPPOTrainer:
                                     (state_advantage_scalar) * (1 - self.config.algorithm.alpha) # [num_actions]
 
                             else:
-                                advantage_scalar = compute_1D_grpo_advantage(
-                                    token_level_rewards=reward_tensor, # [bsz, response_length]
-                                    index=reward_batch.non_tensor_batch['uid'], # [bsz]
-                                    use_adv=self.config.algorithm.grpo_use_adv # bool
-                                ) # [bsz]
-                                advantage_scalar = advantage_scalar[sample_index] # [num_actions]
+                                advantage_scalar = outcome_advantage_scalar
 
                             if self.config.algorithm.action_reweight:
                                 action_reweight_scalar = compute_action_reweights(all_prompt_str, batch, reward_batch, sample_index)
                                 advantage_scalar = advantage_scalar * action_reweight_scalar
+
+                            grouped_advantages = defaultdict(list)
+                            for uid, value in zip(
+                                uid_indexed,
+                                advantage_scalar.detach().cpu().tolist(),
+                            ):
+                                grouped_advantages[str(uid)].append(float(value))
+                            grouped_outcome_rewards = defaultdict(list)
+                            for uid, value in zip(
+                                reward_batch.non_tensor_batch["uid"],
+                                reward_tensor.sum(dim=-1).detach().cpu().tolist(),
+                            ):
+                                grouped_outcome_rewards[str(uid)].append(float(value))
+                            response_token_counts = (
+                                batch.batch["response_mask"].sum(dim=-1).detach().cpu()
+                            )
+                            generation_token_limits = batch.batch.get(
+                                "generation_token_limit"
+                            )
+                            truncated = batch.batch.get(
+                                "generation_reached_token_limit"
+                            )
+                            if generation_token_limits is None or truncated is None:
+                                raise RuntimeError(
+                                    "recurrent rollout lacks per-action token-limit evidence"
+                                )
+                            generation_token_limits = (
+                                generation_token_limits.detach().cpu()
+                            )
+                            truncated = truncated.detach().cpu()
+                            if (
+                                generation_token_limits.shape != response_token_counts.shape
+                                or truncated.shape != response_token_counts.shape
+                                or bool((generation_token_limits <= 0).any().item())
+                                or truncated.dtype != torch.bool
+                            ):
+                                raise RuntimeError(
+                                    "recurrent token-limit evidence is malformed"
+                                )
+                            if bool(
+                                (
+                                    truncated
+                                    & (response_token_counts < generation_token_limits)
+                                ).any().item()
+                            ):
+                                raise RuntimeError(
+                                    "rollout marked an output truncated below its action cap"
+                                )
+                            format_rewards = batch.batch.get("rewards_format")
+                            if format_rewards is None:
+                                telemetry_responses = self.tokenizer.batch_decode(
+                                    batch.batch["responses"], skip_special_tokens=True
+                                )
+                                format_rewards = compute_format_rewards(
+                                    telemetry_responses, batch
+                                )
+                            step_scientific_evidence = {
+                                "all_outputs_truncated": bool(truncated.all().item()),
+                                "finite_gradients": False,
+                                "finite_losses": False,
+                                "high_truncation_rate": bool(
+                                    truncated.float().mean().item() > 0.5
+                                ),
+                                "nonzero_advantage_groups": sum(
+                                    any(abs(value) > 1e-12 for value in values)
+                                    for values in grouped_advantages.values()
+                                ),
+                                "reward_variance_groups": sum(
+                                    any(
+                                        abs(value - values[0]) > 1e-12
+                                        for value in values[1:]
+                                    )
+                                    for values in grouped_outcome_rewards.values()
+                                ),
+                                "systematic_format_failure": bool(
+                                    (format_rewards <= 0).all().item()
+                                ),
+                            }
+
+                            if pilot_evidence_path is not None:
+                                if self.total_training_steps != 3:
+                                    raise ValueError(
+                                        "pilot evidence is only valid for fixed three-step jobs"
+                                    )
+                                alpha = float(self.config.algorithm.alpha)
+                                arm = "b" if alpha == 1.0 else "c"
+                                pilot_kwargs = {}
+                                if arm == "c":
+                                    if state_advantage_scalar is None:
+                                        raise RuntimeError(
+                                            "C pilot lacks state-advantage evidence"
+                                        )
+                                    pilot_kwargs = {
+                                        "state_advantage_values": state_advantage_scalar.detach().cpu().tolist(),
+                                    }
+                                pilot_step_record = create_pilot_step_record(
+                                    arm=arm,
+                                    offload_profile=self.config.reproduction.offload_profile,
+                                    global_step=self.global_steps,
+                                    alpha=alpha,
+                                    prompt_group_ids=resolve_stable_prompt_group_ids(
+                                        pilot_runtime_prompt_group_ids,
+                                        pilot_manifest_prompt_group_ids,
+                                        uid_indexed.tolist(),
+                                    ),
+                                    advantage_values=advantage_scalar.detach().cpu().tolist(),
+                                    outcome_advantage_values=(
+                                        outcome_advantage_scalar.detach().cpu().tolist()
+                                    ),
+                                    action_step_ids=(
+                                        batch.batch["step_id"].detach().cpu().tolist()
+                                    ),
+                                    action_types=(
+                                        batch.batch["action_type"].detach().cpu().tolist()
+                                    ),
+                                    experiment_profile_id=(
+                                        self.config.reproduction.experiment_profile_id
+                                    ),
+                                    **pilot_kwargs,
+                                )
 
                             # apply adv to non-mask tokens
                             response_length = batch.batch['responses'].size(-1)
@@ -2222,6 +2429,36 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if step_scientific_evidence is not None:
+                            gradient_values = [
+                                float(value)
+                                for name, value in actor_output_metrics.items()
+                                if "grad_norm" in name
+                                and isinstance(value, (int, float, np.number))
+                            ]
+                            loss_values = [
+                                float(value)
+                                for name, value in actor_output_metrics.items()
+                                if "loss" in name
+                                and isinstance(value, (int, float, np.number))
+                            ]
+                            step_scientific_evidence["finite_gradients"] = bool(
+                                gradient_values
+                            ) and all(math.isfinite(value) for value in gradient_values)
+                            step_scientific_evidence["finite_losses"] = bool(
+                                loss_values
+                            ) and all(math.isfinite(value) for value in loss_values)
+                        if pilot_step_record is not None:
+                            append_pilot_step_record(
+                                self.config.reproduction.pilot_evidence_path,
+                                pilot_step_record,
+                            )
+                            metrics["pilot/nonzero_prompt_groups"] = (
+                                pilot_step_record["nonzero_prompt_group_count"]
+                            )
+                            metrics["pilot/nonzero_state_groups"] = (
+                                pilot_step_record["nonzero_state_group_count"]
+                            )
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -2247,6 +2484,61 @@ class RayPPOTrainer:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
+                advance_runtime_telemetry("save")
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step
+                    or self.global_steps % self.config.trainer.save_freq == 0
+                ):
+                    with _timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
+                else:
+                    timing_raw["save_checkpoint"] = 0.0
+
+                if runtime_telemetry_path is not None:
+                    actor_telemetry = (
+                        self.actor_rollout_wg.collect_reproduction_step_telemetry()
+                    )
+                    reference_telemetry = (
+                        self.ref_policy_wg.collect_reproduction_reference_logits()
+                    )
+                    if (
+                        not isinstance(actor_telemetry, (list, tuple))
+                        or not isinstance(reference_telemetry, (list, tuple))
+                    ):
+                        raise RuntimeError("worker telemetry result is malformed")
+                    worker_telemetry = [*actor_telemetry, *reference_telemetry]
+                    telemetry_record = create_training_telemetry_step(
+                        worker_records=worker_telemetry,
+                        global_step=self.global_steps,
+                        attempt_id=self.config.reproduction.runtime_attempt_id,
+                        sealed_config_id=self.config.reproduction.sealed_config_id,
+                        sealed_config_sha256=(
+                            self.config.reproduction.sealed_config_sha256
+                        ),
+                        offload_profile=self.config.reproduction.offload_profile,
+                        timing_seconds={
+                            str(name): float(value)
+                            for name, value in timing_raw.items()
+                        },
+                        scientific_evidence=step_scientific_evidence,
+                        experiment_profile_id=(
+                            self.config.reproduction.experiment_profile_id
+                        ),
+                    )
+                    append_training_telemetry_step(
+                        runtime_telemetry_path,
+                        telemetry_record,
+                    )
+                    metrics["telemetry/peak_allocated_gib"] = (
+                        telemetry_record["peak_allocated_bytes"] / 1024**3
+                    )
+                    metrics["telemetry/peak_reserved_gib"] = (
+                        telemetry_record["peak_reserved_bytes"] / 1024**3
+                    )
+                    metrics["telemetry/nvml_peak_used_gib"] = (
+                        telemetry_record["nvml_peak_used_bytes"] / 1024**3
+                    )
+
                 # training metrics
                 metrics.update(
                     {
@@ -2266,10 +2558,6 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
-                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                    with _timer("save_checkpoint", timing_raw):
-                        self._save_checkpoint()
-                
                 save_score_key = 'critic/score/mean'
                 if metrics[save_score_key] > best_critic_score:
                     print(f"New best critic score: {metrics[save_score_key]} > {best_critic_score} (global_step: {self.global_steps})")

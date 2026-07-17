@@ -4,9 +4,10 @@ set -euo pipefail
 umask 077
 
 REPO_URL="${REMEMR1_REPO_URL:-https://github.com/Wolleaf/ReMemR1.git}"
-BRANCH="${REMEMR1_BRANCH:-reproduction/qwen35-plan}"
+BRANCH="${REMEMR1_BRANCH:-reproduction/rtx5090-2b}"
 EXPECTED_COMMIT="${REMEMR1_EXPECTED_COMMIT:-}"
 PROJECT_DIR="${REMEMR1_PROJECT_DIR:-/root/autodl-tmp/ReMemR1}"
+EXPERIMENT_PROFILE="${REMEMR1_EXPERIMENT_PROFILE:-rtx5090-32g-qwen35-2b-v1}"
 PHASE="cpu"
 ALLOW_GUEST_SHUTDOWN="no"
 START_ARGS=()
@@ -106,7 +107,11 @@ verify_bootstrap_persistent_mount /root/autodl-tmp || {
     exit 1
 }
 
-BOOTSTRAP_ROOT="${REMEMR1_PERSIST_ROOT:-/root/autodl-tmp/rememr1}"
+[[ "${EXPERIMENT_PROFILE}" == "rtx5090-32g-qwen35-2b-v1" ]] || {
+    echo "unsupported experiment profile: ${EXPERIMENT_PROFILE}" >&2
+    exit 2
+}
+BOOTSTRAP_ROOT="${REMEMR1_PERSIST_ROOT:-/root/autodl-tmp/rememr1/profiles/${EXPERIMENT_PROFILE}}"
 case "${BOOTSTRAP_ROOT}" in
     /root/autodl-tmp/*) ;;
     *) echo "bootstrap persistent root must be below /root/autodl-tmp" >&2; exit 2 ;;
@@ -304,6 +309,8 @@ timeout --signal=TERM --kill-after=30s 5m \
 init_args=(
     --project-dir "${PROJECT_DIR}"
     --expected-commit "${EXPECTED_COMMIT}"
+    --persist-root "${BOOTSTRAP_ROOT}"
+    --experiment-profile "${EXPERIMENT_PROFILE}"
 )
 [[ "${ALLOW_GUEST_SHUTDOWN}" == "yes" ]] && init_args+=(--allow-guest-shutdown)
 timeout --signal=TERM --kill-after=1m 10m \

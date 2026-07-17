@@ -1,6 +1,6 @@
 # ReMemR1 最终缩小复现方案：Qwen3.5-4B LoRA-GRPO
 
-> **文档状态：唯一权威方案（Source of Truth）**
+> **文档状态：历史方案，已由 [rtx5090_2b_reproduction_plan_zh.md](./rtx5090_2b_reproduction_plan_zh.md) 替代**
 > 项目名称：**基于 Qwen3.5-4B LoRA-GRPO 的 ReMemR1 缩小机制复现**
 > 平台：AutoDL
 > 正式硬件：1 x RTX PRO 6000 Blackwell 96GB
@@ -9,9 +9,10 @@
 > 当前方案分支：`reproduction/qwen35-plan`
 > 最后核对：2026-07-16
 
-本文档是唯一权威方案。早期 2B 全参数方案已删除；
-[reproduction_implementation_handoff_zh.md](./reproduction_implementation_handoff_zh.md)
-只保留实施入口，不维护独立参数。后续实现、租卡、训练、评测和简历表述均以本文档为准。
+本文档只保留 4B / PRO 6000 路线的历史决策与比较依据，不再作为运行入口。当前实现、租卡、
+训练、评测和简历表述均以
+[rtx5090_2b_reproduction_plan_zh.md](./rtx5090_2b_reproduction_plan_zh.md) 为准；不得将本文件中的
+4B 参数混入 active 2B handoff 或配置树。
 
 ---
 

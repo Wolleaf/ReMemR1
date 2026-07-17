@@ -324,7 +324,7 @@ rememr1_require_cloud_env() {
 
     local name
     for name in REMEMR1_PROJECT_DIR PERSIST_ROOT EXPECTED_COMMIT CAPABILITY_FILE \
-        LOCK_FILE LAUNCHER_ROOT; do
+        LOCK_FILE LAUNCHER_ROOT REMEMR1_EXPERIMENT_PROFILE; do
         if [[ -z "${!name:-}" ]]; then
             echo "missing required cloud setting: ${name}" >&2
             return 1
@@ -332,6 +332,10 @@ rememr1_require_cloud_env() {
     done
     if [[ ! "${EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
         echo "EXPECTED_COMMIT must be a full lowercase commit SHA" >&2
+        return 1
+    fi
+    if [[ "${REMEMR1_EXPERIMENT_PROFILE}" != "rtx5090-32g-qwen35-2b-v1" ]]; then
+        echo "unsupported REMEMR1_EXPERIMENT_PROFILE: ${REMEMR1_EXPERIMENT_PROFILE}" >&2
         return 1
     fi
     for name in REMEMR1_PROJECT_DIR PERSIST_ROOT CAPABILITY_FILE LOCK_FILE LAUNCHER_ROOT; do

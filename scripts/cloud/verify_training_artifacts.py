@@ -124,8 +124,19 @@ def verify_training_artifacts(
             state.resolved_config,
             allowed_drift_paths=(
                 "reproduction.adapter_export_dir",
+                "reproduction.pilot_evidence_path",
+                "reproduction.runtime_attempt_id",
+                "reproduction.runtime_binding_sha256",
+                "reproduction.runtime_bound_evidence_path",
+                "reproduction.runtime_telemetry_path",
+                "reproduction.sealed_config_id",
+                "reproduction.sealed_config_sha256",
+                "reproduction.step_zero_fingerprint_path",
+                "reproduction.step_zero_reference_path",
                 "trainer.default_local_dir",
+                "trainer.rollout_data_dir",
                 "trainer.resume_from_path",
+                "trainer.validation_data_dir",
             ),
         )
     except Exception as exc:

@@ -6,20 +6,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runtime.sh"
 
 PROJECT_DIR="${REMEMR1_PROJECT_DIR:-/root/autodl-tmp/ReMemR1}"
-PERSIST_ROOT="${REMEMR1_PERSIST_ROOT:-/root/autodl-tmp/rememr1}"
+EXPERIMENT_PROFILE="${REMEMR1_EXPERIMENT_PROFILE:-rtx5090-32g-qwen35-2b-v1}"
+PERSIST_ROOT="${REMEMR1_PERSIST_ROOT:-/root/autodl-tmp/rememr1/profiles/${EXPERIMENT_PROFILE}}"
 EXPECTED_COMMIT="${REMEMR1_EXPECTED_COMMIT:-}"
 CLOUD_ENV="${REMEMR1_CLOUD_ENV:-/root/autodl-tmp/rememr1-cloud.env}"
 HF_ENDPOINT_VALUE="${HF_ENDPOINT:-https://huggingface.co}"
 ALLOW_GUEST_SHUTDOWN="no"
 
 usage() {
-    echo "Usage: $0 --expected-commit SHA [--project-dir DIR] [--persist-root DIR] [--cloud-env FILE] [--hf-endpoint HTTPS_URL] [--allow-guest-shutdown]" >&2
+    echo "Usage: $0 --expected-commit SHA [--project-dir DIR] [--persist-root DIR] [--experiment-profile ID] [--cloud-env FILE] [--hf-endpoint HTTPS_URL] [--allow-guest-shutdown]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --project-dir) PROJECT_DIR="$2"; shift 2 ;;
         --persist-root) PERSIST_ROOT="$2"; shift 2 ;;
+        --experiment-profile) EXPERIMENT_PROFILE="$2"; shift 2 ;;
         --expected-commit) EXPECTED_COMMIT="$2"; shift 2 ;;
         --cloud-env) CLOUD_ENV="$2"; shift 2 ;;
         --hf-endpoint) HF_ENDPOINT_VALUE="$2"; shift 2 ;;
@@ -28,6 +30,11 @@ while [[ $# -gt 0 ]]; do
         *) usage; exit 2 ;;
     esac
 done
+
+[[ "${EXPERIMENT_PROFILE}" == "rtx5090-32g-qwen35-2b-v1" ]] || {
+    echo "unsupported experiment profile: ${EXPERIMENT_PROFILE}" >&2
+    exit 2
+}
 
 [[ "${EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || {
     echo "--expected-commit must be a full lowercase commit SHA" >&2
@@ -124,6 +131,7 @@ mkdir -p \
     "${PERSIST_ROOT}/data" \
     "${PERSIST_ROOT}/envs" \
     "${PERSIST_ROOT}/evidence" \
+    "${PERSIST_ROOT}/outputs" \
     "${PERSIST_ROOT}/ray" \
     "${PERSIST_ROOT}/sources" \
     "${PERSIST_ROOT}/tmp"
@@ -165,6 +173,7 @@ env_tmp="${CLOUD_ENV}.tmp.$$"
 {
     printf 'export REMEMR1_PROJECT_DIR=%q\n' "${PROJECT_DIR}"
     printf 'export REMEMR1_PERSIST_ROOT=%q\n' "${PERSIST_ROOT}"
+    printf 'export REMEMR1_EXPERIMENT_PROFILE=%q\n' "${EXPERIMENT_PROFILE}"
     printf 'export REMEMR1_EXPECTED_COMMIT=%q\n' "${EXPECTED_COMMIT}"
     printf 'export REMEMR1_CLOUD_ENV=%q\n' "${CLOUD_ENV}"
     printf 'export REMEMR1_CAPABILITY_FILE=%q\n' "${CAPABILITY_FILE}"
@@ -194,3 +203,4 @@ mv "${env_tmp}" "${CLOUD_ENV}"
 echo "Cloud state initialized: ${CLOUD_ENV}"
 echo "Pinned checkout: ${PROJECT_DIR}@${EXPECTED_COMMIT}"
 echo "Persistent root: ${PERSIST_ROOT}"
+echo "Experiment profile: ${EXPERIMENT_PROFILE}"

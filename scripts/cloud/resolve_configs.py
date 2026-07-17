@@ -20,21 +20,42 @@ from taskutils.data_synthesis.reproduction_builder import validate_artifact_bund
 
 
 PLACEHOLDERS = {character * 64 for character in "0123"}
-CONFIG_NAMES = (
+GATE_CONFIG_NAMES = (
     "g0_qwen35_08b",
     "g1_qwen35_2b_step1",
     "g1_qwen35_2b_resume2",
-    "g2a_qwen35_4b",
-    "g2b_qwen35_4b_step1",
-    "g2b_qwen35_4b_resume2",
-    "b_pilot_qwen35_4b",
-    "c_pilot_qwen35_4b",
-    "b40_qwen35_4b",
-    "c40_qwen35_4b",
-    "b80_qwen35_4b",
-    "c80_qwen35_4b",
-    "eval_qwen35_4b",
 )
+TRAINING_SOURCE_NAMES = (
+    "g2a_qwen35_2b_5090",
+    "g2b_qwen35_2b_5090_step1",
+    "g2b_qwen35_2b_5090_resume5",
+    "g2_length_stress_qwen35_2b_5090",
+    "b_pilot_qwen35_2b_5090",
+    "c_pilot_qwen35_2b_5090",
+    "b20_qwen35_2b_5090",
+    "c20_qwen35_2b_5090",
+    "b40_qwen35_2b_5090",
+    "c40_qwen35_2b_5090",
+    "b60_qwen35_2b_5090",
+    "c60_qwen35_2b_5090",
+    "b80_qwen35_2b_5090",
+    "c80_qwen35_2b_5090",
+)
+OFFLOAD_PROFILES = ("r0", "r1")
+EVAL_CONFIG_NAMES = (
+    "eval40_qwen35_2b_5090",
+    "eval80_qwen35_2b_5090",
+)
+CONFIG_COMPOSITIONS = (
+    *((name, name, None) for name in GATE_CONFIG_NAMES),
+    *(
+        (f"{source_name}_{profile}", source_name, profile)
+        for source_name in TRAINING_SOURCE_NAMES
+        for profile in OFFLOAD_PROFILES
+    ),
+    *((name, name, None) for name in EVAL_CONFIG_NAMES),
+)
+CONFIG_NAMES = tuple(name for name, _, _ in CONFIG_COMPOSITIONS)
 
 
 def _sha256(path: Path) -> str:
@@ -135,6 +156,12 @@ def compose_all(data_root: Path, output: Path) -> dict[str, Any]:
     g1_val, g1_val_manifest = _bundle(data_root, "gates/g1/validation")
     formal_train, formal_train_manifest = _bundle(data_root, "formal/train")
     formal_val, formal_val_manifest = _bundle(data_root, "formal/validation")
+    stress_train, stress_train_manifest = _bundle(
+        data_root, "capacity/length-stress/train"
+    )
+    stress_val, stress_val_manifest = _bundle(
+        data_root, "capacity/length-stress/validation"
+    )
     hotpot_eval, hotpot_eval_manifest = _bundle(data_root, "formal/eval/hotpotqa")
     wiki_eval, wiki_eval_manifest = _bundle(
         data_root, "formal/eval/2wikimultihopqa"
@@ -149,6 +176,12 @@ def compose_all(data_root: Path, output: Path) -> dict[str, Any]:
             formal_val,
             formal_val_manifest,
         ),
+        "length_stress": (
+            stress_train,
+            stress_train_manifest,
+            stress_val,
+            stress_val_manifest,
+        ),
     }
     final_output.parent.mkdir(parents=True, exist_ok=True)
     if final_output.exists():
@@ -161,32 +194,57 @@ def compose_all(data_root: Path, output: Path) -> dict[str, Any]:
     records: dict[str, Any] = {}
     try:
         with initialize_config_dir(config_dir=str(config_root), version_base=None):
-            for name in CONFIG_NAMES:
-                profile = "g0" if name.startswith("g0_") else "g1" if name.startswith("g1_") else "formal"
-                train_path, train_manifest, val_path, val_manifest = gate_values[profile]
-                overrides = [
-                    f"data.train_files={train_path / 'train.parquet'}",
-                    f"data.val_files={val_path / 'train.parquet'}",
-                    f"reproduction.data_manifest_sha256={train_manifest['manifest_sha256']}",
-                    f"reproduction.val_data_manifest_sha256={val_manifest['manifest_sha256']}",
+            for name, source_name, offload_profile in CONFIG_COMPOSITIONS:
+                if source_name.startswith("g0_"):
+                    data_profile = "g0"
+                elif source_name.startswith("g1_"):
+                    data_profile = "g1"
+                elif source_name == "g2_length_stress_qwen35_2b_5090":
+                    data_profile = "length_stress"
+                else:
+                    data_profile = "formal"
+                train_path, train_manifest, val_path, val_manifest = gate_values[
+                    data_profile
                 ]
-                if name == "eval_qwen35_4b":
-                    overrides.extend(
-                        [
-                            f"reproduction_evaluation.datasets.hotpotqa.bundle_dir={hotpot_eval}",
-                            "reproduction_evaluation.datasets.hotpotqa.manifest_sha256="
-                            f"{hotpot_eval_manifest['manifest_sha256']}",
-                            "reproduction_evaluation.datasets.2wikimultihopqa.bundle_dir="
-                            f"{wiki_eval}",
-                            "reproduction_evaluation.datasets.2wikimultihopqa.manifest_sha256="
-                            f"{wiki_eval_manifest['manifest_sha256']}",
-                        ]
+                bindings = {
+                    "data.train_files": str(train_path / "train.parquet"),
+                    "data.val_files": str(val_path / "train.parquet"),
+                    "reproduction.data_manifest_sha256": train_manifest[
+                        "manifest_sha256"
+                    ],
+                    "reproduction.val_data_manifest_sha256": val_manifest[
+                        "manifest_sha256"
+                    ],
+                }
+                composition_overrides = []
+                if offload_profile is not None:
+                    composition_overrides.append(
+                        "reproduction/offload@_global_=" f"{offload_profile}"
+                    )
+                if source_name in EVAL_CONFIG_NAMES:
+                    bindings.update(
+                        {
+                            "reproduction_evaluation.datasets.hotpotqa.bundle_dir": str(
+                                hotpot_eval
+                            ),
+                            "reproduction_evaluation.datasets.hotpotqa.manifest_sha256": hotpot_eval_manifest[
+                                "manifest_sha256"
+                            ],
+                            "reproduction_evaluation.datasets.2wikimultihopqa.bundle_dir": str(
+                                wiki_eval
+                            ),
+                            "reproduction_evaluation.datasets.2wikimultihopqa.manifest_sha256": wiki_eval_manifest[
+                                "manifest_sha256"
+                            ],
+                        }
                     )
                 config = compose(
-                    config_name=f"reproduction/{name}",
-                    overrides=overrides,
+                    config_name=f"reproduction/{source_name}",
+                    overrides=composition_overrides,
                     return_hydra_config=False,
                 )
+                for key, value in bindings.items():
+                    OmegaConf.update(config, key, value, merge=False)
                 OmegaConf.resolve(config)
                 serialized = OmegaConf.to_yaml(config, resolve=True, sort_keys=True)
                 if any(value in serialized for value in PLACEHOLDERS):
@@ -194,9 +252,14 @@ def compose_all(data_root: Path, output: Path) -> dict[str, Any]:
                 destination = output / f"{name}.yaml"
                 _atomic_text(destination, serialized)
                 records[name] = {
-                    "overrides": overrides,
+                    "offload_profile": offload_profile,
+                    "overrides": [
+                        *composition_overrides,
+                        *(f"{key}={value}" for key, value in bindings.items()),
+                    ],
                     "path": str((final_output / destination.name).resolve()),
                     "sha256": _sha256(destination),
+                    "source_config": source_name,
                 }
 
         index = {

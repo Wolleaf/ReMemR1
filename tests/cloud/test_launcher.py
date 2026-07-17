@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -12,6 +14,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCH = REPO_ROOT / "scripts" / "cloud" / "launch.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "cloud" / "bootstrap.sh"
+STATUS = REPO_ROOT / "scripts" / "cloud" / "status.sh"
 
 
 def _bash_path(path: Path) -> str:
@@ -79,6 +82,7 @@ exit \"${{FAKE_PIPELINE_RC}}\"
         "REMEMR1_PROJECT_DIR": _bash_path(project),
         "PERSIST_ROOT": _bash_path(persist),
         "EXPECTED_COMMIT": "a" * 40,
+        "REMEMR1_EXPERIMENT_PROFILE": "rtx5090-32g-qwen35-2b-v1",
         "CAPABILITY_FILE": _bash_path(capability),
         "LOCK_FILE": _bash_path(lock_file),
         "LAUNCHER_ROOT": _bash_path(launcher_root),
@@ -148,7 +152,10 @@ def _wait_for_terminal(launcher_root: Path, timeout: float = 15.0) -> Path:
         if directories:
             launcher = max(directories, key=lambda path: path.name)
             if (launcher / "exit-code").is_file() and (
-                (launcher / ".success").is_file() or (launcher / ".failed").is_file()
+                (launcher / ".success").is_file()
+                or (launcher / ".failed").is_file()
+                or (launcher / ".scientific-stop").is_file()
+                or (launcher / ".capacity-stop").is_file()
             ):
                 return launcher
         time.sleep(0.05)
@@ -162,6 +169,28 @@ def _events(path: Path):
     if not path.exists():
         return []
     return path.read_text(encoding="utf-8").splitlines()
+
+
+def _terminal_json(launcher: Path):
+    value = json.loads((launcher / "terminal.json").read_text(encoding="utf-8"))
+    assert set(value) == {
+        "budget_projection",
+        "budget_projection_file_sha256",
+        "exit_code",
+        "expected_commit",
+        "experiment_profile_id",
+        "finished_at",
+        "offload_profile",
+        "outcome",
+        "phase",
+        "pipeline_result",
+        "pipeline_terminal_dir",
+        "retry_hint",
+        "retryable",
+        "schema_version",
+        "started_at",
+    }
+    return value
 
 
 def test_run_logged_preserves_the_command_exit_status(tmp_path):
@@ -384,6 +413,11 @@ def test_failure_publishes_exit_code_before_shutdown_request(launcher_tmp_path):
     assert (launcher / "exit-code").read_text(encoding="ascii").strip() == "23"
     assert (launcher / ".failed").is_file()
     assert not (launcher / ".success").exists()
+    terminal = _terminal_json(launcher)
+    assert terminal["outcome"] == "failed"
+    assert terminal["retryable"] is True
+    assert "--retry-failed-stage" in terminal["retry_hint"]
+    assert (launcher / "retryable").read_text(encoding="ascii").strip() == "true"
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not (launcher / "shutdown-safe").exists():
         time.sleep(0.05)
@@ -416,6 +450,61 @@ def test_failure_publishes_exit_code_before_shutdown_request(launcher_tmp_path):
     assert "--retry-failed-stage" in (result_dir / "args").read_text(encoding="ascii")
 
 
+def test_r1_launch_binds_marker_bytes_and_failure_requires_new_nonce(
+    launcher_tmp_path,
+):
+    env, launcher_root, _, _ = _write_cloud_fixture(
+        launcher_tmp_path, pipeline_rc=23
+    )
+    persist = launcher_tmp_path / "persist"
+    marker = persist / "r1-approval.json"
+    budget = persist / "budget.json"
+    marker.write_bytes(b'{"status":"approved-once"}\n')
+    budget.write_bytes(b'{"projection":"test"}\n')
+
+    _launch(
+        env,
+        "--phase",
+        "gpu-capacity",
+        "--offload-profile",
+        "r1",
+        "--r1-approval",
+        _bash_path(marker),
+        "--budget-projection",
+        _bash_path(budget),
+        expected_returncodes=(0, 23),
+    )
+    launcher = _wait_for_terminal(launcher_root)
+    request = json.loads((launcher / "request.json").read_text(encoding="utf-8"))
+    expected_sha = hashlib.sha256(marker.read_bytes()).hexdigest()
+    assert request["r1_approval_file_sha256"] == expected_sha
+    terminal = _terminal_json(launcher)
+    assert terminal["retryable"] is False
+    assert "new R1 approval nonce" in terminal["retry_hint"]
+    assert "retryable=false" in (launcher / "terminal").read_text(encoding="utf-8")
+
+
+def test_bc_failure_requires_new_budget_generation(launcher_tmp_path):
+    env, launcher_root, _, _ = _write_cloud_fixture(
+        launcher_tmp_path, pipeline_rc=23
+    )
+    budget = launcher_tmp_path / "persist" / "budget.json"
+    budget.write_bytes(b'{"projection":"test"}\n')
+
+    _launch(
+        env,
+        "--phase",
+        "gpu-bc40",
+        "--budget-projection",
+        _bash_path(budget),
+        expected_returncodes=(0, 23),
+    )
+    terminal = _terminal_json(_wait_for_terminal(launcher_root))
+    assert terminal["retryable"] is False
+    assert "new budget projection" in terminal["retry_hint"]
+    assert "new immutable generation" in terminal["retry_hint"]
+
+
 def test_success_publishes_durable_state_before_shutdown_request(launcher_tmp_path):
     env, launcher_root, shutdown_log, _ = _write_cloud_fixture(launcher_tmp_path)
 
@@ -427,6 +516,10 @@ def test_success_publishes_durable_state_before_shutdown_request(launcher_tmp_pa
 
     assert (launcher / "exit-code").read_text(encoding="ascii").strip() == "0"
     assert (launcher / ".success").is_file()
+    terminal = _terminal_json(launcher)
+    assert terminal["outcome"] == "success"
+    assert terminal["retryable"] is False
+    assert (launcher / "retryable").read_text(encoding="ascii").strip() == "false"
     assert (launcher / "shutdown-safe").is_file()
     assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "test-mode"
     assert not (launcher / "shutdown-dispatched").exists()
@@ -461,6 +554,74 @@ def test_success_publishes_durable_state_before_shutdown_request(launcher_tmp_pa
         < safe_index
         < shutdown_index
     )
+
+
+def test_scientific_stop_is_non_retryable_and_shutdown_safe(launcher_tmp_path):
+    env, launcher_root, shutdown_log, _ = _write_cloud_fixture(
+        launcher_tmp_path, pipeline_rc=42
+    )
+
+    _launch(env, "cpu", expected_returncodes=(0, 42))
+    launcher = _wait_for_terminal(launcher_root)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+
+    assert (launcher / ".scientific-stop").read_text(encoding="ascii").strip() == "42"
+    assert not (launcher / ".failed").exists()
+    assert not (launcher / ".success").exists()
+    assert (launcher / "retryable").read_text(encoding="ascii").strip() == "false"
+    terminal = _terminal_json(launcher)
+    assert terminal["outcome"] == "scientific-stop"
+    assert terminal["exit_code"] == 42
+    assert terminal["retryable"] is False
+    assert (launcher / "shutdown-safe").is_file()
+    events = _events(shutdown_log)
+    terminal_index = next(
+        i for i, event in enumerate(events) if "terminal-state-written exit_code=42" in event
+    )
+    removed_index = next(
+        i for i, event in enumerate(events) if "running-marker-removed " in event
+    )
+    safe_index = next(
+        i for i, event in enumerate(events) if "shutdown-safe-written " in event
+    )
+    shutdown_index = next(i for i, event in enumerate(events) if "shutdown-request " in event)
+    assert terminal_index < removed_index < safe_index < shutdown_index
+
+
+def test_capacity_stop_is_non_retryable_and_shutdown_safe(launcher_tmp_path):
+    env, launcher_root, shutdown_log, _ = _write_cloud_fixture(
+        launcher_tmp_path, pipeline_rc=43
+    )
+
+    _launch(env, "cpu", expected_returncodes=(0, 43))
+    launcher = _wait_for_terminal(launcher_root)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+
+    assert (launcher / ".capacity-stop").read_text(encoding="ascii").strip() == "43"
+    assert not (launcher / ".failed").exists()
+    assert not (launcher / ".scientific-stop").exists()
+    assert (launcher / "retryable").read_text(encoding="ascii").strip() == "false"
+    terminal = _terminal_json(launcher)
+    assert terminal["outcome"] == "capacity-stop"
+    assert terminal["exit_code"] == 43
+    assert terminal["retryable"] is False
+    assert (launcher / "shutdown-safe").is_file()
+    events = _events(shutdown_log)
+    terminal_index = next(
+        i for i, event in enumerate(events) if "terminal-state-written exit_code=43" in event
+    )
+    removed_index = next(
+        i for i, event in enumerate(events) if "running-marker-removed " in event
+    )
+    safe_index = next(
+        i for i, event in enumerate(events) if "shutdown-safe-written " in event
+    )
+    shutdown_index = next(i for i, event in enumerate(events) if "shutdown-request " in event)
+    assert terminal_index < removed_index < safe_index < shutdown_index
 
 
 @pytest.mark.parametrize(
@@ -592,3 +753,45 @@ def test_busy_lock_is_terminal_and_never_requests_shutdown(launcher_tmp_path):
         except subprocess.TimeoutExpired:
             holder.kill()
             holder.wait(timeout=5)
+
+
+def test_status_uses_each_launchers_scoped_terminal_pointer(launcher_tmp_path):
+    env, launcher_root, _, _ = _write_cloud_fixture(launcher_tmp_path)
+    pipeline = launcher_tmp_path / "persist" / "cloud" / "pipelines" / "shared"
+    first_state = pipeline / "terminals" / "gpu-bc40" / "r0" / "budget-first"
+    second_state = pipeline / "terminals" / "gpu-bc80" / "r0" / "budget-second"
+    first_state.mkdir(parents=True)
+    second_state.mkdir(parents=True)
+    (first_state / "failed-stage").write_text("b20\n", encoding="ascii")
+    (second_state / "failed-stage").write_text("b60\n", encoding="ascii")
+    (pipeline / "last-terminal").write_bytes(
+        (_bash_path(second_state) + "\n").encode("ascii")
+    )
+
+    outputs = []
+    for name, state in (("first", first_state), ("second", second_state)):
+        launcher = launcher_root / name
+        launcher.mkdir()
+        (launcher / ".failed").write_text("23\n", encoding="ascii")
+        (launcher / "pipeline-result").write_bytes(
+            (_bash_path(pipeline) + "\n").encode("ascii")
+        )
+        (launcher / "pipeline-result.terminal").write_bytes(
+            (_bash_path(state) + "\n").encode("ascii")
+        )
+        result = subprocess.run(
+            [shutil.which("bash"), _bash_path(STATUS), _bash_path(launcher)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        outputs.append(result.stdout)
+
+    assert "pipeline_failed-stage=b20" in outputs[0]
+    assert "pipeline_failed-stage=b60" not in outputs[0]
+    assert "pipeline_failed-stage=b60" in outputs[1]

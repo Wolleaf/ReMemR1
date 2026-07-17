@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start one CPU or GPU-gates pipeline in a detached, durable launcher.
+# Start one cloud phase in a detached, durable launcher.
 set -euo pipefail
 umask 077
 
@@ -13,9 +13,16 @@ source "${SCRIPT_DIR}/lib/shutdown.sh"
 
 usage() {
     cat <<'EOF'
-Usage: launch.sh [--phase] {cpu|gpu-gates} [OPTIONS]
+Usage: launch.sh --phase PHASE [OPTIONS]
+
+Phases:
+  cpu, gpu-gates, gpu-capacity, gpu-bc40, gpu-bc80, gpu-export
 
 Options:
+  --offload-profile P  Required for gpu-capacity; P is r0 or r1.
+  --r1-approval PATH   Required with gpu-capacity --offload-profile r1.
+  --budget-projection PATH
+                        Required for B/C40, B/C80, and R1 capacity.
   --keep-running        Persist results but do not request guest shutdown.
   --retry-failed-stage  Allow the pipeline to retry its first failed stage.
   --dry-run             Validate/print pipeline actions without shutdown.
@@ -27,6 +34,10 @@ phase=""
 keep_running=no
 retry_failed_stage=no
 dry_run=no
+offload_profile=""
+r1_approval=""
+r1_approval_file_sha256=""
+budget_projection=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --phase)
@@ -35,10 +46,34 @@ while [[ $# -gt 0 ]]; do
             phase="$2"
             shift 2
             ;;
-        cpu|gpu-gates)
+        cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
             [[ -z "${phase}" ]] || { echo "phase was provided more than once" >&2; exit 2; }
             phase="$1"
             shift
+            ;;
+        --offload-profile)
+            [[ $# -ge 2 && -z "${offload_profile}" ]] || {
+                echo "--offload-profile requires one value" >&2
+                exit 2
+            }
+            offload_profile="$2"
+            shift 2
+            ;;
+        --r1-approval)
+            [[ $# -ge 2 && -z "${r1_approval}" ]] || {
+                echo "--r1-approval requires one path" >&2
+                exit 2
+            }
+            r1_approval="$2"
+            shift 2
+            ;;
+        --budget-projection)
+            [[ $# -ge 2 && -z "${budget_projection}" ]] || {
+                echo "--budget-projection requires one path" >&2
+                exit 2
+            }
+            budget_projection="$2"
+            shift 2
             ;;
         --keep-running)
             keep_running=yes
@@ -63,11 +98,42 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-[[ "${phase}" == "cpu" || "${phase}" == "gpu-gates" ]] || {
-    echo "phase must be cpu or gpu-gates" >&2
-    usage >&2
+case "${phase}" in
+    cpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export) ;;
+    *) echo "invalid phase: ${phase}" >&2; usage >&2; exit 2 ;;
+esac
+if [[ "${phase}" == "gpu-capacity" ]]; then
+    [[ "${offload_profile}" == "r0" || "${offload_profile}" == "r1" ]] || {
+        echo "gpu-capacity requires --offload-profile r0 or r1" >&2
+        exit 2
+    }
+    if [[ "${offload_profile}" == "r1" && -z "${r1_approval}" ]]; then
+        echo "R1 capacity requires --r1-approval" >&2
+        exit 2
+    fi
+    if [[ "${offload_profile}" == "r1" && -z "${budget_projection}" ]]; then
+        echo "R1 capacity requires --budget-projection for the approved B/C40 projection" >&2
+        exit 2
+    fi
+    if [[ "${offload_profile}" == "r0" && \
+          ( -n "${r1_approval}" || -n "${budget_projection}" ) ]]; then
+        echo "R0 capacity must not carry R1 approval or budget evidence" >&2
+        exit 2
+    fi
+elif [[ "${phase}" == "gpu-bc40" || "${phase}" == "gpu-bc80" ]]; then
+    [[ -n "${budget_projection}" ]] || {
+        echo "${phase} requires --budget-projection" >&2
+        exit 2
+    }
+    [[ -z "${offload_profile}" && -z "${r1_approval}" ]] || {
+        echo "offload and R1 approval arguments are only valid for gpu-capacity" >&2
+        exit 2
+    }
+elif [[ -n "${offload_profile}" || -n "${r1_approval}" || \
+        -n "${budget_projection}" ]]; then
+    echo "offload and R1 approval arguments are only valid for gpu-capacity" >&2
     exit 2
-}
+fi
 
 rememr1_validate_test_mode
 CLOUD_ENV="${REMEMR1_CLOUD_ENV:-/root/autodl-tmp/rememr1-cloud.env}"
@@ -86,6 +152,32 @@ rememr1_path_is_within "${launcher_root_real}" "${persist_real}" || {
     echo "LAUNCHER_ROOT must be inside PERSIST_ROOT" >&2
     exit 1
 }
+if [[ -n "${r1_approval}" ]]; then
+    [[ "${r1_approval}" == /* && -f "${r1_approval}" && ! -L "${r1_approval}" ]] || {
+        echo "R1 approval must be an existing absolute regular file" >&2
+        exit 1
+    }
+    r1_approval="$(rememr1_realpath_existing "${r1_approval}")"
+    rememr1_path_is_within "${r1_approval}" "${persist_real}" || {
+        echo "R1 approval must be inside PERSIST_ROOT" >&2
+        exit 1
+    }
+    r1_approval_file_sha256="$(sha256sum "${r1_approval}" | awk '{print $1}')"
+fi
+budget_projection_file_sha256=""
+if [[ -n "${budget_projection}" ]]; then
+    [[ "${budget_projection}" == /* && -f "${budget_projection}" && \
+       ! -L "${budget_projection}" ]] || {
+        echo "budget projection must be an existing absolute regular file" >&2
+        exit 1
+    }
+    budget_projection="$(rememr1_realpath_existing "${budget_projection}")"
+    rememr1_path_is_within "${budget_projection}" "${persist_real}" || {
+        echo "budget projection must be inside PERSIST_ROOT" >&2
+        exit 1
+    }
+    budget_projection_file_sha256="$(sha256sum "${budget_projection}" | awk '{print $1}')"
+fi
 
 worker="${SCRIPT_DIR}/launcher_worker.sh"
 [[ -f "${worker}" ]] || { echo "launcher worker is missing: ${worker}" >&2; exit 1; }
@@ -131,15 +223,30 @@ launcher="$(rememr1_realpath_existing "${launcher}")"
 
 started_at="$(rememr1_utc_now)"
 request_json="$(printf \
-    '{\n  "schema_version": 1,\n  "phase": "%s",\n  "expected_commit": "%s",\n  "keep_running": "%s",\n  "retry_failed_stage": "%s",\n  "dry_run": "%s",\n  "requested_at": "%s"\n}' \
+    '{\n  "schema_version": 1,\n  "phase": "%s",\n  "experiment_profile_id": "%s",\n  "expected_commit": "%s",\n  "offload_profile": "%s",\n  "r1_approval": "%s",\n  "r1_approval_file_sha256": "%s",\n  "budget_projection": "%s",\n  "budget_projection_file_sha256": "%s",\n  "keep_running": "%s",\n  "retry_failed_stage": "%s",\n  "dry_run": "%s",\n  "requested_at": "%s"\n}' \
     "$(rememr1_json_escape "${phase}")" \
-    "${EXPECTED_COMMIT}" "${keep_running}" "${retry_failed_stage}" "${dry_run}" \
+    "$(rememr1_json_escape "${REMEMR1_EXPERIMENT_PROFILE}")" \
+    "${EXPECTED_COMMIT}" "$(rememr1_json_escape "${offload_profile}")" \
+    "$(rememr1_json_escape "${r1_approval}")" \
+    "${r1_approval_file_sha256}" \
+    "$(rememr1_json_escape "${budget_projection}")" \
+    "${budget_projection_file_sha256}" \
+    "${keep_running}" "${retry_failed_stage}" "${dry_run}" \
     "${started_at}")"
 atomic_write "${launcher}/request.json" "${request_json}"
 atomic_write "${launcher}/status" "starting"
 atomic_write "${launcher}/.starting" "${started_at}"
 
 worker_args=(--phase "${phase}" --launcher-dir "${launcher}")
+[[ -n "${offload_profile}" ]] && worker_args+=(--offload-profile "${offload_profile}")
+if [[ -n "${r1_approval}" ]]; then
+    worker_args+=(--r1-approval "${r1_approval}" \
+        --r1-approval-file-sha256 "${r1_approval_file_sha256}")
+fi
+if [[ -n "${budget_projection}" ]]; then
+    worker_args+=(--budget-projection "${budget_projection}" \
+        --budget-projection-file-sha256 "${budget_projection_file_sha256}")
+fi
 [[ "${keep_running}" == "yes" ]] && worker_args+=(--keep-running)
 [[ "${retry_failed_stage}" == "yes" ]] && worker_args+=(--retry-failed-stage)
 [[ "${dry_run}" == "yes" ]] && worker_args+=(--dry-run)

@@ -1,14 +1,20 @@
-# ReMemR1 单 RTX 5090 + Qwen3.5-2B 候选实施方案
+# ReMemR1 单 RTX 5090 + Qwen3.5-2B 权威实施方案
 
-> 状态：候选方案，尚未替代 `final_reproduction_plan_zh.md`。
+> 状态：当前唯一权威实施方案（Source of Truth）；已替代 4B / PRO 6000 主线。
 > 制定日期：2026-07-17。
-> 代码基线：`cc6c330ce1e8a1f922c28e84dc3f28b298914636`。
+> 迁移起点：`cc6c330ce1e8a1f922c28e84dc3f28b298914636`。
 > 目标硬件：1 x NVIDIA GeForce RTX 5090 32GB。
 > 正式模型：`Qwen/Qwen3.5-2B`，revision `15852e8c16360a2fea060d615a32b45270f8a8fc`。
+> Active profile：`rtx5090-32g-qwen35-2b-v1`；实施分支：`reproduction/rtx5090-2b`。
 
 本文给出从当前“RTX PRO 6000 96GB + Qwen3.5-4B”方案迁移到“单 RTX 5090 32GB +
-Qwen3.5-2B”的完整候选设计。它用于评审方案、估算成本和指导后续实现，不授权直接启动 GPU
-长训练。只有用户确认后，才应同步修改权威交接文档、配置矩阵、云端硬件门禁和正式运行入口。
+Qwen3.5-2B”的完整实施契约。配置、云端门禁、训练、评测、恢复、费用控制和对外表述均以本文
+为准。代码适配完成不等于已经取得 GPU 实测结果；仍须严格按 G-1 -> G0/G1 -> G2 -> B/C40
+-> B/C80 的独立付费阶段执行，任何长训练都必须由操作者显式启动。
+
+本轮明确排除《项目推荐》中建议的新增压缩工具：不增加 `compress_context`，不改成 JSON action，
+也不改变 Agent 动作语义。中间轮次继续要求恰好一个非空 `<update>`，允许至多一个非空
+`<recall>`；最终轮次仍输出 final answer。新增工具若未来立项，必须作为与本主线隔离的新实验。
 
 ---
 
@@ -48,11 +54,10 @@ ReMemR1 的核心机制与对照：
 
 ### 0.3 当前实现边界
 
-当前云端一键流水线只执行 CPU preparation、G0 和 G1，不会启动 G2、B/C pilot 或正式长训练。
-因此现在切换方案不会推翻已经实现的长跑代码；正式 2B 容量门禁和 B/C 入口本来就需要新增。
-
-当前代码会因 GPU 名称和 `>=90 GiB` 门禁直接拒绝 5090。在完成 5090 profile 适配并提交前，
-不得在 5090 上执行现有 `start_gpu_gates.sh`。
+仓库已按 active profile 增加 CPU preparation、5090 G0/G1、G2 capacity、B/C40、B/C80 和结果
+导出的独立入口，并将 4B 资产排除出 active handoff。这里的“已实现”仅表示代码、配置和本地
+验证可交付，不表示已在真实 5090 上完成训练。正式容量、耗时、费用和科学结论仍为空，必须由
+云端 immutable attempts、self-hashed evidence 和 verified package 填充，禁止用规划值冒充实测值。
 
 ### 0.4 预期后果
 
@@ -74,7 +79,7 @@ ReMemR1 的核心机制与对照：
 
 ### 1.1 研究问题
 
-候选方案只回答以下三个缩小问题：
+本方案只回答以下三个缩小问题：
 
 1. 在 Qwen3.5-2B 上，LoRA-GRPO 能否跑通 ReMemR1 recurrent memory 与 learned callback 的
    完整训练、恢复和评测闭环？
@@ -105,7 +110,7 @@ ReMemR1 的核心机制与对照：
 |---|---|---|
 | L0：门禁闭环 | G-1、G0、G1、G2 全部通过 | 证明环境、2B 训练和正式长度容量可用 |
 | L1：最低正式交付 | B/C pilot、B40/C40、32 QA/格主评测、callback 消融 | 已可形成完整简历项目和技术报告 |
-| L2：目标交付 | B80/C80、64 QA/格主评测、完整资源与恢复证据 | 候选方案的最佳正式结果 |
+| L2：目标交付 | B80/C80、64 QA/格主评测、完整资源与恢复证据 | 本方案的最佳正式结果 |
 | L3：正向主证据 | 预注册 `C-B` 四格 macro answer EM 为正且 paired 95% CI 不跨 0 | 加分项，不是工程成功的必要条件 |
 
 负结果只要数据、控制变量、恢复链、评测和统计完整，仍属于有效 L1/L2 交付。
@@ -220,8 +225,15 @@ R0 的容量失败或黄色结论必须先发布完整 terminal evidence 并结�
 里自动重试 OOM 或直接串行切到 R1。操作者检查失败原因后，使用显式 R1 参数和批准 marker 启动新的
 capacity launcher。锁冲突、resume/schema/数值/科学失败均不产生 R1 批准资格。
 
+可信容量停止使用独立终态：`exit-code=43`、`.capacity-stop` 内容为 `43`、`retryable=false`，并绑定
+canonical/self-hashed `capacity-stop.json` 或完整 non-green capacity evidence。OOM 只能由真实
+`torch.OutOfMemoryError` 类型/异常因果链签发，不能由日志字符串或 CLI reason 自报。数值、格式和
+科学负结果继续使用 `exit-code=42` / `.scientific-stop`，普通基础设施或 schema 错误使用 `.failed`。
+
 R1 批准 marker 必须一次性、自哈希，并绑定 active profile/commit、R0 terminal 与 capacity-evidence
 hash、预注册的唯一容量原因和最新预算投影；旧 pipeline 的 marker 或仅存在一个同名空文件均无效。
+持锁的 R1 pipeline 必须在任何 R1 stage 前原子消费 marker，消费记录绑定 launcher/request/pipeline
+identity；即使消费后进程崩溃，该 marker 也不能复用，重启必须生成新 nonce 和重新核算的投影。
 
 Checkpoint schema、optimizer/RNG、predecessor 或 resume 语义失败不会被 offload 修复。这类失败必须在
 同一个 R0/R1 profile 下修复并重跑，不能用“切 R1”掩盖实现错误。
@@ -268,7 +280,7 @@ hash 和 checkpoint hash，不能把“推理不使用 offload”误写成训练
 相对 4B 方案，每步 trajectories 从 32 降为 8。40/80 steps 不再代表相同算力或样本暴露量，报告中
 必须同时给出 prompt groups、trajectories、生成 token、有效 advantage group 数和 wall time。
 
-`batch=2, group=4` 是本候选方案预先固定的资源档：每步仍有 8 条 trajectory，但覆盖两个 prompt
+`batch=2, group=4` 是本方案预先固定的资源档：每步仍有 8 条 trajectory，但覆盖两个 prompt
  group，trajectory 数是旧 `batch=4, group=8` 的四分之一。它比 `batch=1, group=8` 更强调 prompt
 覆盖，代价是每个 group 的 reward variance 更容易不足，因此 pilot 的非零 advantage 门禁不可省略。
 如果 G2 显示 group 8 很宽裕，它也只能作为另一个预注册 profile 重新做成对实验，不能在 B/C 中途升级。
@@ -516,7 +528,7 @@ B/C40 完整结束即达到最低正式交付 L1。即使 C 没有超过 B，也
 
 满足后先用 sealed B60/C60 config 从明确的 `global_step_40` 续到 total step60，再用 B80/C80 config
 从已验证的 step60 续到 total step80。最终 endpoint 另做 full-state fresh-process resume probe，并完成
-64 QA/格最终评测。候选方案不规划 120 steps；优先把 B/C80、callback 消融、统计和报告做完整。
+64 QA/格最终评测。本方案不规划 120 steps；优先把 B/C80、callback 消融、统计和报告做完整。
 
 ### 6.4 禁止的临场救火
 
@@ -579,6 +591,11 @@ memory/final caps、callback 轮次策略、chat template、tokenizer revision �
 调度器。迁移必须新增 matrix dispatcher，按 dataset/doc-count/model/callback 生成不可变 cell identity，
 验证跨 Base/B/C cell 的 QA ID 与顺序完全一致，去重 C learned 主结果与 callback learned 消融的同一
 cell，并在所有必需 cell 验证成功后才原子发布聚合表和 verified evaluation package。
+
+任何已有 cell 的复用和 verified package 的复验都必须重新读取不可变 `results.jsonl`，从每条
+`raw_final_output + gold_answers` 独立计算 extraction、EM/F1/substring EM，重建 cell summary 与
+10,000 次 paired-bootstrap aggregate，并与 cell/package 的路径、文件 hash、plan identity 逐项一致；
+completion marker 或 package 自哈希本身不能作为分数正确性的证据。
 
 训练产物与评测证据必须形成可验证的身份链：checkpoint extra state、adapter metadata 和 merged
 metadata 均嵌入 CPU handoff SHA、selected capacity-profile SHA、sealed training config ID/SHA，
@@ -861,16 +878,16 @@ scripts/cloud/start_gpu_2b_bc80.sh           # B/C40->60->80 + 最终评测/包
 scripts/cloud/export_2b_results.sh            # 只验证/打包，不训练
 ~~~
 
-`start_gpu_2b_bc80.sh` 必须要求已验证的 B/C40 package 和显式费用批准 marker，不能因目录存在就自动续跑。
-该一次性、自哈希 marker 绑定 active profile/commit、capacity profile、B/C40 package hash、两边 step40
-checkpoint hashes 和本次成本投影；旧 pipeline 或内容为空的同名文件必须拒绝。
+`start_gpu_2b_bc80.sh` 必须要求已验证的 B/C40 package 和显式、自哈希的 `bc80` 费用投影，不能因
+目录存在就自动续跑。Pipeline 还要独立重验 active profile/commit、capacity profile、B/C40 package
+和两边 step40 checkpoint；费用投影作为一次启动代的批准证据，旧投影不能在新增支出后继续复用。
 
 新增入口并不够；以下共享路径必须同步修改和测试：
 
 | 文件/范围 | 必须承担的变化 |
 |---|---|
 | `init_cloud.sh` / `lib/runtime.sh` | 从 active profile ID 派生并验证独立 cache/data/cloud/output roots，写入持久 runtime env |
-| `launch.sh` / `launcher_worker.sh` / `status.sh` / `lib/shutdown.sh` | 新 phase allowlist、request identity、三类 terminal marker、全程持锁、终态先同步再决定关机及正确状态展示 |
+| `launch.sh` / `launcher_worker.sh` / `status.sh` / `lib/shutdown.sh` | 新 phase allowlist、request identity、success/failure/scientific-stop/capacity-stop 四类 terminal marker、全程持锁、终态先同步再决定关机及正确状态展示 |
 | `run_pipeline.sh` | G2、B/C40、B/C80 的有序 DAG、显式 predecessor、成功复验、保守 retry/adoption |
 | `run_stage.sh` | 各 stage 命令、timeout、离线环境、config/capacity/checkpoint verifier 和 telemetry |
 | `cloud_state.py` / `resolve_configs.py` | active profile schema、33-config exact inventory、2B asset/data namespace 与自哈希 handoff |
@@ -880,7 +897,7 @@ checkpoint hashes 和本次成本投影；旧 pipeline 或内容为空的同名�
 
 `scripts/cloud/README.md` 顶部必须保留最短正常路径：一个完整 CPU bootstrap block，以及当前人工批准
 付费阶段的一条 GPU 命令；stage-level 命令只用于诊断。G2、B/C40、B/C80 每段都在 success、
-`scientific-stop` 或 terminal failure 证据 durable sync 后才可请求关机，锁冲突、dry-run、keep-running、test mode、sync/authorization 失败
+`capacity-stop`、`scientific-stop` 或 terminal failure 证据 durable sync 后才可请求关机，锁冲突、dry-run、keep-running、test mode、sync/authorization 失败
 必须保持实例运行。Guest poweroff 后仍需人工确认 AutoDL 控制面已停止计费。
 
 README 还必须要求操作者确认同一个 provider volume ID、CPU 实例已经停止并卸载后才能挂到 GPU，
@@ -914,7 +931,7 @@ verifier 生成新的 synthetic success attempt；partial checkpoint、OOM、NaN
 - partial/OOM/NaN/signal attempt 不可 adopt，完整产物后 cleanup 失败才可 synthetic adoption；
 - GPU 缺资产时保持 offline 并失败，compute process、VRAM、CPU/RAM/disk、mount/symlink/path escape 门禁；
 - 每个入口的 success、nonzero、INT、TERM、lock conflict、keep-running、dry-run、test mode、sync、authorization 和 shutdown backend failure；
-- 三类 terminal marker/exit-code/status/关机授权顺序，测试 hook 永不调用真实 shutdown/poweroff backend；
+- 四类 terminal marker/exit-code/status/关机授权顺序，测试 hook 永不调用真实 shutdown/poweroff backend；
 - `bash -n`/可行时 ShellCheck、Python `compileall` 与相关测试、33 份生产 config compose、静态 cloud audit、`git diff --check` 和新 shell mode `100755`。
 
 交付 commit push 后还必须验证远端分支解析到预期 40 位 SHA，并实际读取该 SHA 对应的 raw
@@ -926,7 +943,7 @@ verifier 生成新的 synthetic success attempt；partial checkpoint、OOM、NaN
 
 ### Phase A：文档与 profile
 
-1. 用户确认本候选方案；
+1. 固化本权威方案与无新增工具的范围；
 2. 更新权威 plan/handoff 和云端 README；
 3. 增加 `rtx5090-32g-qwen35-2b-v1` hardware/experiment profile；
 4. 明确保留旧 4B profile，不做 git revert。
@@ -1053,19 +1070,20 @@ L0 不能写已完成 B/C40、callback 消融或正式科学评测。
 
 ---
 
-## 14. 提升为权威方案前的检查清单
+## 14. 实施与租卡验收清单
 
-- [ ] 用户确认正式模型从 4B 改为 2B；
-- [ ] 用户确认正式 GPU 固定为单张 RTX 5090 32GB；
-- [ ] 用户接受 batch/mini/group `2/2/4` 和每步 8 trajectories；
-- [ ] 用户接受固定 3-step pilots、2/6 非零 advantage 门禁和禁止换样本重抽；
-- [ ] 用户接受正式训练按 20-step stages 切分及额外 resume 启动开销；
-- [ ] 用户接受 B/C40 是最低正式交付，B/C80 是预算门控后的可选目标；
-- [ ] 用户接受 R0 -> R1 的 offload 选择规则以及 R1 失败时停止；
-- [ ] 用户接受 500 元计划预算和 450 元 GPU 停止线，或提供新预算；
-- [ ] 用户接受 `C-B` 四格 macro answer EM 为 primary，其他指标不得事后替换；
-- [ ] 用户接受 2B 结果只能声称缩小机制复现；
-- [ ] 当前 4B configs 和方案保留为历史 profile，不做 revert；
+- [x] 正式模型从 4B 改为固定 revision 的 2B；
+- [x] 正式 GPU 固定为单张 RTX 5090 32GB；
+- [x] batch/mini/group 固定为 `2/2/4`，每步 8 trajectories；
+- [x] 固定 3-step pilots、2/6 非零 advantage 门禁，禁止换样本重抽；
+- [x] 正式训练按 20-step stages 切分，并接受额外 resume 启动开销；
+- [x] B/C40 是最低正式交付，B/C80 是预算门控后的可选目标；
+- [x] R0 -> R1 只允许容量原因、显式批准和新 launcher，R1 失败即停止；
+- [x] 计划预算 500 元、GPU 停止线 450 元，投影超线即停止；
+- [x] `C-B` 四格 macro answer EM 为 primary，其他指标不得事后替换；
+- [x] 2B 结果只能声称缩小机制复现；
+- [x] 不新增压缩工具，不改变 `<update>` / `<recall>` / final answer 协议；
+- [x] 当前 4B configs 和方案保留为历史 profile，不做 revert；
 - [ ] 更新权威 handoff 前再次核对工作区和远端 commit；
 - [ ] 实施完成并通过 CPU tests 前不启动 5090；
 - [ ] G2 通过并发布费用投影前不启动 B/C40；
@@ -1073,14 +1091,15 @@ L0 不能写已完成 B/C40、callback 消融或正式科学评测。
 
 ---
 
-## 15. 依据
+## 15. 依据与文档优先级
 
-- 当前权威方案：`docs/final_reproduction_plan_zh.md`；
+- 当前权威方案：本文；
 - 当前实施入口：`docs/reproduction_implementation_handoff_zh.md`；
 - 当前云端说明：`scripts/cloud/README.md`；
+- 历史 4B / PRO 6000 方案：`docs/final_reproduction_plan_zh.md`；
 - 历史 2B/5090 规划：commit `08174dc` 中的 `docs/reproduction_plan_zh.md`；
-- 当前代码与配置基线：commit `cc6c330ce1e8a1f922c28e84dc3f28b298914636`；
+- 本轮迁移起点：commit `cc6c330ce1e8a1f922c28e84dc3f28b298914636`；
 - 论文：`2509.23040v5.pdf`。
 
-历史方案只提供容量、时长和降级参考；本候选方案以当前已实现的 LoRA/FSDP、HF rollout、
+历史方案只提供容量、时长和降级参考；本方案以当前已实现的 LoRA/FSDP、HF rollout、
 checkpoint、数据和评测契约为准。任何规划显存和时长均须由真实 5090 G2 证据替换。

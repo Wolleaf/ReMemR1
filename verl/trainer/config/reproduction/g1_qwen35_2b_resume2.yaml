@@ -31,6 +31,7 @@ reproduction:
   val_data_manifest_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
   val_data_manifest_mode: train
   val_data_manifest_profile: fixture
+  pilot_evidence_path: null
   export_adapter_on_save: true
   adapter_export_dir: /root/autodl-tmp/rememr1/artifacts/gates/g1-qwen35-2b/seed42/run-20260716-resume2/adapter
   template_revision: rememr1-template-v1

@@ -1,0 +1,27 @@
+# @package _global_
+defaults:
+  - /reproduction/g2b_qwen35_2b_5090_step1
+  - _self_
+
+data:
+  train_files: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/data/capacity/length-stress/train/train.parquet
+  val_files: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/data/capacity/length-stress/validation/train.parquet
+
+reproduction:
+  length_stress: true
+  formal_data: false
+  data_manifest_profile: fixture
+  val_data_manifest_profile: fixture
+  export_adapter_on_save: false
+  adapter_export_dir: null
+
+actor_rollout_ref:
+  rollout:
+    ignore_eos: true
+
+trainer:
+  experiment_name: g2-length-stress-qwen35-2b-5090-${reproduction.offload_profile}-seed42
+  rollout_data_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/g2-length-stress/logs/rollouts
+  validation_data_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/g2-length-stress/logs/validation
+  save_freq: -1
+  default_local_dir: /root/autodl-tmp/rememr1/profiles/rtx5090-32g-qwen35-2b-v1/outputs/${reproduction.offload_profile}/g2-length-stress/not-a-reusable-checkpoint

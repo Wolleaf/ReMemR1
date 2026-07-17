@@ -1,5 +1,6 @@
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,145 @@ from scripts.cloud import gpu_probe
 
 def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class _FakeCuda:
+    def __init__(self, *, count=1, name="NVIDIA GeForce RTX 5090", memory=32 * 1024**3):
+        self._count = count
+        self._name = name
+        self._memory = memory
+
+    def is_available(self):
+        return True
+
+    def device_count(self):
+        return self._count
+
+    def get_device_capability(self, index):
+        assert index == 0
+        return (12, 0)
+
+    def get_device_name(self, index):
+        assert index == 0
+        return self._name
+
+    def get_device_properties(self, index):
+        assert index == 0
+        return SimpleNamespace(total_memory=self._memory)
+
+
+def _hardware_inputs():
+    smi = {
+        "compute_processes": [],
+        "gpus": [
+            {
+                "driver_version": "999.1",
+                "gpu_free_memory_bytes": 30 * 1024**3,
+                "gpu_name": "NVIDIA GeForce RTX 5090",
+                "gpu_total_memory_bytes": 32 * 1024**3,
+                "gpu_uuid": "GPU-test-uuid",
+            }
+        ],
+    }
+    resources = {
+        "host_cpu_count": 32,
+        "host_total_memory_bytes": 160 * 1024**3,
+        "persistent_disk_free_bytes": 250 * 1024**3,
+        "persistent_disk_probe_path": "/persistent",
+    }
+    torch_module = SimpleNamespace(cuda=_FakeCuda(), version=SimpleNamespace(cuda="13.0"))
+    return torch_module, smi, resources
+
+
+def _probe_with(torch_module, smi, resources, *, profile="R0", toolkit="13.0"):
+    return gpu_probe._probe_hardware(
+        profile=profile,
+        torch_module=torch_module,
+        nvidia_smi_probe=lambda: smi,
+        toolkit_probe=lambda: toolkit,
+        host_resource_probe=lambda: resources,
+    )
+
+
+def test_rtx5090_preflight_accepts_injected_r0_and_r1_profiles():
+    torch_module, smi, resources = _hardware_inputs()
+    result = _probe_with(torch_module, smi, resources)
+    assert result["gpu_name"] == "NVIDIA GeForce RTX 5090"
+    assert result["gpu_free_memory_bytes"] == 30 * 1024**3
+    assert result["cuda_toolkit"] == "13.0"
+    assert result["other_compute_process_count"] == 0
+
+    result = _probe_with(torch_module, smi, resources, profile="R1")
+    assert result["capacity_profile"] == "R1"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda torch, smi, resources: setattr(torch.cuda, "_count", 2), "exactly 1 visible"),
+        (
+            lambda torch, smi, resources: setattr(torch.cuda, "_name", "NVIDIA RTX PRO 6000"),
+            "GeForce RTX 5090",
+        ),
+        (
+            lambda torch, smi, resources: setattr(torch.cuda, "_memory", 30 * 1024**3),
+            "31 GiB",
+        ),
+        (
+            lambda torch, smi, resources: smi["gpus"][0].update(
+                gpu_free_memory_bytes=28 * 1024**3
+            ),
+            "29 GiB free",
+        ),
+        (
+            lambda torch, smi, resources: smi["compute_processes"].append(
+                {"gpu_uuid": "GPU-test-uuid", "pid": 1234, "process_name": "python"}
+            ),
+            "other compute processes",
+        ),
+        (
+            lambda torch, smi, resources: resources.update(
+                persistent_disk_free_bytes=199 * 1024**3
+            ),
+            "200 GiB",
+        ),
+    ],
+)
+def test_rtx5090_preflight_fails_closed(mutate, message):
+    torch_module, smi, resources = _hardware_inputs()
+    mutate(torch_module, smi, resources)
+    with pytest.raises(gpu_probe.ProbeError, match=message):
+        _probe_with(torch_module, smi, resources)
+
+
+def test_rtx5090_preflight_requires_exact_runtime_toolkit_and_r1_ram():
+    torch_module, smi, resources = _hardware_inputs()
+    with pytest.raises(gpu_probe.ProbeError, match="toolkit 13.0"):
+        _probe_with(torch_module, smi, resources, toolkit="12.8")
+
+    torch_module.version.cuda = "12.8"
+    with pytest.raises(gpu_probe.ProbeError, match="runtime 13.0"):
+        _probe_with(torch_module, smi, resources)
+    torch_module.version.cuda = "13.0"
+
+    resources["host_total_memory_bytes"] = 127 * 1024**3
+    with pytest.raises(gpu_probe.ProbeError, match="R1 requires at least 128 GiB"):
+        _probe_with(torch_module, smi, resources, profile="R1")
+
+
+def test_nvidia_smi_and_nvcc_parsers_are_injectable(monkeypatch):
+    outputs = iter(
+        [
+            "NVIDIA GeForce RTX 5090, 999.1, GPU-test, 32640, 30720\n",
+            "",
+            "Cuda compilation tools, release 13.0, V13.0.1\n",
+        ]
+    )
+    monkeypatch.setattr(gpu_probe, "_run_text", lambda command: next(outputs))
+    inventory = gpu_probe._query_nvidia_smi()
+    assert inventory["gpus"][0]["gpu_free_memory_bytes"] == 30720 * 1024**2
+    assert inventory["compute_processes"] == []
+    assert gpu_probe._query_cuda_toolkit() == "13.0"
 
 
 def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monkeypatch):
@@ -23,9 +163,17 @@ def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monke
         "cuda_runtime": "13.0",
         "driver_version": "999.1",
         "gpu_compute_capability": [12, 0],
-        "gpu_name": "NVIDIA RTX PRO 6000 Blackwell",
-        "gpu_total_memory_bytes": 96 * 1024**3,
+        "capacity_profile": "R0",
+        "cuda_toolkit": "13.0",
+        "gpu_free_memory_bytes": 30 * 1024**3,
+        "gpu_name": "NVIDIA GeForce RTX 5090",
+        "gpu_total_memory_bytes": 32 * 1024**3,
         "gpu_uuid": "GPU-test-uuid",
+        "host_cpu_count": 32,
+        "host_total_memory_bytes": 128 * 1024**3,
+        "other_compute_process_count": 0,
+        "persistent_disk_free_bytes": 250 * 1024**3,
+        "persistent_disk_probe_path": "/persistent",
     }
     kernels = {}
     for kernel in ("causal-conv1d", "flash-linear-attention"):

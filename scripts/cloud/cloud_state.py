@@ -51,8 +51,9 @@ from taskutils.data_synthesis.reproduction_manifest import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 HANDOFF_STATUS = "cpu_ready"
+EXPERIMENT_PROFILE_ID = "rtx5090-32g-qwen35-2b-v1"
 SEED = 42
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -60,6 +61,8 @@ _TRACKED_ASSET_MANIFEST = REPOSITORY_ROOT / "environment" / "reproduction-assets
 _ENVIRONMENT_LOCK = REPOSITORY_ROOT / "environment" / "reproduction-cu130.lock.json"
 _GATE_SOURCE_REVISION_PREFIX = "rememr1-gate-source-v1"
 _GATE_REPEAT_CANDIDATES = tuple(range(32, 113, 4))
+_LENGTH_STRESS_SOURCE_REVISION_PREFIX = "rememr1-length-stress-source-v1"
+_LENGTH_STRESS_REPEAT_CANDIDATES = tuple(range(80, 181, 4))
 _GATE_CONTRACT = TrainManifestContract(
     qa_count=20,
     document_count=16,
@@ -74,21 +77,56 @@ _G1_EVAL_CONTRACT = EvalManifestContract(
     pool_document_count=16,
     chunk_size=1024,
 )
-_CONFIG_NAMES = {
-    "b40_qwen35_4b.yaml",
-    "b80_qwen35_4b.yaml",
-    "b_pilot_qwen35_4b.yaml",
-    "c40_qwen35_4b.yaml",
-    "c80_qwen35_4b.yaml",
-    "c_pilot_qwen35_4b.yaml",
-    "eval_qwen35_4b.yaml",
-    "g0_qwen35_08b.yaml",
-    "g1_qwen35_2b_resume2.yaml",
-    "g1_qwen35_2b_step1.yaml",
-    "g2a_qwen35_4b.yaml",
-    "g2b_qwen35_4b_resume2.yaml",
-    "g2b_qwen35_4b_step1.yaml",
+_LENGTH_STRESS_CONTRACT = TrainManifestContract(
+    qa_count=2,
+    document_count=200,
+    chunk_size=5000,
+    max_chunks=6,
+    min_context_tokens=25_001,
+    max_context_tokens=30_000,
+)
+_ACTIVE_ASSET_IDS = {
+    "2wikimultihopqa-source",
+    "byted-hotpotqa-formal",
+    "hotpotqa-source",
+    "qwen35-08b-model-tokenizer",
+    "qwen35-2b-model-tokenizer",
 }
+_GATE_CONFIG_IDS = {
+    "g0_qwen35_08b",
+    "g1_qwen35_2b_resume2",
+    "g1_qwen35_2b_step1",
+}
+_TRAINING_SOURCE_IDS = {
+    "b20_qwen35_2b_5090",
+    "b40_qwen35_2b_5090",
+    "b60_qwen35_2b_5090",
+    "b80_qwen35_2b_5090",
+    "b_pilot_qwen35_2b_5090",
+    "c20_qwen35_2b_5090",
+    "c40_qwen35_2b_5090",
+    "c60_qwen35_2b_5090",
+    "c80_qwen35_2b_5090",
+    "c_pilot_qwen35_2b_5090",
+    "g2_length_stress_qwen35_2b_5090",
+    "g2a_qwen35_2b_5090",
+    "g2b_qwen35_2b_5090_resume5",
+    "g2b_qwen35_2b_5090_step1",
+}
+_EVAL_CONFIG_IDS = {
+    "eval40_qwen35_2b_5090",
+    "eval80_qwen35_2b_5090",
+}
+_CONFIG_IDS = (
+    _GATE_CONFIG_IDS
+    | _EVAL_CONFIG_IDS
+    | {
+        f"{source}_{profile}"
+        for source in _TRAINING_SOURCE_IDS
+        for profile in ("r0", "r1")
+    }
+)
+_CONFIG_NAMES = {f"{config_id}.yaml" for config_id in _CONFIG_IDS}
 _CONFIG_TREE_NAMES = _CONFIG_NAMES | {"index.json"}
 _PLACEHOLDER_DIGESTS = {character * 64 for character in "0123"}
 _SHA256_CACHE: contextvars.ContextVar[
@@ -112,6 +150,7 @@ class BundleSpec:
     source_split: str | None
     tokenizer_asset: str
     gate_split: str | None = None
+    length_stress_split: str | None = None
 
 
 _BUNDLE_SPECS = (
@@ -184,7 +223,7 @@ _BUNDLE_SPECS = (
         "byted-hotpotqa-formal",
         "hotpotqa_train_32k.parquet",
         None,
-        "qwen35-4b-model-tokenizer",
+        "qwen35-2b-model-tokenizer",
     ),
     BundleSpec(
         ("formal", "validation"),
@@ -195,7 +234,7 @@ _BUNDLE_SPECS = (
         "byted-hotpotqa-formal",
         "hotpotqa_dev.parquet",
         None,
-        "qwen35-4b-model-tokenizer",
+        "qwen35-2b-model-tokenizer",
     ),
     BundleSpec(
         ("formal", "eval", "hotpotqa"),
@@ -206,7 +245,7 @@ _BUNDLE_SPECS = (
         "hotpotqa-source",
         "hotpotqa/dev.jsonl",
         None,
-        "qwen35-4b-model-tokenizer",
+        "qwen35-2b-model-tokenizer",
     ),
     BundleSpec(
         ("formal", "eval", "2wikimultihopqa"),
@@ -217,7 +256,31 @@ _BUNDLE_SPECS = (
         "2wikimultihopqa-source",
         "2wikimultihopqa/dev.jsonl",
         None,
-        "qwen35-4b-model-tokenizer",
+        "qwen35-2b-model-tokenizer",
+    ),
+    BundleSpec(
+        ("capacity", "length_stress", "train"),
+        "capacity/length-stress/train",
+        "train",
+        "fixture",
+        "hotpotqa",
+        None,
+        None,
+        None,
+        "qwen35-2b-model-tokenizer",
+        length_stress_split="train",
+    ),
+    BundleSpec(
+        ("capacity", "length_stress", "validation"),
+        "capacity/length-stress/validation",
+        "train",
+        "fixture",
+        "hotpotqa",
+        None,
+        None,
+        None,
+        "qwen35-2b-model-tokenizer",
+        length_stress_split="validation",
     ),
 )
 
@@ -559,6 +622,10 @@ def _validate_runtime_against_tracked(
     validate_asset_manifest(tracked)
     runtime_assets = {asset["asset_id"]: asset for asset in runtime["assets"]}
     tracked_assets = {asset["asset_id"]: asset for asset in tracked["assets"]}
+    if set(tracked_assets) != _ACTIVE_ASSET_IDS:
+        raise CloudStateError(
+            "tracked asset IDs do not match the active 5090/2B experiment profile"
+        )
     if set(runtime_assets) != set(tracked_assets):
         raise CloudStateError("runtime asset IDs differ from the tracked manifest")
     for asset_id, baseline in tracked_assets.items():
@@ -750,6 +817,128 @@ def _publish_gate_sources(
     return result
 
 
+def _synthetic_length_stress_records(
+    split: str,
+    repeat_count: int,
+) -> list[dict[str, Any]]:
+    if split not in {"train", "validation"}:
+        raise CloudStateError(f"unsupported length-stress split: {split}")
+    records: list[dict[str, Any]] = []
+    for qa_index in range(100):
+        contexts = []
+        for document_index in range(2):
+            marker = f"{split}-{qa_index:03d}-{document_index}"
+            title = f"Length stress {split} document {qa_index:03d}-{document_index}"
+            contexts.append(
+                {
+                    "document_id": f"length-stress-{marker}",
+                    "sentences": [
+                        f"Capacity evidence {marker}. "
+                        + ("memory " * repeat_count)
+                        + "End."
+                    ],
+                    "title": title,
+                }
+            )
+        records.append(
+            {
+                "_id": f"length-stress-{split}-qa-{qa_index:03d}",
+                "answers": [f"answer-{split}-{qa_index:03d}"],
+                "context": contexts,
+                "question": f"What is the fixed {split} capacity answer {qa_index:03d}?",
+                "supporting_facts": [[contexts[0]["title"], 0]],
+            }
+        )
+    return records
+
+
+def _probe_length_stress_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    repeat_count: int,
+    tokenizer_name: str,
+    tokenizer_revision: str,
+    encode: Callable[[str], Any],
+) -> tuple[int, int]:
+    payload = _jsonl_bytes(records)
+    examples = tuple(
+        parse_source_record(record, dataset="hotpotqa", source_index=index)
+        for index, record in enumerate(records)
+    )
+    metadata = ManifestMetadata(
+        source_name="hotpotqa",
+        source_revision=(
+            f"{_LENGTH_STRESS_SOURCE_REVISION_PREFIX}-r{repeat_count:03d}"
+        ),
+        source_sha256=hashlib.sha256(payload).hexdigest(),
+        tokenizer_name=tokenizer_name,
+        tokenizer_revision=tokenizer_revision,
+        seed=SEED,
+    )
+    built = build_train_records(
+        examples,
+        metadata=metadata,
+        encode=encode,
+        contract=_LENGTH_STRESS_CONTRACT,
+    )
+    counts = [record.context_token_count for record in built]
+    return min(counts), max(counts)
+
+
+def _select_length_stress_sources(
+    tokenizer: tuple[str, str, Callable[[str], Any]],
+) -> tuple[int, dict[str, bytes], dict[str, dict[str, int]]]:
+    tokenizer_name, tokenizer_revision, encode = tokenizer
+    last_errors: list[str] = []
+    for repeat_count in _LENGTH_STRESS_REPEAT_CANDIDATES:
+        payloads: dict[str, bytes] = {}
+        observations: dict[str, dict[str, int]] = {}
+        try:
+            for split in ("train", "validation"):
+                records = _synthetic_length_stress_records(split, repeat_count)
+                payloads[split] = _jsonl_bytes(records)
+                minimum, maximum = _probe_length_stress_records(
+                    records,
+                    repeat_count=repeat_count,
+                    tokenizer_name=tokenizer_name,
+                    tokenizer_revision=tokenizer_revision,
+                    encode=encode,
+                )
+                observations[split] = {
+                    "max_context_tokens": maximum,
+                    "min_context_tokens": minimum,
+                }
+            return repeat_count, payloads, observations
+        except (ManifestValidationError, ValueError) as exc:
+            last_errors.append(f"r{repeat_count}: {exc}")
+    detail = "; ".join(last_errors[-3:])
+    raise CloudStateError(
+        "no finite non-scientific length-stress candidate satisfies the pinned "
+        f"2B tokenizer; last failures: {detail}"
+    )
+
+
+def _publish_length_stress_sources(
+    data_root: Path,
+    payloads: Mapping[str, bytes],
+) -> dict[str, Path]:
+    source_root = data_root / "capacity" / "length-stress" / "source"
+    result: dict[str, Path] = {}
+    for split in ("train", "validation"):
+        path = source_root / f"{split}.jsonl"
+        payload = payloads[split]
+        if path.exists():
+            if not path.is_file() or path.read_bytes() != payload:
+                raise CloudStateError(
+                    "existing length-stress source differs from deterministic output: "
+                    f"{path}"
+                )
+        else:
+            _atomic_write_bytes(path, payload)
+        result[split] = path.resolve(strict=True)
+    return result
+
+
 def _insert_nested(root: dict[str, Any], keys: Sequence[str], value: Any) -> None:
     cursor = root
     for key in keys[:-1]:
@@ -818,6 +1007,8 @@ def _probe_formal_parquet(path: Path, *, dataset: str) -> None:
 
 
 def _expected_bundle_contract(spec: BundleSpec) -> Mapping[str, Any]:
+    if spec.length_stress_split is not None:
+        return _LENGTH_STRESS_CONTRACT.to_dict()
     if spec.profile == "fixture":
         if spec.mode == "train":
             return _GATE_CONTRACT.to_dict()
@@ -901,7 +1092,7 @@ def build_data(
     validator: Callable[[str | os.PathLike[str]], Mapping[str, Any]] = validate_artifact_bundle,
     tracked_manifest_path: str | Path | None = _TRACKED_ASSET_MANIFEST,
 ) -> dict[str, Any]:
-    """Build or strictly validate all gate and formal bundles without downloads."""
+    """Build or strictly validate all gate, capacity, and formal bundles offline."""
 
     runtime = load_asset_manifest(manifest_path)
     _require_resolved_manifest(runtime)
@@ -928,6 +1119,12 @@ def build_data(
         )
     repeat_count, gate_payloads, gate_observations = _select_gate_sources(tokenizer_cache)
     gate_sources = _publish_gate_sources(root, gate_payloads)
+    (
+        length_repeat_count,
+        length_payloads,
+        length_observations,
+    ) = _select_length_stress_sources(tokenizer_cache["g1"])
+    length_sources = _publish_length_stress_sources(root, length_payloads)
 
     local_sources: dict[tuple[str, str], Path] = {}
     bundles: dict[str, Any] = {}
@@ -941,6 +1138,11 @@ def build_data(
         if spec.gate_split is not None:
             source_path = gate_sources[spec.gate_split]
             source_revision = f"{_GATE_SOURCE_REVISION_PREFIX}-r{repeat_count:03d}"
+        elif spec.length_stress_split is not None:
+            source_path = length_sources[spec.length_stress_split]
+            source_revision = (
+                f"{_LENGTH_STRESS_SOURCE_REVISION_PREFIX}-r{length_repeat_count:03d}"
+            )
         else:
             assert spec.source_asset is not None and spec.source_file is not None
             source_asset = _asset_by_id(runtime, spec.source_asset)
@@ -988,7 +1190,9 @@ def build_data(
                 "tokenizer_name": tokenizer_key[0],
                 "tokenizer_revision": tokenizer_key[1],
             }
-            if spec.profile == "fixture":
+            if spec.length_stress_split is not None:
+                kwargs["train_contract"] = _LENGTH_STRESS_CONTRACT
+            elif spec.profile == "fixture":
                 if spec.mode == "train":
                     kwargs["train_contract"] = _GATE_CONTRACT
                 else:
@@ -1029,9 +1233,31 @@ def build_data(
         },
         "token_observations": gate_observations,
     }
+    length_source_summary = {
+        "generator": _LENGTH_STRESS_SOURCE_REVISION_PREFIX,
+        "non_scientific": True,
+        "ordered_source_ids_sha256": hashlib.sha256(
+            "\n".join(
+                record["_id"]
+                for split in ("train", "validation")
+                for record in _synthetic_length_stress_records(split, length_repeat_count)
+            ).encode("ascii")
+        ).hexdigest(),
+        "repeat_count": length_repeat_count,
+        "sources": {
+            split: {
+                "path": str(path),
+                "sha256": _sha256_file(path),
+                "size": path.stat().st_size,
+            }
+            for split, path in sorted(length_sources.items())
+        },
+        "token_observations": length_observations,
+    }
     return {
         "bundles": bundles,
         "gate_source": gate_source_summary,
+        "length_stress_source": length_source_summary,
         "schema_version": SCHEMA_VERSION,
         "status": "complete",
     }
@@ -1114,7 +1340,7 @@ def _validate_resolved_config_tree(
         entry = _require_mapping(raw_entry, f"config_index.configs.{config_id}")
         _require_exact_keys(
             entry,
-            {"overrides", "path", "sha256"},
+            {"offload_profile", "overrides", "path", "sha256", "source_config"},
             f"config_index.configs.{config_id}",
         )
         filename = f"{config_id}.yaml"
@@ -1129,6 +1355,25 @@ def _validate_resolved_config_tree(
             isinstance(item, str) and item for item in overrides
         ):
             raise CloudStateError(f"resolved config overrides are malformed for {config_id}")
+        source_config = entry["source_config"]
+        offload_profile = entry["offload_profile"]
+        if config_id in _GATE_CONFIG_IDS | _EVAL_CONFIG_IDS:
+            if source_config != config_id or offload_profile is not None:
+                raise CloudStateError(
+                    f"resolved config composition identity is invalid for {config_id}"
+                )
+        else:
+            profile = config_id.rsplit("_", 1)[-1]
+            source = config_id.removesuffix(f"_{profile}")
+            if (
+                profile not in {"r0", "r1"}
+                or source not in _TRAINING_SOURCE_IDS
+                or source_config != source
+                or offload_profile != profile
+            ):
+                raise CloudStateError(
+                    f"resolved offload composition identity is invalid for {config_id}"
+                )
         text = expected_path.read_text(encoding="utf-8")
         if any(placeholder in text for placeholder in _PLACEHOLDER_DIGESTS):
             raise CloudStateError(f"resolved config retains a placeholder digest: {config_id}")
@@ -1353,6 +1598,34 @@ def _validate_gate_source_file(spec: BundleSpec, source_path: Path, revision: st
         raise CloudStateError(f"gate source bytes are not deterministic for {spec.relative_path}")
 
 
+def _validate_length_stress_source_file(
+    spec: BundleSpec,
+    source_path: Path,
+    revision: str,
+) -> None:
+    match = re.fullmatch(
+        rf"{re.escape(_LENGTH_STRESS_SOURCE_REVISION_PREFIX)}-r(\d{{3}})",
+        revision,
+    )
+    if match is None:
+        raise CloudStateError(
+            f"length-stress bundle has an invalid source revision: {revision!r}"
+        )
+    repeat_count = int(match.group(1))
+    if repeat_count not in _LENGTH_STRESS_REPEAT_CANDIDATES:
+        raise CloudStateError(
+            f"length-stress bundle uses an unsupported repeat count: {repeat_count}"
+        )
+    assert spec.length_stress_split is not None
+    expected = _jsonl_bytes(
+        _synthetic_length_stress_records(spec.length_stress_split, repeat_count)
+    )
+    if source_path.read_bytes() != expected:
+        raise CloudStateError(
+            f"length-stress source bytes are not deterministic for {spec.relative_path}"
+        )
+
+
 def _load_and_record_bundles(
     data_root: Path,
     asset_manifest: Mapping[str, Any],
@@ -1380,6 +1653,16 @@ def _load_and_record_bundles(
         )
         if spec.gate_split is not None:
             _validate_gate_source_file(spec, source_path, manifest["source"]["revision"])
+            expected_source_revision = manifest["source"]["revision"]
+            tokenizer_asset = _asset_by_id(asset_manifest, spec.tokenizer_asset)
+            tokenizer_name = tokenizer_asset["repo_id"]
+            tokenizer_revision = tokenizer_asset["revision"]
+        elif spec.length_stress_split is not None:
+            _validate_length_stress_source_file(
+                spec,
+                source_path,
+                manifest["source"]["revision"],
+            )
             expected_source_revision = manifest["source"]["revision"]
             tokenizer_asset = _asset_by_id(asset_manifest, spec.tokenizer_asset)
             tokenizer_name = tokenizer_asset["repo_id"]
@@ -1424,6 +1707,7 @@ def _publish_handoff_impl(
     config_root: str | Path,
     persist_root: str | Path,
     *,
+    experiment_profile_id: str = EXPERIMENT_PROFILE_ID,
     repository_root: str | Path = REPOSITORY_ROOT,
     tracked_manifest_path: str | Path = _TRACKED_ASSET_MANIFEST,
     environment_lock_path: str | Path = _ENVIRONMENT_LOCK,
@@ -1431,6 +1715,10 @@ def _publish_handoff_impl(
     """Validate all CPU outputs and atomically publish a self-hashed handoff."""
 
     commit = _require_commit(commit)
+    if experiment_profile_id != EXPERIMENT_PROFILE_ID:
+        raise CloudStateError(
+            f"unsupported experiment profile: {experiment_profile_id!r}"
+        )
     _git_repository_record(
         repository_root,
         expected_commit=commit,
@@ -1483,6 +1771,7 @@ def _publish_handoff_impl(
         "data_root": str(root),
         "environment_lock": {"file": _file_record(environment_lock_path)},
         "environment_lock_sha256": environment_lock["lock_sha256"],
+        "experiment_profile_id": experiment_profile_id,
         "git_commit": commit,
         "kernel_source_root": str(kernel_root),
         "kernel_sources": kernels,
@@ -1508,6 +1797,7 @@ def publish_handoff(
     config_root: str | Path,
     persist_root: str | Path,
     *,
+    experiment_profile_id: str = EXPERIMENT_PROFILE_ID,
     repository_root: str | Path = REPOSITORY_ROOT,
     tracked_manifest_path: str | Path = _TRACKED_ASSET_MANIFEST,
     environment_lock_path: str | Path = _ENVIRONMENT_LOCK,
@@ -1524,6 +1814,7 @@ def publish_handoff(
             kernel_source_root,
             config_root,
             persist_root,
+            experiment_profile_id=experiment_profile_id,
             repository_root=repository_root,
             tracked_manifest_path=tracked_manifest_path,
             environment_lock_path=environment_lock_path,
@@ -1533,7 +1824,18 @@ def publish_handoff(
 
 
 def _iter_bundle_records(bundles: Mapping[str, Any]) -> list[tuple[BundleSpec, Mapping[str, Any]]]:
-    _require_exact_keys(bundles, {"formal", "gates"}, "bundles")
+    _require_exact_keys(bundles, {"capacity", "formal", "gates"}, "bundles")
+    capacity = _require_mapping(bundles["capacity"], "bundles.capacity")
+    _require_exact_keys(capacity, {"length_stress"}, "bundles.capacity")
+    length_stress = _require_mapping(
+        capacity["length_stress"],
+        "bundles.capacity.length_stress",
+    )
+    _require_exact_keys(
+        length_stress,
+        {"train", "validation"},
+        "bundles.capacity.length_stress",
+    )
     gates = _require_mapping(bundles["gates"], "bundles.gates")
     _require_exact_keys(gates, {"g0", "g1"}, "bundles.gates")
     g0 = _require_mapping(gates["g0"], "bundles.gates.g0")
@@ -1594,6 +1896,16 @@ def _verify_bundle_record(
         raise CloudStateError(f"bundle validation failed for {path}: {exc}") from exc
     if spec.gate_split is not None:
         _validate_gate_source_file(spec, source_path, manifest["source"]["revision"])
+        expected_source_revision = manifest["source"]["revision"]
+        tokenizer_asset = _asset_by_id(asset_manifest, spec.tokenizer_asset)
+        tokenizer_name = tokenizer_asset["repo_id"]
+        tokenizer_revision = tokenizer_asset["revision"]
+    elif spec.length_stress_split is not None:
+        _validate_length_stress_source_file(
+            spec,
+            source_path,
+            manifest["source"]["revision"],
+        )
         expected_source_revision = manifest["source"]["revision"]
         tokenizer_asset = _asset_by_id(asset_manifest, spec.tokenizer_asset)
         tokenizer_name = tokenizer_asset["repo_id"]
@@ -1665,6 +1977,7 @@ def _verify_handoff_impl(
         "data_root",
         "environment_lock",
         "environment_lock_sha256",
+        "experiment_profile_id",
         "git_commit",
         "handoff_sha256",
         "kernel_source_root",
@@ -1677,6 +1990,8 @@ def _verify_handoff_impl(
     _require_exact_keys(handoff, expected_keys, "handoff")
     if handoff["schema_version"] != SCHEMA_VERSION or handoff["status"] != HANDOFF_STATUS:
         raise CloudStateError("handoff schema/status is not CPU-ready")
+    if handoff["experiment_profile_id"] != EXPERIMENT_PROFILE_ID:
+        raise CloudStateError("handoff experiment profile is not the active 5090/2B profile")
     digest = _require_sha256(handoff["handoff_sha256"], "handoff.handoff_sha256")
     unsigned = dict(handoff)
     unsigned.pop("handoff_sha256")
@@ -1830,6 +2145,10 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--kernel-source-root", type=Path, required=True)
     publish.add_argument("--config-root", type=Path, required=True)
     publish.add_argument("--persist-root", type=Path, required=True)
+    publish.add_argument(
+        "--experiment-profile",
+        default=EXPERIMENT_PROFILE_ID,
+    )
 
     verify = commands.add_parser("verify-handoff", help="strictly re-verify a handoff")
     verify.add_argument("--handoff", type=Path, required=True)
@@ -1868,6 +2187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.kernel_source_root,
                 args.config_root,
                 args.persist_root,
+                experiment_profile_id=args.experiment_profile,
             )
             _print_json(
                 {

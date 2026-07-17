@@ -1,11 +1,12 @@
 # ReMemR1 RTX 5090 / Qwen3.5-2B 项目可行性、成功率与简历路线分析
 
 > 分析日期：2026-07-17
-> 当前代码：commit `36f7166`，分支 `reproduction/rtx5090-2b`
-> 当前实现基线：RTX PRO 6000 96GB + Qwen3.5-4B 适配版本
+> 分析代码快照：commit `36f7166`，分支 `reproduction/rtx5090-2b`
+> 迁移前实现基线：RTX PRO 6000 96GB + Qwen3.5-4B 适配版本
 > 后续目标：单张 RTX 5090 32GB + Qwen3.5-2B
 > 主要输入：`docs/rtx5090_2b_reproduction_plan_zh.md`、`docs/项目推荐.md`
-> 文档性质：项目决策分析，不是 GPU 实测报告；文中的概率是基于当前代码、范围、预算和时间假设的主观工程区间，不是统计置信区间。
+> 文档性质：项目决策分析，不是 GPU 实测报告；文中的概率是基于上述代码快照、范围、预算和时间假设的主观工程区间，不是统计置信区间。
+> 实施更新（2026-07-17）：本文“当前代码拒绝 5090”“尚未实现”等描述是 commit `36f7166` 的迁移前基线。后续代码已按 5090/2B active profile 适配，但尚无真实 5090 训练结果；成功率区间仍需用 G0/G1/G2 实测更新。新增 `compress_context` 已从当前主线排除。
 
 ---
 
@@ -25,7 +26,7 @@
 | **L2** | B/C80、64 QA/格和完整最终包 | **13%-25%** |
 | **L3 显著正向结果** | 预注册 `C-B` 四格 macro answer EM 为正且 paired 95% CI 不跨 0 | **3%-8%** |
 
-注意：**当前代码不做任何修改就直接上 5090，成功概率是 0%**，因为 hardware probe 会主动拒绝非 PRO 6000 / 90 GiB 环境。表中的概率都以先完成候选方案要求的 5090/2B 迁移为前提。
+注意：**commit `36f7166` 的迁移前代码不做任何修改就直接上 5090，成功概率是 0%**，因为当时的 hardware probe 会主动拒绝非 PRO 6000 / 90 GiB 环境。表中的概率都以先完成候选方案要求的 5090/2B 迁移为前提。
 
 因此，最现实的项目定义不是“必须复现出论文提升”，而是：
 
@@ -37,7 +38,7 @@
 
 1. **主线先做无新增工具的 2B/5090 baseline。**先得到真实 G1/G2，再决定是否承担 B/C40 长训练。
 2. **不要现在迁移到 ROLL，也不要把 XML 协议改成 JSON。**当前仓库已经围绕 `verl`、`<update>` / `<recall>` 和完整 checkpoint/eval contract 做了大量适配；更换框架或协议会主动丢掉已有资产。
-3. **`compress_context` 放在 baseline L1 之后，作为独立 D 组扩展。**如果秋招时间紧，达到 L0 后可改做一个小型、可演示的 Context Budget Manager，但不要把它混入预注册 B/C 主实验。
+3. **当前项目排除 `compress_context` 和独立 D 组。**第 5 节只保留为早期方案比较，不进入当前实现、配置、预算或简历口径；未来如重新立项，必须使用独立分支、profile 和实验注册。
 4. **不编数据。**没有正向结果可以写工程闭环、负结果、容量边界和失败分析；伪造提升不仅不必要，而且很容易被日志、配置、checkpoint、seed 和 CI 追问击穿。
 
 ---
@@ -54,7 +55,7 @@
 - checkpoint/resume、adapter export/merge、配置与数据 provenance；
 - 预注册 primary、预算门控和 scientific-stop。
 
-它的优点是严谨、可解释、经得起追问；缺点是范围大，尤其是 33 份 active resolved config、G2 capacity、B/C40、20 个评测 cells 和 verified package 都还没有实现。
+它的优点是严谨、可解释、经得起追问；缺点是范围大；在 commit `36f7166` 快照中，33 份 active resolved config、G2 capacity、B/C40、20 个评测 cells 和 verified package 都还没有实现。
 
 ### 1.2 《项目推荐》的目标
 
@@ -95,9 +96,9 @@
 
 从早期基线到当前分支，仓库约新增 3.6 万行实现和测试代码，共能检索到约 321 个 `test_` 函数。这说明项目的工程底座已经比较厚，后续不应再轻易换训练框架。
 
-### 2.2 尚未完成的 5090 / 2B 正式部分
+### 2.2 迁移前尚未完成的 5090 / 2B 正式部分
 
-| 缺口 | 当前事实 | 影响 |
+| 缺口 | commit `36f7166` 的迁移前事实 | 影响 |
 |---|---|---|
 | 5090 hardware profile | `gpu_probe.py` 和 `run_stage.sh` 仍要求 PRO 6000、至少 90 GiB | 当前 GPU 入口会直接拒绝 5090 |
 | Active experiment namespace | 当前 handoff/config inventory 仍以 4B 正式 profile 为准 | 2B 与旧 4B state 尚未隔离 |
@@ -108,9 +109,9 @@
 | 真实运行证据 | 仓库内没有 GPU 日志、checkpoint、capacity evidence 或正式 metrics package | 目前不能声称已在 5090 跑通或已有实验提升 |
 | 权威文档切换 | handoff 和 cloud README 仍指向 4B/PRO6000 与旧分支 | 候选 5090 方案尚未成为操作入口 |
 
-当前 `run_pipeline.sh` 明确只列出 CPU stages 和 `gpu-preflight -> g0 -> g1-step1 -> g1-resume2 -> g1-artifacts`；这与候选方案“当前一键流水线只到 G1”的判断一致。
+commit `36f7166` 的 `run_pipeline.sh` 只列出 CPU stages 和 `gpu-preflight -> g0 -> g1-step1 -> g1-resume2 -> g1-artifacts`；这与当时“一键流水线只到 G1”的判断一致。
 
-### 2.3 本次本地验证结果
+### 2.3 迁移前分析的本地验证结果
 
 本次分析没有安装 CUDA 训练依赖，也没有运行 GPU、网络下载或长训练。只做了与风险相称的静态和轻量验证：
 
@@ -183,7 +184,7 @@
 
 ---
 
-## 5. 增加 `compress_context` 工具的分析
+## 5. 增加 `compress_context` 工具的历史分析（当前不实施）
 
 ### 5.1 它不是当前代码上的“一行新增工具”
 
@@ -332,11 +333,11 @@ Agent 自由选择 update / recall / compress / answer
 - 一页架构图、README、known limitations、失败分析；
 - verified package 的 hashes 和复现实操命令。
 
-### Phase 6：工具与 L2 二选一（8/24 以后）
+### Phase 6：L2 或项目收尾（8/24 以后）
 
-- 面向 Agent 架构岗：优先做 Context Budget Manager + 小规模固定消融；
 - 面向科研复现且 C-B 已有可信趋势：可以选择 B/C80；
-- 不建议同时承担完整 compress-RL 和 L2。
+- 面向工程或 Agent 架构岗：优先整理状态机、恢复、trajectory、资源与失败证据；
+- 当前主线不承担任何新增工具；只在预算允许时进入 L2，否则以完整 L1 收尾。
 
 ---
 
@@ -344,16 +345,12 @@ Agent 自由选择 update / recall / compress / answer
 
 | 时间/门禁 | 停止条件 | 收尾方式 |
 |---|---|---|
-| T+7 天 | 2B/5090 CPU config、数据或测试仍不能稳定通过 | 冻结新云自动化和 compress，先修 baseline |
+| T+7 天 | 2B/5090 CPU config、数据或测试仍不能稳定通过 | 冻结范围，先修 baseline |
 | G1 | 连续两次出现同一类失败 | 切已验证底座或缩短声明范围，不无限排查 |
 | G2 | R0/R1 都失败 | 停止正式 B/C；发布容量边界，不偷改 dtype |
 | 预算 | L1 投影超过 GPU 450 / 总额 500 元 | 不启动 B/C40；用 L0 工程包收尾 |
 | Pilot | 固定样本未达到 `2/6` 非零 advantage | 发布 scientific-stop，不重抽 seed/样本 |
 | 8 月 16 日 | 尚未得到 B/C40 | 停止追严格 L1，整理 G1/G2 + prompted/小评测简历包 |
-| Compress pilot | 合法格式率 <85% | 不进 RL |
-| Compress pilot | 调用率 <5% 或 >80% | 动作没有可学习的有效分布，不进 RL |
-| Compress pilot | token 节省 <20% | 工具缺乏实际价值，不进 RL |
-| Compress pilot | 固定小评测下降 >2 个绝对百分点 | 只报告负结果，不扩大训练 |
 
 ---
 
@@ -379,7 +376,7 @@ Agent 自由选择 update / recall / compress / answer
 
 如果 C-B 为零或为负，就写“未观察到显著提升，并定位 2B/group4/单 seed 下的信号与容量边界”，不要把 secondary 指标替换成事后 primary。
 
-### 8.4 完成工具扩展后可以写什么
+### 8.4 未来独立工具项目的边界（不属于本次交付）
 
 只有在真实对照完成后才写：
 
@@ -427,15 +424,15 @@ Agent 自由选择 update / recall / compress / answer
 
 ### 如果目标是突出 Agent 架构
 
-先取得 baseline 证据，再增加一个**语义清晰、目标明确、可度量的 Context Budget Manager**。不要照搬 `compress_context(content)`，也不要从第一天把它并入 GRPO 主线。工具最合理的成功标准是 token/成本下降且精度损失可控，而不是一定提高 EM。
+当前决策是不增加工具。若未来另行立项，应先封存 baseline 证据，再在独立 profile 中设计语义清晰、目标明确、可度量的 Context Budget Manager；不得回写或污染本次 B/C 主实验。
 
 ### 一句话决策
 
-> 继续做；先把 5090/2B baseline 做成能跑、能恢复、能评测、能解释的简历项目，再把 compress 当作可失败的独立加分项。项目成功不要求论文式正向结果，但所有数字必须来自真实、可追溯的 evidence。
+> 继续做；把无新增工具的 5090/2B baseline 做成能跑、能恢复、能评测、能解释的简历项目。项目成功不要求论文式正向结果，但所有数字必须来自真实、可追溯的 evidence。
 
 ---
 
-## 11. 关键代码证据索引
+## 11. 迁移前基线的关键代码证据索引
 
 - 当前 5090 候选层级与声明边界：`docs/rtx5090_2b_reproduction_plan_zh.md:73`、`:102`、`:994`；
 - 当前实现只到 G0/G1：`scripts/cloud/run_pipeline.sh:146`、`:714`；

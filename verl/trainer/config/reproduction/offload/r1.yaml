@@ -1,0 +1,12 @@
+# @package _global_
+reproduction:
+  offload_profile: r1
+
+actor_rollout_ref:
+  actor:
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  ref:
+    fsdp_config:
+      param_offload: true

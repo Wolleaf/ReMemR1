@@ -68,6 +68,19 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.get("use_torch_compile", True)  #  use torch compile by default
             else verl_F.entropy_from_logits
         )
+        self._reproduction_logits_evidence = None
+
+    def _record_reproduction_logits(self, logits: torch.Tensor) -> None:
+        evidence = {
+            "bytes": logits.numel() * logits.element_size(),
+            "dtype": str(logits.dtype).removeprefix("torch."),
+            "element_size": logits.element_size(),
+            "numel": logits.numel(),
+            "shape": list(logits.shape),
+        }
+        previous = self._reproduction_logits_evidence
+        if previous is None or evidence["bytes"] > previous["bytes"]:
+            self._reproduction_logits_evidence = evidence
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -120,6 +133,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                 )  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                self._record_reproduction_logits(logits_rmpad)
 
                 logits_rmpad.div_(temperature)
 
@@ -158,6 +172,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                 )  # prevent model thinks we are generating
                 logits = output.logits
+                self._record_reproduction_logits(logits)
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch["responses"])

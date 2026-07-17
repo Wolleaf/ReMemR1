@@ -63,6 +63,7 @@ class FakeModel(torch.nn.Module):
         self.inside_summon = False
         self.emit_eos = True
         self.sample_from_rng = False
+        self.eos_token_ids = []
 
     def generate(
         self,
@@ -77,6 +78,7 @@ class FakeModel(torch.nn.Module):
     ):
         del attention_mask, pad_token_id, kwargs
         n = generation_config.num_return_sequences
+        self.eos_token_ids.append(eos_token_id)
         self.calls.append(
             {
                 "batch_size": input_ids.shape[0],
@@ -90,7 +92,7 @@ class FakeModel(torch.nn.Module):
         )
 
         prompts = input_ids.repeat_interleave(n, dim=0)
-        generated_length = min(max_new_tokens, 2)
+        generated_length = max_new_tokens if eos_token_id is None else min(max_new_tokens, 2)
         if self.sample_from_rng and do_sample:
             generated_length = max_new_tokens
             weights = torch.ones(
@@ -109,7 +111,7 @@ class FakeModel(torch.nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-        if self.emit_eos:
+        if self.emit_eos and eos_token_id is not None:
             generated[:, -1] = eos_token_id
         return types.SimpleNamespace(sequences=torch.cat([prompts, generated], dim=1))
 
@@ -274,6 +276,8 @@ def test_call_overrides_and_cpu_shapes(hf_module, monkeypatch):
     assert result.batch["position_ids"].shape == (1, 8)
     assert result.batch["responses"].tolist() == [[5, 9, 0, 0, 0]]
     assert result.batch["attention_mask"][0, -5:].tolist() == [1, 1, 0, 0, 0]
+    assert result.batch["generation_token_limit"].tolist() == [3]
+    assert result.batch["generation_reached_token_limit"].tolist() == [False]
 
 
 def test_non_divisible_batch_never_exceeds_micro_batch(hf_module):
@@ -307,6 +311,39 @@ def test_padding_after_max_tokens_is_masked_without_eos(hf_module):
 
     assert result.batch["responses"].tolist() == [[5, 5, 0, 0]]
     assert result.batch["attention_mask"][0, -4:].tolist() == [1, 1, 0, 0]
+    assert result.batch["generation_token_limit"].tolist() == [2]
+    assert result.batch["generation_reached_token_limit"].tolist() == [True]
+
+
+def test_length_stress_ignore_eos_forces_full_generation_and_masks_actual_tokens(
+    hf_module,
+):
+    model = FakeModel()
+    rollout = hf_module.HFRollout(model, make_config(ignore_eos=True))
+
+    result = rollout.generate_sequences(
+        make_prompts(hf_module, batch_size=1),
+        pad_to=5,
+        max_tokens=4,
+        n=1,
+    )
+
+    assert model.eos_token_ids == [None]
+    assert result.batch["responses"].tolist() == [[5, 5, 5, 5, 0]]
+    assert result.batch["attention_mask"][0, -5:].tolist() == [1, 1, 1, 1, 0]
+    assert result.batch["generation_token_limit"].tolist() == [4]
+    assert result.batch["generation_reached_token_limit"].tolist() == [True]
+
+
+def test_ignore_eos_rejects_non_boolean_config(hf_module):
+    rollout = hf_module.HFRollout(FakeModel(), make_config(ignore_eos="true"))
+
+    with pytest.raises(ValueError, match="ignore_eos must be a boolean"):
+        rollout.generate_sequences(
+            make_prompts(hf_module, batch_size=1),
+            max_tokens=2,
+            n=1,
+        )
 
 
 def test_call_level_n_expands_once_across_micro_batches(hf_module):

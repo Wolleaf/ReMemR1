@@ -40,11 +40,13 @@ def _manifest_for_files(tmp_path, file_specs, *, kind="dataset_source"):
                 "files": file_specs,
                 "kind": kind,
                 "repo_id": (
-                    "Qwen/Qwen3.5-4B" if kind == "model_and_tokenizer" else "owner/dataset"
+                    "Qwen/Qwen3.5-2B"
+                    if kind == "model_and_tokenizer"
+                    else "owner/dataset"
                 ),
                 "repo_type": "model" if kind == "model_and_tokenizer" else "dataset",
                 "revision": (
-                    qwen35.QWEN35_PINNED_REVISIONS["Qwen/Qwen3.5-4B"]
+                    qwen35.QWEN35_PINNED_REVISIONS["Qwen/Qwen3.5-2B"]
                     if kind == "model_and_tokenizer"
                     else "1" * 40
                 ),
@@ -59,18 +61,26 @@ def test_repository_asset_manifest_pins_models_and_source_hashes():
     manifest = assets.load_asset_manifest(ASSET_MANIFEST_PATH)
     indexed = {asset["asset_id"]: asset for asset in manifest["assets"]}
 
+    assert set(indexed) == {
+        "2wikimultihopqa-source",
+        "byted-hotpotqa-formal",
+        "hotpotqa-source",
+        "qwen35-08b-model-tokenizer",
+        "qwen35-2b-model-tokenizer",
+    }
+    assert all("4b" not in asset_id.casefold() for asset_id in indexed)
+
     assert {
         asset_id: indexed[asset_id]["revision"]
         for asset_id in (
             "qwen35-08b-model-tokenizer",
             "qwen35-2b-model-tokenizer",
-            "qwen35-4b-model-tokenizer",
         )
     } == {
         "qwen35-08b-model-tokenizer": "2fc06364715b967f1860aea9cf38778875588b17",
         "qwen35-2b-model-tokenizer": "15852e8c16360a2fea060d615a32b45270f8a8fc",
-        "qwen35-4b-model-tokenizer": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     }
+    assert "qwen35-4b-model-tokenizer" not in indexed
     assert indexed["hotpotqa-source"]["revision"] == "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
     assert indexed["2wikimultihopqa-source"]["revision"] == "bcafb8dd07d453be3cbeeeb3f78be1841bddf92c"
     assert {
@@ -204,7 +214,7 @@ def test_materialized_qwen_snapshot_manifest_is_loader_compatible(tmp_path):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     config_path = source_dir / "config.json"
-    weight_path = source_dir / "model.safetensors-00001-of-00002.safetensors"
+    weight_path = source_dir / "model.safetensors-00001-of-00001.safetensors"
     config_path.write_bytes(config_data)
     weight_path.write_bytes(weight_data)
     manifest = _manifest_for_files(
@@ -230,7 +240,7 @@ def test_materialized_qwen_snapshot_manifest_is_loader_compatible(tmp_path):
     snapshot = Path(report["assets"][0]["materialized_snapshot"]["path"])
     loader_evidence = qwen35.validate_qwen35_revision_source(
         snapshot,
-        qwen35.QWEN35_PINNED_REVISIONS["Qwen/Qwen3.5-4B"],
+        qwen35.QWEN35_PINNED_REVISIONS["Qwen/Qwen3.5-2B"],
     )
     assert report["status"] == "complete"
     assert loader_evidence.kind == "verified_snapshot_manifest"
