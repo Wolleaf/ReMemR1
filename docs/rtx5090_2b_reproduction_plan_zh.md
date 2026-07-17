@@ -145,16 +145,18 @@ GPU preflight 还要求恰好一张可见 GPU、启动时无其它 compute proce
 
 | 资源 | 最低 | 推荐 |
 |---|---:|---:|
-| CPU | 24 cores | 32 cores 或以上 |
-| CPU preparation RAM | 48 GiB | 64-96 GiB |
-| GPU host RAM（R0） | 96 GiB | 128 GiB |
+| CPU | 16 cores | 24-32 cores |
+| CPU preparation RAM | 48 GiB | 64-90 GiB |
+| GPU host RAM（R0） | 80 GiB | 90 GiB 或以上 |
 | GPU host RAM（R1） | 128 GiB | 160-192 GiB |
 | 持久盘可用空间 | 200 GiB | 250 GiB |
 | 系统 | Ubuntu 22.04 | 同左 |
 | Python | 3.12.2 持久隔离环境 | 同左 |
 
-offload、Ray 临时目录、checkpoint、模型 cache 和评测结果必须全部落在持久盘。禁止把显存压力转化为
-系统盘 swap 或 `/tmp/ray` 爆盘。R0 不应仅因实例 RAM 低于 128 GiB 被预先排除；R1 则必须满足更高
+CPU 和 RAM 门禁均取宿主可见资源与 cgroup quota/cpuset/memory limit 的有效较小值。标准
+AutoDL 标称 `16 cores / 90 GB`（十进制 90 GB 约为 83.8 GiB）的 5090 实例可进入 R0，但不能据此预设训练一定通过。offload、Ray 临时目录、
+checkpoint、模型 cache 和评测结果必须全部落在持久盘。禁止把显存压力转化为系统盘 swap 或
+`/tmp/ray` 爆盘。R0 不应仅因实例 RAM 低于 128 GiB 被预先排除；R1 则必须满足更高
 RAM 门禁，并在 G2 中证明峰值低于可用内存 80%、无 swap 和无持续 page-fault 抖动。
 
 ### 2.3 自动关机与计费边界
@@ -816,7 +818,7 @@ inventory、G2/B/C DAG、matrix dispatcher、跨 cell 配对校验、聚合和 v
 | 权威文档 | 评审通过后将本方案提升为权威，并更新 handoff/README |
 | Profile namespace | 将 active profile ID 纳入 persistent root、pipeline identity、handoff 和 output 路径，隔离旧 4B state |
 | Hardware profile | 严格验证 RTX 5090、单卡、>=31 GiB、sm_120/CUDA13、无其它 compute process、启动空闲显存 >=29 GiB |
-| Host resources | CPU preflight 新增 >=24 cores、>=48 GiB RAM、初始 >=200 GiB 持久盘；每个 GPU phase 重验 profile RAM 和“预计写入量 + 终态 reserve”的剩余盘 |
+| Host resources | CPU preflight 新增 >=16 cores、>=48 GiB RAM、初始 >=200 GiB 持久盘；每个 GPU phase 按 cgroup 有效配额重验 CPU、profile RAM 和“预计写入量 + 终态 reserve”的剩余盘 |
 | Asset profile | 新建仅含 0.8B、2B 和所需数据的 active manifest；旧含 4B manifest 留在 inactive profile，不能在旧 manifest 中运行时跳过 4B |
 | Formal bundles | 在 2B namespace 使用固定 2B tokenizer identity 重建 train/validation/eval，并单独封存 non-scientific length-stress bundle；不能沿用 4B identity |
 | Config/handoff | resolver 封存 33 份 active resolved configs；handoff 对 profile、config 和 asset exact-key 校验 |

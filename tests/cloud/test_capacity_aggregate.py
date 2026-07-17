@@ -300,7 +300,7 @@ def _handoff_fixture(path: Path, index_path: Path):
     return handoff
 
 
-def _gpu_fixture(pipeline: Path, profile="r0"):
+def _gpu_fixture(pipeline: Path, profile="r0", host_memory_gib=128):
     evidence_path = pipeline / "gpu-evidence" / "causal-conv1d" / "bf16-forward.json"
     hardware = {
         "capacity_profile": profile.upper(),
@@ -313,7 +313,7 @@ def _gpu_fixture(pipeline: Path, profile="r0"):
         "gpu_total_memory_bytes": 32 * GIB,
         "gpu_uuid": "GPU-test-uuid",
         "host_cpu_count": 32,
-        "host_total_memory_bytes": 128 * GIB,
+        "host_total_memory_bytes": host_memory_gib * GIB,
         "other_compute_process_count": 0,
         "persistent_disk_free_bytes": 250 * GIB,
         "persistent_disk_probe_path": str(pipeline),
@@ -366,6 +366,20 @@ def _gpu_fixture(pipeline: Path, profile="r0"):
     build = {**unsigned, "build_info_sha256": aggregate._canonical_sha256(unsigned)}
     _write_json(pipeline / "build-info.json", build, canonical=False)
     return evidence_path
+
+
+def test_gpu_evidence_enforces_profile_specific_host_ram(tmp_path):
+    accepted = _gpu_fixture(tmp_path / "accepted", "r0", host_memory_gib=80)
+    _, _, hardware = aggregate._load_gpu_evidence(accepted, "r0")
+    assert hardware["host_total_memory_bytes"] == 80 * GIB
+
+    rejected_r0 = _gpu_fixture(tmp_path / "rejected-r0", "r0", host_memory_gib=79)
+    with pytest.raises(aggregate.CapacityAggregateError, match="GPU host total memory"):
+        aggregate._load_gpu_evidence(rejected_r0, "r0")
+
+    rejected_r1 = _gpu_fixture(tmp_path / "rejected-r1", "r1", host_memory_gib=127)
+    with pytest.raises(aggregate.CapacityAggregateError, match="GPU host total memory"):
+        aggregate._load_gpu_evidence(rejected_r1, "r1")
 
 
 def _scientific(**overrides):
@@ -440,7 +454,7 @@ def _step(step, config_id, config_sha, attempt_id, *, scientific):
     }
 
 
-def _aggregate_fixture(tmp_path: Path, profile="r0"):
+def _aggregate_fixture(tmp_path: Path, profile="r0", host_memory_gib=128):
     pipeline = tmp_path / "pipeline"
     generation = "base" if profile == "r0" else f"approval-{'1' * 64}-budget-{'f' * 64}"
     stages = pipeline / "stages" / "gpu-capacity" / profile / generation
@@ -448,7 +462,7 @@ def _aggregate_fixture(tmp_path: Path, profile="r0"):
     runs = tmp_path / "runs"
     index_path, index = _index_fixture(tmp_path)
     handoff = _handoff_fixture(pipeline / "cpu-handoff.json", index_path)
-    gpu_path = _gpu_fixture(pipeline, profile)
+    gpu_path = _gpu_fixture(pipeline, profile, host_memory_gib=host_memory_gib)
     specs = {
         "g2a": ("g2a", "g2a.run", (1,)),
         "g2b-step1": ("g2b-step1", "g2b-step1.run", (1,)),
@@ -710,8 +724,17 @@ def test_target_identity_cli_builds_r1_authority_before_r1_attempts(
     assert output.read_bytes() == _canonical(identity) + b"\n"
 
 
-def _capacity_stop_fixture(tmp_path: Path, stopped_stage="g2a", profile="r0"):
-    kwargs, ledgers = _aggregate_fixture(tmp_path, profile)
+def _capacity_stop_fixture(
+    tmp_path: Path,
+    stopped_stage="g2a",
+    profile="r0",
+    host_memory_gib=128,
+):
+    kwargs, ledgers = _aggregate_fixture(
+        tmp_path,
+        profile,
+        host_memory_gib=host_memory_gib,
+    )
     runtime_stage = (
         "g2-length-stress" if stopped_stage == "length-stress" else stopped_stage
     )
@@ -816,6 +839,15 @@ def test_capacity_stop_finalizes_only_trusted_r0_oom(tmp_path):
     )
     assert evidence["classification"]["r1_eligible"] is True
     assert evidence["classification"]["eligibility_reason"] == "oom"
+
+
+def test_capacity_stop_without_step_records_accepts_r0_80_gib_hardware(tmp_path):
+    kwargs, _, _, _ = _capacity_stop_fixture(tmp_path, host_memory_gib=80)
+    outputs = aggregate.aggregate_capacity_stop(**kwargs)
+
+    telemetry = outputs["telemetry.json"]
+    assert telemetry["steps"] == []
+    assert telemetry["host_total_memory_bytes"] == 80 * GIB
 
 
 def test_r1_capacity_stop_is_canonical_but_never_authorizes_another_profile(

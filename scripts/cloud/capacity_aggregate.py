@@ -515,7 +515,7 @@ def _load_gpu_evidence(
         require_observed_profile and observed_profile != profile.upper()
     ):
         raise CapacityAggregateError("GPU evidence offload profile drifted")
-    required_host_memory = (96 if observed_profile == "R0" else 128) * GIB
+    required_host_memory = (80 if observed_profile == "R0" else 128) * GIB
     _integer(
         hardware["host_total_memory_bytes"],
         "GPU host total memory",
@@ -1663,7 +1663,7 @@ def _merge_capacity_stop_telemetry(
             else _integer(
                 hardware["host_total_memory_bytes"],
                 "GPU evidence host total memory",
-                minimum=96 * GIB,
+                minimum=(80 if identity["selected_profile"] == "R0" else 128) * GIB,
             )
         ),
         "identity": dict(identity),

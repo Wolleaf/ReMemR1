@@ -614,7 +614,7 @@ case "${STAGE}" in
             echo "CPU preparation requires at least ${min_free_gib} GiB free on the persistent volume" >&2
             exit 1
         }
-        min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-24}"
+        min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-16}"
         [[ "${min_cpu_cores}" =~ ^[0-9]+$ && "${min_cpu_cores}" -gt 0 ]] || {
             echo "REMEMR1_MIN_CPU_CORES must be a positive integer" >&2
             exit 2

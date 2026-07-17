@@ -102,6 +102,23 @@ def _query_single_gpu_nvml_memory():
     }
 
 
+def _create_reproduction_host_memory_probe():
+    # Keep cloud-only probing lazy so ordinary verl deployments still import this worker.
+    from scripts.cloud.host_resource_probe import create_memory_telemetry_probe
+
+    host = psutil.virtual_memory()
+    return create_memory_telemetry_probe(host_total_memory_bytes=host.total)
+
+
+def _sample_reproduction_host_memory(probe):
+    host = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    return probe.sample(
+        fallback_used_memory_bytes=host.used,
+        fallback_swap_used_bytes=swap.used,
+    )
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -885,8 +902,8 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.reset_peak_memory_stats()
         self.actor._reproduction_logits_evidence = None
         initial = _query_single_gpu_nvml_memory()
-        host = psutil.virtual_memory()
-        swap = psutil.swap_memory()
+        host_memory_probe = _create_reproduction_host_memory_probe()
+        host = _sample_reproduction_host_memory(host_memory_probe)
         stop_event = threading.Event()
         started = time.monotonic()
         state = {
@@ -896,6 +913,7 @@ class ActorRolloutRefWorker(Worker):
             "error": None,
             "gpu_uuid": initial["gpu_uuid"],
             "host_peak_used_bytes": host.used,
+            "host_memory_probe": host_memory_probe,
             "lock": threading.Lock(),
             "nvml_peak_used_bytes": initial["used_bytes"],
             "nvml_total_bytes": initial["total_bytes"],
@@ -903,12 +921,12 @@ class ActorRolloutRefWorker(Worker):
             "phase_name": _REPRODUCTION_TELEMETRY_PHASES[0],
             "phase_nvml_peak_used_bytes": initial["used_bytes"],
             "phase_started_monotonic": started,
-            "phase_swap_peak_used_bytes": swap.used,
+            "phase_swap_peak_used_bytes": host.swap_used,
             "phases": [],
             "sample_nvml": sample_nvml,
             "started_monotonic": started,
             "stop_event": stop_event,
-            "swap_peak_used_bytes": swap.used,
+            "swap_peak_used_bytes": host.swap_used,
         }
 
         def sample():
@@ -920,8 +938,11 @@ class ActorRolloutRefWorker(Worker):
                         or observed["total_bytes"] != state["nvml_total_bytes"]
                     ):
                         raise RuntimeError("GPU identity changed during telemetry sampling")
-                    host_used = psutil.virtual_memory().used
-                    swap_used = psutil.swap_memory().used
+                    host = _sample_reproduction_host_memory(
+                        state["host_memory_probe"]
+                    )
+                    host_used = host.used
+                    swap_used = host.swap_used
                     with state["lock"]:
                         state["nvml_peak_used_bytes"] = max(
                             state["nvml_peak_used_bytes"], observed["used_bytes"]
@@ -964,8 +985,7 @@ class ActorRolloutRefWorker(Worker):
             or observed["total_bytes"] != state["nvml_total_bytes"]
         ):
             raise RuntimeError("GPU identity changed during telemetry sampling")
-        host = psutil.virtual_memory()
-        swap = psutil.swap_memory()
+        host = _sample_reproduction_host_memory(state["host_memory_probe"])
         ended = time.monotonic()
         with state["lock"]:
             state["nvml_peak_used_bytes"] = max(
@@ -975,7 +995,7 @@ class ActorRolloutRefWorker(Worker):
                 state["host_peak_used_bytes"], host.used
             )
             state["swap_peak_used_bytes"] = max(
-                state["swap_peak_used_bytes"], swap.used
+                state["swap_peak_used_bytes"], host.swap_used
             )
             phase = {
                 "duration_seconds": ended - state["phase_started_monotonic"],
@@ -991,11 +1011,11 @@ class ActorRolloutRefWorker(Worker):
                 "post_allocated_bytes": torch.cuda.memory_allocated(),
                 "post_reserved_bytes": torch.cuda.memory_reserved(),
                 "swap_peak_used_bytes": max(
-                    state["phase_swap_peak_used_bytes"], swap.used
+                    state["phase_swap_peak_used_bytes"], host.swap_used
                 ),
             }
             state["phases"].append(phase)
-        return observed, host, swap
+        return observed, host
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def advance_reproduction_step_telemetry(self, next_phase):
@@ -1013,14 +1033,14 @@ class ActorRolloutRefWorker(Worker):
             raise RuntimeError(
                 f"telemetry phase transition must be {expected_current}->{expected_next}"
             )
-        observed, host, swap = self._close_reproduction_telemetry_phase(state)
+        observed, host = self._close_reproduction_telemetry_phase(state)
         torch.cuda.reset_peak_memory_stats()
         with state["lock"]:
             state["phase_name"] = next_phase
             state["phase_started_monotonic"] = time.monotonic()
             state["phase_nvml_peak_used_bytes"] = observed["used_bytes"]
             state["phase_host_peak_used_bytes"] = host.used
-            state["phase_swap_peak_used_bytes"] = swap.used
+            state["phase_swap_peak_used_bytes"] = host.swap_used
         return {"phase": expected_current, "rank": self.rank, "status": "sealed"}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1037,7 +1057,7 @@ class ActorRolloutRefWorker(Worker):
             state["thread"].join(timeout=10)
             if state["thread"].is_alive():
                 raise RuntimeError("NVML telemetry sampler did not stop")
-        final, host, swap = self._close_reproduction_telemetry_phase(state)
+        final, host = self._close_reproduction_telemetry_phase(state)
         error = state["error"]
         self._reproduction_telemetry_sampler = None
         if error is not None:
@@ -1074,7 +1094,9 @@ class ActorRolloutRefWorker(Worker):
             "reference_logits": None,
             "role": "actor",
             "step_wall_seconds": time.monotonic() - state["started_monotonic"],
-            "swap_used_bytes": max(state["swap_peak_used_bytes"], swap.used),
+            "swap_used_bytes": max(
+                state["swap_peak_used_bytes"], host.swap_used
+            ),
             "world_size": self.world_size,
         }
 
@@ -1106,7 +1128,9 @@ class ActorRolloutRefWorker(Worker):
         if logits is None:
             raise RuntimeError("reference worker produced no logits evidence")
         gpu = _query_single_gpu_nvml_memory()
-        host = psutil.virtual_memory()
+        host = _sample_reproduction_host_memory(
+            _create_reproduction_host_memory_probe()
+        )
         self._reproduction_reference_logits_pending = False
         zero_phases = [
             {

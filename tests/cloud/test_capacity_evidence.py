@@ -287,6 +287,39 @@ def test_green_r0_capacity_profile_is_self_hashed_and_verifiable():
         capacity.verify_capacity_profile(tampered)
 
 
+def test_capacity_evidence_enforces_profile_specific_host_ram():
+    r0_identity, r0_configs = _identity("R0")
+    r0_telemetry = _telemetry(r0_identity)
+    r0_telemetry["host_total_memory_bytes"] = 80 * GIB
+    evidence = capacity.create_capacity_evidence(
+        identity=r0_identity,
+        telemetry=r0_telemetry,
+        attempt_metadata=_attempt_metadata(r0_identity, r0_configs),
+        selected_configs=r0_configs,
+    )
+    assert evidence["telemetry_sha256"] == capacity.canonical_sha256(r0_telemetry)
+
+    r0_telemetry["host_total_memory_bytes"] = 80 * GIB - 1
+    with pytest.raises(capacity.CapacityEvidenceError, match="R0 telemetry"):
+        capacity.create_capacity_evidence(
+            identity=r0_identity,
+            telemetry=r0_telemetry,
+            attempt_metadata=_attempt_metadata(r0_identity, r0_configs),
+            selected_configs=r0_configs,
+        )
+
+    r1_identity, r1_configs = _identity("R1")
+    r1_telemetry = _telemetry(r1_identity)
+    r1_telemetry["host_total_memory_bytes"] = 128 * GIB - 1
+    with pytest.raises(capacity.CapacityEvidenceError, match="R1 telemetry"):
+        capacity.create_capacity_evidence(
+            identity=r1_identity,
+            telemetry=r1_telemetry,
+            attempt_metadata=_attempt_metadata(r1_identity, r1_configs),
+            selected_configs=r1_configs,
+        )
+
+
 def test_capacity_thresholds_cover_green_yellow_and_red_boundaries():
     identity, _ = _identity("R0")
     telemetry = _telemetry(identity)

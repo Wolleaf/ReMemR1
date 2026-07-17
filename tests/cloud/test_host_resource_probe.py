@@ -6,6 +6,7 @@ from scripts.cloud.host_resource_probe import (
     GIB,
     ProbeError,
     check_minimums,
+    create_memory_telemetry_probe,
     probe_resources,
 )
 
@@ -32,11 +33,13 @@ def _v2_fixture(
     memory_max: str = "max",
     cpu_max: str = "max 100000",
     cpuset: str = "0-31",
+    ram_gib: int = 64,
 ) -> None:
     _base_proc(
         root,
         "0::/\n",
         "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        ram_gib=ram_gib,
     )
     _write(root, "/sys/fs/cgroup/memory.max", memory_max + "\n")
     _write(root, "/sys/fs/cgroup/cpu.max", cpu_max + "\n")
@@ -73,6 +76,28 @@ def test_v2_half_core_and_two_gib_fail_both_minimums(tmp_path):
     assert len(violations) == 2
     assert "500 millicores" in violations[0]
     assert "2147483648 bytes" in violations[1]
+
+
+def test_active_profile_accepts_16_cores_and_90_gb_but_rejects_15_cores(tmp_path):
+    _v2_fixture(
+        tmp_path / "accepted",
+        memory_max=str(90_000_000_000),
+        cpuset="0-15",
+        ram_gib=90,
+    )
+    accepted = probe_resources(tmp_path / "accepted", host_cpu_count=16)
+    assert check_minimums(accepted, min_cpu_cores=16, min_ram_gib=48) == []
+
+    _v2_fixture(
+        tmp_path / "rejected",
+        memory_max=str(90 * GIB),
+        cpuset="0-14",
+        ram_gib=90,
+    )
+    rejected = probe_resources(tmp_path / "rejected", host_cpu_count=16)
+    violations = check_minimums(rejected, min_cpu_cores=16, min_ram_gib=48)
+    assert len(violations) == 1
+    assert "requires at least 16 effective CPU cores" in violations[0]
 
 
 def test_cpuset_is_counted_without_double_counting_overlaps(tmp_path):
@@ -117,6 +142,128 @@ def test_v1_memory_cpu_and_cpuset_fallback(tmp_path):
     assert check_minimums(result, min_cpu_cores=24, min_ram_gib=48) == []
 
 
+def test_v2_telemetry_uses_limiting_ancestor_counters_over_host_fallback(tmp_path):
+    _base_proc(
+        tmp_path,
+        "0::/parent/job\n",
+        "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        ram_gib=256,
+    )
+    _write(tmp_path, "/sys/fs/cgroup/memory.max", str(200 * GIB))
+    _write(tmp_path, "/sys/fs/cgroup/parent/memory.max", str(90 * GIB))
+    _write(tmp_path, "/sys/fs/cgroup/parent/job/memory.max", "max\n")
+    current = _write(
+        tmp_path,
+        "/sys/fs/cgroup/parent/memory.current",
+        str(61 * GIB),
+    )
+    _write(tmp_path, "/sys/fs/cgroup/parent/memory.swap.current", str(3 * GIB))
+
+    probe = create_memory_telemetry_probe(
+        tmp_path,
+        host_total_memory_bytes=256 * GIB,
+    )
+    first = probe.sample(
+        fallback_used_memory_bytes=180 * GIB,
+        fallback_swap_used_bytes=12 * GIB,
+    )
+
+    assert probe.cgroup_mode == "v2"
+    assert first.total == 90 * GIB
+    assert first.used == 61 * GIB
+    assert first.swap_used == 3 * GIB
+
+    current.write_text(str(62 * GIB), encoding="ascii")
+    second = probe.sample(
+        fallback_used_memory_bytes=181 * GIB,
+        fallback_swap_used_bytes=13 * GIB,
+    )
+    assert second.used == 62 * GIB
+
+
+def test_v1_telemetry_derives_swap_from_memsw_over_host_fallback(tmp_path):
+    _base_proc(
+        tmp_path,
+        "5:memory:/job\n",
+        "29 23 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+        ram_gib=192,
+    )
+    _write(
+        tmp_path,
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        str(2**63 - 4096),
+    )
+    _write(
+        tmp_path,
+        "/sys/fs/cgroup/memory/job/memory.limit_in_bytes",
+        str(96 * GIB),
+    )
+    _write(
+        tmp_path,
+        "/sys/fs/cgroup/memory/job/memory.usage_in_bytes",
+        str(70 * GIB),
+    )
+    _write(
+        tmp_path,
+        "/sys/fs/cgroup/memory/job/memory.memsw.usage_in_bytes",
+        str(72 * GIB),
+    )
+
+    probe = create_memory_telemetry_probe(
+        tmp_path,
+        host_total_memory_bytes=192 * GIB,
+    )
+    snapshot = probe.sample(
+        fallback_used_memory_bytes=150 * GIB,
+        fallback_swap_used_bytes=11 * GIB,
+    )
+
+    assert probe.cgroup_mode == "v1"
+    assert snapshot.total == 96 * GIB
+    assert snapshot.used == 70 * GIB
+    assert snapshot.swap_used == 2 * GIB
+
+
+def test_memory_telemetry_uses_host_values_without_a_cgroup(tmp_path):
+    _base_proc(tmp_path, "", "", ram_gib=128)
+
+    probe = create_memory_telemetry_probe(
+        tmp_path,
+        host_total_memory_bytes=128 * GIB,
+    )
+    snapshot = probe.sample(
+        fallback_used_memory_bytes=40 * GIB,
+        fallback_swap_used_bytes=1 * GIB,
+    )
+
+    assert probe.cgroup_mode == "none"
+    assert snapshot.total == 128 * GIB
+    assert snapshot.used == 40 * GIB
+    assert snapshot.swap_used == 1 * GIB
+
+
+def test_cgroup_telemetry_fails_closed_without_a_swap_counter(tmp_path):
+    _base_proc(
+        tmp_path,
+        "0::/job\n",
+        "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
+        ram_gib=128,
+    )
+    _write(tmp_path, "/sys/fs/cgroup/memory.max", str(128 * GIB))
+    _write(tmp_path, "/sys/fs/cgroup/job/memory.max", str(90 * GIB))
+    _write(tmp_path, "/sys/fs/cgroup/job/memory.current", str(40 * GIB))
+
+    probe = create_memory_telemetry_probe(
+        tmp_path,
+        host_total_memory_bytes=128 * GIB,
+    )
+    with pytest.raises(ProbeError, match="swap usage counter is unavailable"):
+        probe.sample(
+            fallback_used_memory_bytes=50 * GIB,
+            fallback_swap_used_bytes=0,
+        )
+
+
 def test_malformed_limit_fails_closed(tmp_path):
     _v2_fixture(tmp_path, cpu_max="not-a-quota")
 
@@ -140,7 +287,7 @@ def test_cpu_preflight_uses_probe_with_profile_defaults():
     )
     preflight = source.split("    cpu-preflight)", 1)[1].split("        ;;", 1)[0]
 
-    assert 'min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-24}"' in preflight
+    assert 'min_cpu_cores="${REMEMR1_MIN_CPU_CORES:-16}"' in preflight
     assert 'min_ram_gib="${REMEMR1_MIN_RAM_GIB:-48}"' in preflight
     assert "python3 scripts/cloud/host_resource_probe.py" in preflight
     assert preflight.index("run_logged checkout") < preflight.index("host-resource-preflight")

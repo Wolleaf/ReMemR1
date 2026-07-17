@@ -686,7 +686,7 @@ def create_capacity_evidence(
                 raise CapacityEvidenceError(
                     f"telemetry.steps[{index}] total VRAM drifted from GPU identity"
                 )
-    required_host_ram = (96 if profile == "R0" else 128) * GIB
+    required_host_ram = (80 if profile == "R0" else 128) * GIB
     observed_host_ram = telemetry_mapping.get("host_total_memory_bytes")
     if (
         isinstance(observed_host_ram, bool)

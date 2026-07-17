@@ -397,6 +397,76 @@ def test_worker_and_trainer_wire_reset_collect_around_the_optimizer_loop():
     )
 
 
+def test_worker_resource_evidence_routes_host_memory_through_cgroup_probe():
+    root = Path(__file__).resolve().parents[2]
+    worker_tree = ast.parse(
+        (root / "verl" / "workers" / "fsdp_workers.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    worker_class = next(
+        node
+        for node in worker_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker"
+    )
+    telemetry_methods = {
+        node.name: node
+        for node in worker_class.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "reset_reproduction_step_telemetry",
+            "advance_reproduction_step_telemetry",
+            "collect_reproduction_step_telemetry",
+            "_close_reproduction_telemetry_phase",
+            "collect_reproduction_reference_logits",
+        }
+    }
+
+    assert set(telemetry_methods) == {
+        "reset_reproduction_step_telemetry",
+        "advance_reproduction_step_telemetry",
+        "collect_reproduction_step_telemetry",
+        "_close_reproduction_telemetry_phase",
+        "collect_reproduction_reference_logits",
+    }
+    direct_sampling_methods = {
+        "reset_reproduction_step_telemetry",
+        "_close_reproduction_telemetry_phase",
+        "collect_reproduction_reference_logits",
+    }
+    assert all(
+        any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_sample_reproduction_host_memory"
+            for node in ast.walk(telemetry_methods[name])
+        )
+        for name in direct_sampling_methods
+    )
+    assert all(
+        any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_close_reproduction_telemetry_phase"
+            for node in ast.walk(telemetry_methods[name])
+        )
+        for name in {
+            "advance_reproduction_step_telemetry",
+            "collect_reproduction_step_telemetry",
+        }
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "psutil"
+        and node.func.attr in {"virtual_memory", "swap_memory"}
+        for method in telemetry_methods.values()
+        for node in ast.walk(method)
+    )
+
+
 def test_telemetry_rejects_reference_resource_double_counting():
     reference = _worker("reference")
     reference["peak_allocated_bytes"] = 2 * 1024**3

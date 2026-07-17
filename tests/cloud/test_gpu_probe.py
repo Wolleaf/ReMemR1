@@ -1,5 +1,6 @@
 import hashlib
 import json
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +80,49 @@ def test_rtx5090_preflight_accepts_injected_r0_and_r1_profiles():
 
     result = _probe_with(torch_module, smi, resources, profile="R1")
     assert result["capacity_profile"] == "R1"
+
+
+def test_rtx5090_r0_accepts_autodl_16_core_90_gb_profile():
+    torch_module, smi, resources = _hardware_inputs()
+    resources.update(
+        host_cpu_count=16,
+        host_total_memory_bytes=90_000_000_000,
+    )
+
+    result = _probe_with(torch_module, smi, resources, profile="R0")
+
+    assert result["host_cpu_count"] == 16
+    assert result["host_total_memory_bytes"] == 90_000_000_000
+
+
+def test_rtx5090_r0_rejects_15_cores_and_less_than_80_gib():
+    torch_module, smi, resources = _hardware_inputs()
+    resources.update(
+        host_cpu_count=15,
+        host_total_memory_bytes=90 * 1024**3,
+    )
+    with pytest.raises(gpu_probe.ProbeError, match="at least 16 host CPU cores"):
+        _probe_with(torch_module, smi, resources, profile="R0")
+
+    resources.update(
+        host_cpu_count=16,
+        host_total_memory_bytes=80 * 1024**3 - 1,
+    )
+    with pytest.raises(gpu_probe.ProbeError, match="R0 requires at least 80 GiB"):
+        _probe_with(torch_module, smi, resources, profile="R0")
+
+
+def test_gpu_host_inventory_uses_cgroup_effective_resources(tmp_path):
+    result = gpu_probe._host_resources(
+        tmp_path,
+        resource_probe=lambda: SimpleNamespace(
+            effective_cpu_cores=Fraction(33, 2),
+            effective_memory_bytes=90 * 1024**3,
+        ),
+    )
+
+    assert result["host_cpu_count"] == 16
+    assert result["host_total_memory_bytes"] == 90 * 1024**3
 
 
 @pytest.mark.parametrize(
@@ -234,6 +278,23 @@ def test_existing_gpu_evidence_rehashes_files_and_matches_driver(tmp_path, monke
         hardware_probe=lambda: hardware,
     )
     assert result["status"] == "verified-existing"
+
+    r1_hardware = {
+        **hardware,
+        "capacity_profile": "R1",
+        "host_total_memory_bytes": 160 * 1024**3,
+    }
+    with pytest.raises(gpu_probe.ProbeError, match="evidence identity changed"):
+        gpu_probe.verify_existing_evidence(
+            root,
+            evidence_root,
+            build_log,
+            freeze,
+            build_info_path,
+            minimum_optimizer_steps=20,
+            profile="R1",
+            hardware_probe=lambda: r1_hardware,
+        )
 
     (evidence_root / "causal-conv1d" / "bf16-forward.json").write_text(
         "{}", encoding="ascii"

@@ -80,6 +80,60 @@ class ResourceProbe:
         }
 
 
+@dataclass(frozen=True)
+class MemoryTelemetrySnapshot:
+    total: int
+    used: int
+    swap_used: int
+
+
+@dataclass(frozen=True)
+class MemoryTelemetryProbe:
+    """Resolved memory counters that can be sampled without rescanning cgroups."""
+
+    cgroup_mode: str
+    total_memory_bytes: int
+    memory_usage_path: Optional[Path]
+    swap_usage_path: Optional[Path]
+    swap_usage_includes_memory: bool
+
+    def sample(
+        self,
+        *,
+        fallback_used_memory_bytes: int,
+        fallback_swap_used_bytes: int,
+    ) -> MemoryTelemetrySnapshot:
+        fallback_used = _nonnegative_int(
+            fallback_used_memory_bytes,
+            "fallback used memory",
+        )
+        fallback_swap = _nonnegative_int(
+            fallback_swap_used_bytes,
+            "fallback swap used",
+        )
+        if self.memory_usage_path is None:
+            return MemoryTelemetrySnapshot(
+                total=self.total_memory_bytes,
+                used=fallback_used,
+                swap_used=fallback_swap,
+            )
+
+        used = _read_counter(self.memory_usage_path, "cgroup memory usage")
+        if self.swap_usage_path is None:
+            raise ProbeError("cgroup swap usage counter is unavailable")
+        raw_swap = _read_counter(self.swap_usage_path, "cgroup swap usage")
+        swap_used = (
+            max(0, raw_swap - used)
+            if self.swap_usage_includes_memory
+            else raw_swap
+        )
+        return MemoryTelemetrySnapshot(
+            total=self.total_memory_bytes,
+            used=used,
+            swap_used=swap_used,
+        )
+
+
 def _unescape_mount_path(value: str) -> str:
     for encoded, decoded in (
         ("\\040", " "),
@@ -208,6 +262,19 @@ def _read_optional(path: Path, description: str) -> Optional[str]:
         return None
     except (OSError, UnicodeError) as error:
         raise ProbeError("cannot read %s (%s): %s" % (description, path, error)) from error
+
+
+def _nonnegative_int(value: object, description: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProbeError("%s must be a non-negative integer" % description)
+    return value
+
+
+def _read_counter(path: Path, description: str) -> int:
+    value = _read_required(path, description).strip()
+    if not value.isdigit():
+        raise ProbeError("malformed %s in %s" % (description, path))
+    return int(value)
 
 
 def _mount_target(mount: MountInfo, membership: PurePosixPath) -> PurePosixPath:
@@ -401,6 +468,147 @@ def _detect_host_cpu_count() -> int:
     if not counts:
         raise ProbeError("cannot determine the host CPU count")
     return min(counts)
+
+
+def _memory_usage_directory(
+    target: PurePosixPath,
+    memory_limit: Optional[int],
+    memory_limit_source: str,
+) -> PurePosixPath:
+    if memory_limit is None:
+        return target
+    return PurePosixPath(memory_limit_source).parent
+
+
+def _optional_counter_path(
+    filesystem_root: Path,
+    candidates: Sequence[PurePosixPath],
+) -> Optional[Path]:
+    for logical_path in candidates:
+        path = _rooted(filesystem_root, logical_path)
+        if _read_optional(path, str(logical_path)) is not None:
+            return path
+    return None
+
+
+def create_memory_telemetry_probe(
+    filesystem_root: Path = Path("/"),
+    host_total_memory_bytes: Optional[int] = None,
+) -> MemoryTelemetryProbe:
+    """Resolve cgroup memory counters, with host values reserved for fallback."""
+
+    if host_total_memory_bytes is None:
+        meminfo = _read_required(
+            _rooted(filesystem_root, PurePosixPath("/proc/meminfo")),
+            "/proc/meminfo",
+        )
+        host_total_memory_bytes = parse_memtotal(meminfo)
+    host_total = _nonnegative_int(host_total_memory_bytes, "host total memory")
+    if host_total == 0:
+        raise ProbeError("host total memory must be positive")
+
+    membership = parse_membership(
+        _read_required(
+            _rooted(filesystem_root, PurePosixPath("/proc/self/cgroup")),
+            "/proc/self/cgroup",
+        )
+    )
+    if membership.unified is not None and membership.controllers:
+        mode = "hybrid"
+    elif membership.unified is not None:
+        mode = "v2"
+    elif membership.controllers:
+        mode = "v1"
+    else:
+        return MemoryTelemetryProbe(
+            cgroup_mode="none",
+            total_memory_bytes=host_total,
+            memory_usage_path=None,
+            swap_usage_path=None,
+            swap_usage_includes_memory=False,
+        )
+
+    mounts = parse_mountinfo(
+        _read_required(
+            _rooted(filesystem_root, PurePosixPath("/proc/self/mountinfo")),
+            "/proc/self/mountinfo",
+        )
+    )
+    if "memory" in membership.controllers:
+        mount, target = _mount_for(
+            mounts,
+            membership.controllers["memory"],
+            "cgroup",
+            "memory",
+        )
+        memory_limit, memory_source = _collect_v1_memory(
+            filesystem_root,
+            mount,
+            target,
+        )
+        usage_directory = _memory_usage_directory(
+            target,
+            memory_limit,
+            memory_source,
+        )
+        memory_usage_path = _rooted(
+            filesystem_root,
+            usage_directory / "memory.usage_in_bytes",
+        )
+        direct_swap_path = _optional_counter_path(
+            filesystem_root,
+            (usage_directory / "memory.swap.usage_in_bytes",),
+        )
+        if direct_swap_path is not None:
+            swap_usage_path = direct_swap_path
+            swap_includes_memory = False
+        else:
+            swap_usage_path = _optional_counter_path(
+                filesystem_root,
+                (usage_directory / "memory.memsw.usage_in_bytes",),
+            )
+            swap_includes_memory = swap_usage_path is not None
+    elif membership.unified is not None:
+        mount, target = _mount_for(mounts, membership.unified, "cgroup2")
+        memory_limit, memory_source = _collect_v2_memory(
+            filesystem_root,
+            mount,
+            target,
+        )
+        usage_directory = _memory_usage_directory(
+            target,
+            memory_limit,
+            memory_source,
+        )
+        memory_usage_path = _rooted(
+            filesystem_root,
+            usage_directory / "memory.current",
+        )
+        swap_usage_path = _optional_counter_path(
+            filesystem_root,
+            (usage_directory / "memory.swap.current",),
+        )
+        swap_includes_memory = False
+    else:
+        return MemoryTelemetryProbe(
+            cgroup_mode=mode,
+            total_memory_bytes=host_total,
+            memory_usage_path=None,
+            swap_usage_path=None,
+            swap_usage_includes_memory=False,
+        )
+
+    effective_total = min(
+        host_total,
+        host_total if memory_limit is None else memory_limit,
+    )
+    return MemoryTelemetryProbe(
+        cgroup_mode=mode,
+        total_memory_bytes=effective_total,
+        memory_usage_path=memory_usage_path,
+        swap_usage_path=swap_usage_path,
+        swap_usage_includes_memory=swap_includes_memory,
+    )
 
 
 def probe_resources(

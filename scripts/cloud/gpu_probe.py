@@ -21,6 +21,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from scripts.cloud import host_resource_probe as host_resources
 from scripts.reproduction import verify_environment as environment
 
 
@@ -32,8 +33,8 @@ GIB = 1024**3
 MIN_GPU_MEMORY_BYTES = 31 * GIB
 MIN_FREE_GPU_MEMORY_BYTES = 29 * GIB
 MIN_DISK_FREE_BYTES = 200 * GIB
-MIN_CPU_COUNT = 24
-MIN_HOST_MEMORY_BYTES = {"R0": 96 * GIB, "R1": 128 * GIB}
+MIN_CPU_COUNT = 16
+MIN_HOST_MEMORY_BYTES = {"R0": 80 * GIB, "R1": 128 * GIB}
 _RTX_5090_NAME = re.compile(r"(?:^|\s)GEFORCE\s+RTX\s+5090$", re.IGNORECASE)
 _NVCC_RELEASE = re.compile(r"\brelease\s+([0-9]+\.[0-9]+)\b", re.IGNORECASE)
 
@@ -261,20 +262,10 @@ def _query_cuda_toolkit() -> str:
     return match.group(1)
 
 
-def _read_host_total_memory_bytes() -> int:
-    path = Path("/proc/meminfo")
-    try:
-        for line in path.read_text(encoding="ascii").splitlines():
-            if line.startswith("MemTotal:"):
-                fields = line.split()
-                if len(fields) == 3 and fields[2].lower() == "kb":
-                    return int(fields[1]) * 1024
-    except (OSError, ValueError) as exc:
-        raise ProbeError(f"cannot determine host RAM: {exc}") from exc
-    raise ProbeError("cannot determine host RAM from /proc/meminfo")
-
-
-def _host_resources(disk_path: Path) -> dict[str, Any]:
+def _host_resources(
+    disk_path: Path,
+    resource_probe: Callable[[], host_resources.ResourceProbe] | None = None,
+) -> dict[str, Any]:
     candidate = disk_path.resolve()
     while not candidate.exists() and candidate != candidate.parent:
         candidate = candidate.parent
@@ -282,9 +273,17 @@ def _host_resources(disk_path: Path) -> dict[str, Any]:
         disk_free = shutil.disk_usage(candidate).free
     except OSError as exc:
         raise ProbeError(f"cannot determine free disk at {candidate}: {exc}") from exc
+    try:
+        resources = (
+            resource_probe()
+            if resource_probe is not None
+            else host_resources.probe_resources()
+        )
+    except host_resources.ProbeError as exc:
+        raise ProbeError(f"cannot determine effective host resources: {exc}") from exc
     return {
-        "host_cpu_count": os.cpu_count() or 0,
-        "host_total_memory_bytes": _read_host_total_memory_bytes(),
+        "host_cpu_count": math.floor(resources.effective_cpu_cores),
+        "host_total_memory_bytes": resources.effective_memory_bytes,
         "persistent_disk_free_bytes": disk_free,
         "persistent_disk_probe_path": str(candidate),
     }
@@ -542,6 +541,8 @@ def verify_existing_evidence(
         if hardware_probe is not None
         else _probe_hardware(profile=profile, disk_path=evidence_root)
     )
+    if hardware.get("capacity_profile") != profile:
+        raise ProbeError("current host capacity profile differs from requested profile")
     system = info["system"]
     for key in ("cuda_runtime", "driver_version", "gpu_compute_capability", "gpu_name"):
         if system[key] != hardware[key]:
@@ -569,6 +570,7 @@ def verify_existing_evidence(
                 raise ProbeError(f"{kernel} {mode} evidence hash changed")
             evidence_hardware = evidence.get("hardware")
             stable_hardware_fields = {
+                "capacity_profile",
                 "cuda_runtime",
                 "cuda_toolkit",
                 "driver_version",
@@ -576,10 +578,12 @@ def verify_existing_evidence(
                 "gpu_name",
                 "gpu_total_memory_bytes",
                 "gpu_uuid",
+                "host_cpu_count",
+                "host_total_memory_bytes",
                 "torch_gpu_total_memory_bytes",
             }
             hardware_changed = not isinstance(evidence_hardware, Mapping) or any(
-                key in evidence_hardware and evidence_hardware.get(key) != hardware.get(key)
+                evidence_hardware.get(key) != hardware.get(key)
                 for key in stable_hardware_fields
             )
             if (
