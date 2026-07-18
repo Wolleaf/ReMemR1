@@ -363,6 +363,25 @@ def test_host_ram_or_growth_pressure_cannot_authorize_r1():
     assert result["r1_eligible"] is False
 
 
+def test_high_truncation_is_yellow_science_and_never_authorizes_r1():
+    identity, configs = _identity("R0")
+    telemetry = _telemetry(identity)
+    telemetry["high_truncation_rate"] = True
+
+    result = capacity.classify_telemetry(telemetry)
+
+    assert result["metrics"]["format"]["status"] == "yellow"
+    assert result["overall"] == "yellow"
+    assert result["r1_eligible"] is False
+    with pytest.raises(capacity.CapacityEvidenceError, match="not all green"):
+        capacity.create_capacity_profile(
+            identity=identity,
+            telemetry=telemetry,
+            attempt_metadata=_attempt_metadata(identity, configs),
+            selected_configs=configs,
+        )
+
+
 def test_partial_r0_oom_attempt_produces_eligible_evidence_not_a_profile():
     identity, configs = _identity("R0")
     telemetry = _telemetry(identity)

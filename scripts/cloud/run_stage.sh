@@ -463,6 +463,7 @@ run_bound_training() {
         --attempt-dir "${RUN_DIR}"
 
     local training_rc training_started_rc=0 cleanup_rc telemetry_rc expected_step="" length_stress=no
+    local verification_scope="scientific"
     local expected_train_file="" expected_validation_file=""
     local expected_train_manifest="" expected_validation_manifest=""
     local expected_base_model="" expected_revision=""
@@ -488,16 +489,35 @@ run_bound_training() {
     fi
     if [[ "${training_rc}" -eq 0 ]]; then
         case "${config_id}" in
-            g0_qwen35_08b) expected_step=20 ;;
-            g1_qwen35_2b_step1) expected_step=1 ;;
-            g1_qwen35_2b_resume2) expected_step=2 ;;
-            g2a_qwen35_2b_5090_*|g2b_qwen35_2b_5090_step1_*) expected_step=1 ;;
-            g2b_qwen35_2b_5090_resume5_*) expected_step=5 ;;
+            g0_qwen35_08b)
+                expected_step=20
+                verification_scope=engineering
+                ;;
+            g1_qwen35_2b_step1)
+                expected_step=1
+                verification_scope=engineering
+                ;;
+            g1_qwen35_2b_resume2)
+                expected_step=2
+                verification_scope=engineering
+                ;;
+            g2a_qwen35_2b_5090_*|g2b_qwen35_2b_5090_step1_*)
+                expected_step=1
+                verification_scope=capacity
+                ;;
+            g2b_qwen35_2b_5090_resume5_*)
+                expected_step=5
+                verification_scope=capacity
+                ;;
             g2_length_stress_qwen35_2b_5090_*)
                 expected_step=1
                 length_stress=yes
+                verification_scope=capacity
                 ;;
-            b_pilot_qwen35_2b_5090_*|c_pilot_qwen35_2b_5090_*) expected_step=3 ;;
+            b_pilot_qwen35_2b_5090_*|c_pilot_qwen35_2b_5090_*)
+                expected_step=3
+                verification_scope=scientific
+                ;;
             [bc]20_qwen35_2b_5090_*) expected_step=20 ;;
             [bc]40_qwen35_2b_5090_*) expected_step=40 ;;
             [bc]60_qwen35_2b_5090_*) expected_step=60 ;;
@@ -510,7 +530,8 @@ run_bound_training() {
             --expected-config-sha256 \
                 "$(sha256sum "${REMEMR1_CONFIG_ROOT}/${config_id}.yaml" | awk '{print $1}')" \
             --expected-offload-profile "${REMEMR1_OFFLOAD_PROFILE}" \
-            --expected-final-step "${expected_step}")
+            --expected-final-step "${expected_step}" \
+            --verification-scope "${verification_scope}")
         [[ "${length_stress}" != yes ]] || telemetry_args+=(--length-stress)
         set +e
         run_logged "verify-telemetry-${config_id}" 10m \

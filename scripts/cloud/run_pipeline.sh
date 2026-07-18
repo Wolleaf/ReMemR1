@@ -948,25 +948,56 @@ stage_record_path() {
     printf '%s\n' "${origin_dir}/${stage}.run"
 }
 
+verify_engineering_training_telemetry() {
+    local run="$1"
+    local config_id="$2"
+    local step="$3"
+    local python="$4"
+    timeout --verbose --signal=TERM --kill-after=30s 10m \
+        "${python}" scripts/cloud/training_telemetry.py verify-success \
+        --attempt-dir "${run}" \
+        --expected-config-id "${config_id}" \
+        --expected-config-sha256 \
+            "$(sha256sum "${REMEMR1_CONFIG_ROOT}/${config_id}.yaml" | awk '{print $1}')" \
+        --expected-offload-profile r0 \
+        --expected-final-step "${step}" \
+        --verification-scope engineering
+}
+
 verify_2b_training_artifacts() {
     local key="$1"
     local run="$2"
     local python="$3"
     local config_id step predecessor="" predecessor_step="" length_stress=no
+    local verification_scope="scientific"
     case "${key}" in
-        g2a) config_id="g2a_qwen35_2b_5090_${OFFLOAD_PROFILE}"; step=1 ;;
-        g2b-step1) config_id="g2b_qwen35_2b_5090_step1_${OFFLOAD_PROFILE}"; step=1 ;;
+        g2a)
+            config_id="g2a_qwen35_2b_5090_${OFFLOAD_PROFILE}"
+            step=1; verification_scope=capacity
+            ;;
+        g2b-step1)
+            config_id="g2b_qwen35_2b_5090_step1_${OFFLOAD_PROFILE}"
+            step=1; verification_scope=capacity
+            ;;
         g2b-resume5)
             config_id="g2b_qwen35_2b_5090_resume5_${OFFLOAD_PROFILE}"
             step=5; predecessor=g2b-step1; predecessor_step=1
+            verification_scope=capacity
             ;;
         g2-length-stress)
             config_id="g2_length_stress_qwen35_2b_5090_${OFFLOAD_PROFILE}"
             step=1
             length_stress=yes
+            verification_scope=capacity
             ;;
-        b-pilot) config_id="b_pilot_qwen35_2b_5090_${OFFLOAD_PROFILE}"; step=3 ;;
-        c-pilot) config_id="c_pilot_qwen35_2b_5090_${OFFLOAD_PROFILE}"; step=3 ;;
+        b-pilot)
+            config_id="b_pilot_qwen35_2b_5090_${OFFLOAD_PROFILE}"
+            step=3; verification_scope=scientific
+            ;;
+        c-pilot)
+            config_id="c_pilot_qwen35_2b_5090_${OFFLOAD_PROFILE}"
+            step=3; verification_scope=scientific
+            ;;
         b20) config_id="b20_qwen35_2b_5090_${OFFLOAD_PROFILE}"; step=20 ;;
         c20) config_id="c20_qwen35_2b_5090_${OFFLOAD_PROFILE}"; step=20 ;;
         b40)
@@ -1001,7 +1032,8 @@ verify_2b_training_artifacts() {
         --expected-config-sha256 \
             "$(sha256sum "${REMEMR1_CONFIG_ROOT}/${config_id}.yaml" | awk '{print $1}')" \
         --expected-offload-profile "${OFFLOAD_PROFILE}" \
-        --expected-final-step "${step}")
+        --expected-final-step "${step}" \
+        --verification-scope "${verification_scope}")
     [[ "${length_stress}" != yes ]] || telemetry_args+=(--length-stress)
     timeout --verbose --signal=TERM --kill-after=30s 10m \
         "${python}" scripts/cloud/training_telemetry.py \
@@ -1061,6 +1093,8 @@ verify_stage_artifacts() {
             timeout --verbose --signal=TERM --kill-after=1m 20m \
                 "${python}" scripts/cloud/run_resolved_training.py verify \
                 --attempt-dir "${run}" || return
+            verify_engineering_training_telemetry \
+                "${run}" g0_qwen35_08b 20 "${python}" || return
             timeout --verbose --signal=TERM --kill-after=1m 2h \
                 "${python}" scripts/cloud/verify_training_artifacts.py \
                 --checkpoint-dir "${run}/checkpoints/global_step_20" \
@@ -1079,6 +1113,8 @@ verify_stage_artifacts() {
             timeout --verbose --signal=TERM --kill-after=1m 20m \
                 "${python}" scripts/cloud/run_resolved_training.py verify \
                 --attempt-dir "${run}" || return
+            verify_engineering_training_telemetry \
+                "${run}" g1_qwen35_2b_step1 1 "${python}" || return
             timeout --verbose --signal=TERM --kill-after=1m 2h \
                 "${python}" scripts/cloud/verify_training_artifacts.py \
                 --checkpoint-dir "${run}/checkpoints/global_step_1" \
@@ -1099,6 +1135,8 @@ verify_stage_artifacts() {
             timeout --verbose --signal=TERM --kill-after=1m 20m \
                 "${python}" scripts/cloud/run_resolved_training.py verify \
                 --attempt-dir "${run}" || return
+            verify_engineering_training_telemetry \
+                "${run}" g1_qwen35_2b_resume2 2 "${python}" || return
             timeout --verbose --signal=TERM --kill-after=1m 2h \
                 "${python}" scripts/cloud/verify_training_artifacts.py \
                 --checkpoint-dir "${run}/checkpoints/global_step_2" \

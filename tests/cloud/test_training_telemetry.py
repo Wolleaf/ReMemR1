@@ -74,7 +74,26 @@ def _worker(role="actor", **overrides):
     return value
 
 
-def _record(step=1, scientific=False, **worker_overrides):
+def _scientific(**overrides):
+    value = {
+        "all_outputs_truncated": False,
+        "finite_gradients": True,
+        "finite_losses": True,
+        "high_truncation_rate": False,
+        "nonzero_advantage_groups": 2,
+        "reward_variance_groups": 2,
+        "systematic_format_failure": False,
+    }
+    value.update(overrides)
+    return value
+
+
+def _record(
+    step=1,
+    scientific=False,
+    scientific_overrides=None,
+    **worker_overrides,
+):
     return create_step_record(
         worker_records=[
             _worker("actor", **worker_overrides),
@@ -91,18 +110,21 @@ def _record(step=1, scientific=False, **worker_overrides):
             "update_actor": 20.0,
         },
         scientific_evidence=(
-            {
-                "all_outputs_truncated": False,
-                "finite_gradients": True,
-                "finite_losses": True,
-                "high_truncation_rate": False,
-                "nonzero_advantage_groups": 2,
-                "reward_variance_groups": 2,
-                "systematic_format_failure": False,
-            }
+            _scientific(**(scientific_overrides or {}))
             if scientific
             else None
         ),
+    )
+
+
+def _verify(attempt, verification_scope):
+    return verify_success_ledger(
+        attempt,
+        expected_config_id="g2b_qwen35_2b_5090_resume5_r0",
+        expected_config_sha256="a" * 64,
+        expected_offload_profile="r0",
+        expected_final_step=5,
+        verification_scope=verification_scope,
     )
 
 
@@ -189,7 +211,7 @@ def test_scientific_step_evidence_is_bound_into_the_ledger(tmp_path):
     assert evidence["reward_variance_groups"] == 2
 
 
-def test_strict_success_verifies_identity_final_step_and_science(tmp_path):
+def test_scientific_success_verifies_identity_final_step_and_science(tmp_path):
     attempt = tmp_path / "g2b-resume5-r0-attempt-1"
     append_step(attempt / "telemetry.json", _record(5, scientific=True))
 
@@ -199,6 +221,7 @@ def test_strict_success_verifies_identity_final_step_and_science(tmp_path):
         expected_config_sha256="a" * 64,
         expected_offload_profile="r0",
         expected_final_step=5,
+        verification_scope="scientific",
     )
     assert ledger["steps"][-1]["global_step"] == 5
 
@@ -209,10 +232,11 @@ def test_strict_success_verifies_identity_final_step_and_science(tmp_path):
             expected_config_sha256="a" * 64,
             expected_offload_profile="r0",
             expected_final_step=5,
+            verification_scope="scientific",
         )
 
 
-def test_strict_success_rejects_rehashed_false_scientific_evidence(tmp_path):
+def test_all_scopes_reject_nonfinite_scientific_evidence(tmp_path):
     attempt = tmp_path / "g2b-resume5-r0-attempt-1"
     path = attempt / "telemetry.json"
     append_step(path, _record(5, scientific=True))
@@ -227,14 +251,9 @@ def test_strict_success_rejects_rehashed_false_scientific_evidence(tmp_path):
     value["ledger_sha256"] = telemetry._canonical_sha256(unsigned_ledger)
     path.write_bytes(telemetry._canonical_bytes(value) + b"\n")
 
-    with pytest.raises(TrainingScientificStop, match="non-finite losses"):
-        verify_success_ledger(
-            attempt,
-            expected_config_id="g2b_qwen35_2b_5090_resume5_r0",
-            expected_config_sha256="a" * 64,
-            expected_offload_profile="r0",
-            expected_final_step=5,
-        )
+    for verification_scope in telemetry.VERIFICATION_SCOPES:
+        with pytest.raises(TrainingScientificStop, match="non-finite losses"):
+            _verify(attempt, verification_scope)
     assert telemetry.main(
         [
             "verify-success",
@@ -248,8 +267,120 @@ def test_strict_success_rejects_rehashed_false_scientific_evidence(tmp_path):
             "r0",
             "--expected-final-step",
             "5",
+            "--verification-scope",
+            "scientific",
         ]
     ) == 42
+
+
+def test_engineering_scope_records_protocol_failure_without_treating_it_as_g0_science(
+    tmp_path,
+):
+    attempt = tmp_path / "g2b-resume5-r0-attempt-1"
+    append_step(
+        attempt / "telemetry.json",
+        _record(
+            5,
+            scientific=True,
+            scientific_overrides={
+                "all_outputs_truncated": True,
+                "high_truncation_rate": True,
+                "nonzero_advantage_groups": 0,
+                "reward_variance_groups": 0,
+                "systematic_format_failure": True,
+            },
+        ),
+    )
+
+    ledger = _verify(attempt, "engineering")
+
+    assert ledger["steps"][0]["scientific_evidence"]["all_outputs_truncated"] is True
+
+
+def test_capacity_scope_defers_high_truncation_and_group_totals_to_aggregate(tmp_path):
+    attempt = tmp_path / "g2b-resume5-r0-attempt-1"
+    append_step(
+        attempt / "telemetry.json",
+        _record(
+            5,
+            scientific=True,
+            scientific_overrides={
+                "high_truncation_rate": True,
+                "nonzero_advantage_groups": 0,
+                "reward_variance_groups": 0,
+            },
+        ),
+    )
+
+    assert _verify(attempt, "capacity")["steps"][-1]["global_step"] == 5
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("all_outputs_truncated", "truncated every output"),
+        ("systematic_format_failure", "systematic format failure"),
+    ],
+)
+def test_capacity_scope_stops_red_protocol_failures(tmp_path, field, message):
+    attempt = tmp_path / "g2b-resume5-r0-attempt-1"
+    append_step(
+        attempt / "telemetry.json",
+        _record(5, scientific=True, scientific_overrides={field: True}),
+    )
+
+    with pytest.raises(TrainingScientificStop, match=message):
+        _verify(attempt, "capacity")
+
+
+def test_scientific_scope_only_stops_protocol_failure_sustained_for_the_attempt(
+    tmp_path,
+):
+    attempt = tmp_path / "g2b-resume5-r0-attempt-1"
+    append_step(
+        attempt / "telemetry.json",
+        _record(
+            4,
+            scientific=True,
+            scientific_overrides={
+                "all_outputs_truncated": True,
+                "high_truncation_rate": True,
+                "nonzero_advantage_groups": 0,
+                "reward_variance_groups": 0,
+                "systematic_format_failure": True,
+            },
+        ),
+    )
+    append_step(
+        attempt / "telemetry.json",
+        _record(
+            5,
+            scientific=True,
+            scientific_overrides={
+                "high_truncation_rate": True,
+                "nonzero_advantage_groups": 0,
+                "reward_variance_groups": 0,
+            },
+        ),
+    )
+
+    assert _verify(attempt, "scientific")["steps"][-1]["global_step"] == 5
+
+
+def test_scientific_scope_stops_attempt_wide_protocol_collapse(tmp_path):
+    attempt = tmp_path / "g2b-resume5-r0-attempt-1"
+    for step in (4, 5):
+        append_step(
+            attempt / "telemetry.json",
+            _record(
+                step,
+                scientific=True,
+                scientific_overrides={"all_outputs_truncated": True},
+            ),
+        )
+
+    with pytest.raises(TrainingScientificStop, match="throughout the attempt"):
+        _verify(attempt, "scientific")
 
 
 def test_length_stress_checks_resources_but_excludes_scientific_result(tmp_path):
@@ -280,9 +411,27 @@ def test_length_stress_checks_resources_but_excludes_scientific_result(tmp_path)
         expected_config_sha256="b" * 64,
         expected_offload_profile="r0",
         expected_final_step=1,
+        verification_scope="capacity",
         length_stress=True,
     )
     assert ledger["steps"][0]["scientific_evidence"]["finite_losses"] is False
+
+
+def test_cloud_training_and_recovery_select_matching_telemetry_scopes():
+    root = Path(__file__).resolve().parents[2]
+    stage = (root / "scripts" / "cloud" / "run_stage.sh").read_text(
+        encoding="utf-8"
+    )
+    pipeline = (root / "scripts" / "cloud" / "run_pipeline.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert stage.count("verification_scope=engineering") == 3
+    assert stage.count("verification_scope=capacity") == 3
+    assert "--verification-scope \"${verification_scope}\"" in stage
+    assert pipeline.count("verification_scope=capacity") == 4
+    assert "--verification-scope \"${verification_scope}\"" in pipeline
+    assert pipeline.count("verify_engineering_training_telemetry") == 4
 
 
 def test_worker_and_trainer_wire_reset_collect_around_the_optimizer_loop():

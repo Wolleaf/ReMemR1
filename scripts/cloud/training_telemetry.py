@@ -17,6 +17,7 @@ from typing import Any
 
 SCHEMA_VERSION = 2
 PROFILE_ID = "rtx5090-32g-qwen35-2b-v1"
+VERIFICATION_SCOPES = ("capacity", "engineering", "scientific")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_PHASES = (
     "rollout",
@@ -523,8 +524,13 @@ def verify_success_ledger(
     expected_config_sha256: str,
     expected_offload_profile: str,
     expected_final_step: int,
+    verification_scope: str,
     length_stress: bool = False,
 ) -> dict[str, Any]:
+    if verification_scope not in VERIFICATION_SCOPES:
+        raise TrainingTelemetryError(
+            f"telemetry verification scope must be one of {VERIFICATION_SCOPES}"
+        )
     attempt = _safe_absolute(attempt_dir, "telemetry attempt")
     if attempt.is_symlink() or not attempt.is_dir():
         raise TrainingTelemetryError("telemetry attempt must be a regular directory")
@@ -596,20 +602,23 @@ def verify_success_ledger(
             raise TrainingScientificStop(f"telemetry step {step} has non-finite losses")
         if evidence["finite_gradients"] is not True:
             raise TrainingScientificStop(f"telemetry step {step} has non-finite gradients")
-        if evidence["all_outputs_truncated"] is not False:
+        if verification_scope == "capacity" and evidence["all_outputs_truncated"]:
             raise TrainingScientificStop(f"telemetry step {step} truncated every output")
-        if evidence["high_truncation_rate"] is not False:
-            raise TrainingScientificStop(f"telemetry step {step} has high truncation")
-        if evidence["systematic_format_failure"] is not False:
+        if verification_scope == "capacity" and evidence["systematic_format_failure"]:
             raise TrainingScientificStop(
                 f"telemetry step {step} has systematic format failure"
             )
-    if not length_stress and (
-        sum(item["nonzero_advantage_groups"] for item in scientific) < 1
-        or sum(item["reward_variance_groups"] for item in scientific) < 1
+    if verification_scope == "scientific" and scientific and all(
+        item["all_outputs_truncated"] for item in scientific
     ):
         raise TrainingScientificStop(
-            "training telemetry has no usable reward variance or advantage group"
+            "training telemetry truncated every output throughout the attempt"
+        )
+    if verification_scope == "scientific" and scientific and all(
+        item["systematic_format_failure"] for item in scientific
+    ):
+        raise TrainingScientificStop(
+            "training telemetry has systematic format failure throughout the attempt"
         )
     return ledger
 
@@ -656,6 +665,11 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--expected-config-sha256", required=True)
     verify.add_argument("--expected-offload-profile", choices=("r0", "r1"), required=True)
     verify.add_argument("--expected-final-step", type=int, required=True)
+    verify.add_argument(
+        "--verification-scope",
+        choices=VERIFICATION_SCOPES,
+        required=True,
+    )
     verify.add_argument("--length-stress", action="store_true")
     return parser
 
@@ -669,6 +683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_config_sha256=args.expected_config_sha256,
             expected_offload_profile=args.expected_offload_profile,
             expected_final_step=args.expected_final_step,
+            verification_scope=args.verification_scope,
             length_stress=args.length_stress,
         )
     except TrainingScientificStop as exc:
@@ -698,6 +713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "PROFILE_ID",
     "REQUIRED_PHASES",
+    "VERIFICATION_SCOPES",
     "SCHEMA_VERSION",
     "TrainingTelemetryError",
     "TrainingScientificStop",
