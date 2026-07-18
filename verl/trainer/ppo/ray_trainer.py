@@ -1424,11 +1424,13 @@ class RayPPOTrainer:
         state: CheckpointExtraState,
         *,
         verify_directory: bool = True,
+        allow_atomic_staging_name: bool = False,
     ):
         root = Path(checkpoint_root)
         _, loaded_state = verify_reproduction_checkpoint_directory(
             root,
             verify_files=verify_directory,
+            allow_atomic_staging_name=allow_atomic_staging_name,
         )
         if loaded_state.sha256 != state.sha256:
             raise CheckpointContractError(
@@ -1556,6 +1558,7 @@ class RayPPOTrainer:
                 staging,
                 state,
                 verify_directory=False,
+                allow_atomic_staging_name=True,
             )
 
         atomic_publish_directory(

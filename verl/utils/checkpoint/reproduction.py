@@ -1750,6 +1750,7 @@ def verify_reproduction_checkpoint_directory(
     directory: str | Path,
     *,
     verify_files: bool = True,
+    allow_atomic_staging_name: bool = False,
 ) -> tuple[CompletionManifest, CheckpointExtraState]:
     """Bind marker identity, directory step, and strict root extra-state."""
 
@@ -1760,6 +1761,8 @@ def verify_reproduction_checkpoint_directory(
         else _read_completion_manifest(root)
     )
     match = re.fullmatch(r"global_step_(\d+)", root.name)
+    if match is None and allow_atomic_staging_name:
+        match = re.fullmatch(r"\.global_step_(\d+)\.staging-.+", root.name)
     if match is None:
         raise CheckpointContractError(
             "reproduction checkpoint directory must be named global_step_<N>"
@@ -1773,7 +1776,11 @@ def verify_reproduction_checkpoint_directory(
         raise CheckpointContractError(
             "completion marker artifact_type is not a reproduction checkpoint"
         )
-    if manifest.metadata["global_step"] != directory_step:
+    marker_step = _require_nonnegative_int(
+        manifest.metadata["global_step"],
+        name="completion marker global_step",
+    )
+    if marker_step != directory_step:
         raise CheckpointContractError(
             "completion marker global_step does not match checkpoint directory"
         )

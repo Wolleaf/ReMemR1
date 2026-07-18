@@ -635,6 +635,61 @@ def test_reproduction_checkpoint_binds_artifact_directory_marker_and_state_step(
             checkpoint.verify_reproduction_checkpoint_directory(destination)
 
 
+def test_reproduction_checkpoint_accepts_only_bound_atomic_staging_name(tmp_path):
+    state = _sample_extra_state(global_step=20)
+    staging = _publish_reproduction_checkpoint(
+        tmp_path / ".global_step_20.staging-test",
+        state,
+        {
+            "artifact_type": "reproduction_training_checkpoint",
+            "global_step": 20,
+        },
+    )
+
+    with pytest.raises(checkpoint.CheckpointContractError, match="global_step_<N>"):
+        checkpoint.verify_reproduction_checkpoint_directory(staging)
+
+    _, loaded = checkpoint.verify_reproduction_checkpoint_directory(
+        staging,
+        verify_files=False,
+        allow_atomic_staging_name=True,
+    )
+    assert loaded.sha256 == state.sha256
+
+    mismatched = _publish_reproduction_checkpoint(
+        tmp_path / ".global_step_19.staging-mismatched",
+        state,
+        {
+            "artifact_type": "reproduction_training_checkpoint",
+            "global_step": 20,
+        },
+    )
+    with pytest.raises(
+        checkpoint.CheckpointContractError,
+        match="marker global_step does not match checkpoint directory",
+    ):
+        checkpoint.verify_reproduction_checkpoint_directory(
+            mismatched,
+            verify_files=False,
+            allow_atomic_staging_name=True,
+        )
+
+    arbitrary = _publish_reproduction_checkpoint(
+        tmp_path / "checkpoint-staging-test",
+        state,
+        {
+            "artifact_type": "reproduction_training_checkpoint",
+            "global_step": 20,
+        },
+    )
+    with pytest.raises(checkpoint.CheckpointContractError, match="global_step_<N>"):
+        checkpoint.verify_reproduction_checkpoint_directory(
+            arbitrary,
+            verify_files=False,
+            allow_atomic_staging_name=True,
+        )
+
+
 def test_public_checkpoint_contract_exports_strict_helpers():
     expected = {
         "DEFAULT_RESUME_CONFIG_ALLOWLIST",

@@ -281,6 +281,8 @@ def test_trainer_deserializes_every_actor_shard_before_publish():
     assert "torch.load(model_path, weights_only=False)" in artifact_source
     assert "torch.load(optimizer_path, weights_only=False)" in artifact_source
     assert "validate_scheduler_optimizer_alignment" in artifact_source
+    assert "allow_atomic_staging_name=allow_atomic_staging_name" in artifact_source
+    assert "allow_atomic_staging_name=True" in save_source
     assert "validator=validator" in save_source
     assert "'artifact_type': 'reproduction_training_checkpoint'" in save_source
 
