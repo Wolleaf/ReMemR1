@@ -275,6 +275,48 @@ def test_only_exact_visual_and_mtp_namespaces_are_allowed():
     )
 
 
+@pytest.mark.parametrize("container", [set, frozenset])
+def test_transformers_514_set_loading_info_is_accepted_and_sorted(container):
+    report = qwen35.validate_qwen35_loading_info(
+        {
+            "missing_keys": container(),
+            "unexpected_keys": container(
+                {
+                    "mtp.layers.0.weight",
+                    "model.visual.blocks.0.weight",
+                }
+            ),
+            "mismatched_keys": container(),
+            "error_msgs": [],
+        }
+    )
+
+    assert report.unexpected_keys == (
+        "model.visual.blocks.0.weight",
+        "mtp.layers.0.weight",
+    )
+
+
+def test_transformers_514_mismatched_key_set_preserves_tuple_compatibility():
+    with pytest.raises(qwen35.Qwen35StateDictError, match="mismatched keys"):
+        qwen35.validate_qwen35_loading_info(
+            {
+                "missing_keys": set(),
+                "unexpected_keys": set(),
+                "mismatched_keys": {
+                    ("model.norm.weight", (2,), (3,)),
+                },
+                "error_msgs": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("value", ["model.norm.weight", {"model.norm.weight": None}])
+def test_loading_info_still_rejects_strings_and_mappings(value):
+    with pytest.raises(qwen35.Qwen35StateDictError, match="sequence or set"):
+        qwen35.validate_qwen35_loading_info({"missing_keys": value})
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

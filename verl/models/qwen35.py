@@ -283,8 +283,11 @@ def inspect_qwen35_config(config: Any) -> Qwen35ConfigInfo:
 def _as_key_tuple(values: Any, field_name: str) -> tuple[str, ...]:
     if values is None:
         return ()
-    if isinstance(values, str) or not isinstance(values, Sequence):
-        raise Qwen35StateDictError(f"loading_info[{field_name!r}] must be a sequence")
+    unordered = isinstance(values, (set, frozenset))
+    if isinstance(values, str) or not isinstance(values, (Sequence, set, frozenset)):
+        raise Qwen35StateDictError(
+            f"loading_info[{field_name!r}] must be a sequence or set"
+        )
 
     normalized: list[str] = []
     for value in values:
@@ -296,7 +299,7 @@ def _as_key_tuple(values: Any, field_name: str) -> tuple[str, ...]:
             raise Qwen35StateDictError(
                 f"loading_info[{field_name!r}] contains a non-string entry: {value!r}"
             )
-    return tuple(normalized)
+    return tuple(sorted(normalized)) if unordered else tuple(normalized)
 
 
 def _partition_allowed(keys: tuple[str, ...], patterns: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
