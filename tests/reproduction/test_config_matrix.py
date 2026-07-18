@@ -262,7 +262,10 @@ def test_training_sources_fail_closed_without_an_offload_overlay():
 
 def test_active_gate_configs_expose_the_pilot_evidence_schema():
     for name in GATE_CONFIG_NAMES:
-        assert _compose_source(name).reproduction.pilot_evidence_path is None
+        reproduction = _compose_source(name).reproduction
+        assert reproduction.experiment_profile_id == PROFILE_ID
+        assert reproduction.offload_profile == "r0"
+        assert reproduction.pilot_evidence_path is None
 
 
 @pytest.mark.parametrize("name", TRAINING_CONTRACTS)

@@ -20,6 +20,8 @@ data:
   truncation: center
 
 reproduction:
+  experiment_profile_id: rtx5090-32g-qwen35-2b-v1
+  offload_profile: r0
   run_seed: 42
   formal_data: false
   data_seed: 1938833696
