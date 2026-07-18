@@ -9,7 +9,9 @@ hashed before the bundle is published.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
+import heapq
 import json
 import os
 import shutil
@@ -37,9 +39,11 @@ from .reproduction_manifest import (
     build_manifest_record,
     canonical_json_bytes,
     canonical_jsonl_sha256,
+    count_tokens,
     normalize_text,
     normalized_text_sha256,
     ordered_values_sha256,
+    render_context,
     stable_document_id,
     validate_canonical_jsonl,
     validate_eval_manifest_pair,
@@ -73,6 +77,8 @@ FORMAL_TRAIN_CHUNK_SIZE = 5000
 FORMAL_TRAIN_MAX_CHUNKS = 6
 FORMAL_TRAIN_MIN_CONTEXT_TOKENS = 25_001
 FORMAL_TRAIN_MAX_CONTEXT_TOKENS = 30_000
+_FORMAL_TRAIN_INITIAL_DISTRACTOR_RESERVE = 64
+_FORMAL_TRAIN_EXACT_TRIALS_PER_RESERVE = 32
 _FLOATING_REVISIONS = {"", "main", "master", "latest", "head"}
 _DATASET_ALIASES = {
     "hotpot": "hotpotqa",
@@ -239,6 +245,10 @@ class _RejectableSourceRecordError(ManifestValidationError):
     ) -> None:
         super().__init__(message)
         self.reasons = tuple(reasons)
+
+
+class _LengthFitSearchExhausted(ManifestValidationError):
+    """Raised when a bounded ranked reserve cannot repair a train context."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,6 +788,36 @@ def _select_qa_ids(
     return tuple(ordered[:qa_count])
 
 
+def _ranked_distractor_ids(
+    example: ParsedExample,
+    *,
+    corpus: Mapping[str, DocumentInput],
+    seed: int,
+    limit: int | None = None,
+) -> tuple[str, ...]:
+    core_set = {document.document_id for document in example.documents}
+    distractor_count = len(corpus) - len(core_set)
+    if limit is not None:
+        _require_int(limit, "distractor_rank_limit")
+        limit = min(limit, distractor_count)
+    key = lambda document_id: (
+        _rank(seed, example.qa.qa_id, "distractor-selection", document_id),
+        document_id,
+    )
+    candidates = (
+        document_id for document_id in corpus if document_id not in core_set
+    )
+    if limit is None:
+        return tuple(sorted(candidates, key=key))
+    return tuple(
+        heapq.nsmallest(
+            limit,
+            candidates,
+            key=key,
+        )
+    )
+
+
 def _materialize_document_pool(
     example: ParsedExample,
     *,
@@ -785,6 +825,7 @@ def _materialize_document_pool(
     prefix_document_count: int,
     pool_document_count: int,
     seed: int,
+    ranked_distractor_ids: Sequence[str] | None = None,
 ) -> tuple[tuple[DocumentInput, ...], tuple[SupportingFactInput, ...]]:
     if prefix_document_count > pool_document_count:
         raise ManifestValidationError("document prefix exceeds pool size")
@@ -800,21 +841,26 @@ def _materialize_document_pool(
             f"{pool_document_count} per QA"
         )
     core_set = set(core_ids)
-    distractors = sorted(
-        (document_id for document_id in corpus if document_id not in core_set),
-        key=lambda document_id: (
-            _rank(seed, example.qa.qa_id, "distractor-selection", document_id),
-            document_id,
-        ),
-    )
+    if ranked_distractor_ids is None:
+        distractors = _ranked_distractor_ids(example, corpus=corpus, seed=seed)
+    else:
+        distractors = tuple(ranked_distractor_ids)
+        if (
+            len(distractors) != len(set(distractors))
+            or any(document_id not in corpus for document_id in distractors)
+            or any(document_id in core_set for document_id in distractors)
+        ):
+            raise ManifestValidationError(
+                "ranked distractor reserve is not unique or differs from the corpus"
+            )
     needed = pool_document_count - len(core_ids)
     if len(distractors) < needed:
         raise ManifestValidationError(
             f"QA {example.qa.qa_id} does not have enough unique distractors"
         )
     prefix_padding_count = prefix_document_count - len(core_ids)
-    prefix_ids = list(core_ids) + distractors[:prefix_padding_count]
-    tail_ids = distractors[prefix_padding_count:needed]
+    prefix_ids = list(core_ids) + list(distractors[:prefix_padding_count])
+    tail_ids = list(distractors[prefix_padding_count:needed])
     prefix_ids.sort(
         key=lambda document_id: (
             _rank(seed, example.qa.qa_id, "prefix-order", document_id),
@@ -844,6 +890,218 @@ def _materialize_document_pool(
     if any(fact.document_index >= prefix_document_count for fact in remapped_facts):
         raise ManifestValidationError("supporting evidence escaped the required prefix")
     return tuple(corpus[document_id] for document_id in pool_ids), remapped_facts
+
+
+def _distance_to_token_window(count: int, contract: TrainManifestContract) -> int:
+    if count < contract.min_context_tokens:
+        return contract.min_context_tokens - count
+    if count > contract.max_context_tokens:
+        return count - contract.max_context_tokens
+    return 0
+
+
+def _is_monotonic_token_improvement(
+    current_count: int,
+    candidate_count: int,
+    contract: TrainManifestContract,
+) -> bool:
+    if current_count < contract.min_context_tokens:
+        return current_count < candidate_count <= contract.max_context_tokens
+    if current_count > contract.max_context_tokens:
+        return contract.min_context_tokens <= candidate_count < current_count
+    return False
+
+
+def _best_removal_for_addition(
+    removals: Sequence[tuple[int, int, str]],
+    removal_weights: Sequence[int],
+    *,
+    added_weight: int,
+    current_count: int,
+    contract: TrainManifestContract,
+) -> tuple[int, int, str, int]:
+    """Choose the deterministic removal whose proxy count is nearest the window."""
+
+    midpoint = (contract.min_context_tokens + contract.max_context_tokens) // 2
+    minimum_weight = current_count + added_weight - contract.max_context_tokens
+    maximum_weight = current_count + added_weight - contract.min_context_tokens
+    left = bisect.bisect_left(removal_weights, minimum_weight)
+    right = bisect.bisect_right(removal_weights, maximum_weight)
+    candidate_indices: set[int] = set()
+    if left < right:
+        target_weight = current_count + added_weight - midpoint
+        target = bisect.bisect_left(
+            removal_weights,
+            target_weight,
+            left,
+            right,
+        )
+        candidate_indices.update((target - 1, target))
+    else:
+        candidate_indices.update((left - 1, left))
+    candidate_indices.update((0, len(removals) - 1))
+
+    choices = []
+    for index in sorted(candidate_indices):
+        if index < 0 or index >= len(removals):
+            continue
+        removed_weight, slot, removed_id = removals[index]
+        predicted_count = current_count + added_weight - removed_weight
+        choices.append(
+            (
+                _distance_to_token_window(predicted_count, contract),
+                abs(predicted_count - midpoint),
+                slot,
+                removed_id,
+                removed_weight,
+                predicted_count,
+            )
+        )
+    if not choices:
+        raise ManifestValidationError("formal length fitting has no removable distractor")
+    _, _, slot, removed_id, removed_weight, predicted_count = min(choices)
+    return removed_weight, slot, removed_id, predicted_count
+
+
+def _fit_formal_train_pool(
+    example: ParsedExample,
+    *,
+    initial_pool: Sequence[DocumentInput],
+    initial_context_token_count: int,
+    ranked_distractor_ids: Sequence[str],
+    corpus: Mapping[str, DocumentInput],
+    encode: Callable[[str], Any],
+    contract: TrainManifestContract,
+    body_token_counts: dict[str, int],
+    failed_exact_trials: set[tuple[str, int, int, str]] | None = None,
+) -> tuple[tuple[DocumentInput, ...], int]:
+    """Repair only distractor slots until the exact context enters the train window."""
+
+    if failed_exact_trials is None:
+        failed_exact_trials = set()
+    pool = list(initial_pool)
+    core_ids = {document.document_id for document in example.documents}
+    initial_pool_ids = {document.document_id for document in pool}
+    needed_distractors = contract.document_count - len(core_ids)
+    alternatives = tuple(ranked_distractor_ids[needed_distractors:])
+    changed_slots: set[int] = set()
+    current_count = initial_context_token_count
+
+    def body_count(document_id: str) -> int:
+        cached = body_token_counts.get(document_id)
+        if cached is not None:
+            return cached
+        document = corpus[document_id]
+        value = count_tokens(encode, f"{document.title}\n{document.text}")
+        body_token_counts[document_id] = value
+        return value
+
+    while _distance_to_token_window(current_count, contract):
+        current_ids = {document.document_id for document in pool}
+        removals = sorted(
+            (
+                body_count(document.document_id),
+                slot,
+                document.document_id,
+            )
+            for slot, document in enumerate(pool)
+            if document.document_id not in core_ids and slot not in changed_slots
+        )
+        if not removals:
+            raise ManifestValidationError(
+                f"QA {example.qa.qa_id} cannot fit the formal token window without "
+                "replacing a core document or a previously repaired slot"
+            )
+        removal_weights = tuple(value[0] for value in removals)
+        proposals = []
+        for alternative_rank, added_id in enumerate(
+            alternatives,
+            start=needed_distractors,
+        ):
+            if added_id in current_ids or added_id in initial_pool_ids:
+                continue
+            added_weight = body_count(added_id)
+            removed_weight, slot, removed_id, predicted_count = (
+                _best_removal_for_addition(
+                    removals,
+                    removal_weights,
+                    added_weight=added_weight,
+                    current_count=current_count,
+                    contract=contract,
+                )
+            )
+            proposals.append(
+                (
+                    _distance_to_token_window(predicted_count, contract),
+                    abs(
+                        predicted_count
+                        - (
+                            contract.min_context_tokens
+                            + contract.max_context_tokens
+                        )
+                        // 2
+                    ),
+                    alternative_rank,
+                    slot,
+                    added_id,
+                    removed_id,
+                    removed_weight,
+                )
+            )
+        if not proposals:
+            raise _LengthFitSearchExhausted(
+                f"QA {example.qa.qa_id} has no unused ranked distractor for formal "
+                "token-window fitting"
+            )
+
+        repaired = False
+        pool_state = ordered_values_sha256(
+            tuple(document.document_id for document in pool)
+        )
+        exact_trials = heapq.nsmallest(
+            _FORMAL_TRAIN_EXACT_TRIALS_PER_RESERVE,
+            (
+                proposal
+                for proposal in proposals
+                if (pool_state, current_count, proposal[3], proposal[4])
+                not in failed_exact_trials
+            ),
+        )
+        for _, _, _, slot, added_id, removed_id, _ in exact_trials:
+            if pool[slot].document_id != removed_id:
+                raise ManifestValidationError(
+                    "formal length-fitting proposal references a stale document slot"
+                )
+            trial = list(pool)
+            trial[slot] = corpus[added_id]
+            trial_count = count_tokens(encode, render_context(trial))
+            if not _is_monotonic_token_improvement(
+                current_count,
+                trial_count,
+                contract,
+            ):
+                failed_exact_trials.add(
+                    (pool_state, current_count, slot, added_id)
+                )
+                continue
+            pool = trial
+            current_count = trial_count
+            changed_slots.add(slot)
+            repaired = True
+            break
+        if not repaired:
+            raise _LengthFitSearchExhausted(
+                f"QA {example.qa.qa_id} has no exact monotonic distractor replacement "
+                f"from {current_count} tokens into [{contract.min_context_tokens}, "
+                f"{contract.max_context_tokens}]"
+            )
+
+    final_ids = tuple(document.document_id for document in pool)
+    if len(final_ids) != contract.document_count or len(set(final_ids)) != len(final_ids):
+        raise ManifestValidationError("formal length fitting lost unique documents")
+    if not core_ids.issubset(final_ids):
+        raise ManifestValidationError("formal length fitting replaced a core document")
+    return tuple(pool), current_count
 
 
 def _parse_all_examples(
@@ -1119,9 +1377,12 @@ def build_train_records(
     metadata: ManifestMetadata,
     encode: Callable[[str], Any],
     contract: TrainManifestContract = TrainManifestContract(),
+    fit_context_window: bool = False,
 ) -> tuple[ManifestRecord, ...]:
     """Build the fixed 512/200 train set and enforce the 6-chunk token window."""
 
+    if type(fit_context_window) is not bool:
+        raise TypeError("fit_context_window must be a bool")
     contract.validate()
     metadata.validate()
     selected = _select_examples(examples, qa_count=contract.qa_count, seed=metadata.seed)
@@ -1129,13 +1390,31 @@ def build_train_records(
     qa_ids = tuple(example.qa.qa_id for example in selected)
     qa_order_sha256 = ordered_values_sha256(qa_ids)
     records = []
+    body_token_counts: dict[str, int] = {}
     for qa_index, example in enumerate(selected):
+        ranked_distractors: tuple[str, ...] | None = None
+        distractor_count = len(corpus) - len(example.documents)
+        needed_distractors = contract.document_count - len(example.documents)
+        ranked_limit: int | None = None
+        failed_exact_trials: set[tuple[str, int, int, str]] = set()
+        if fit_context_window and needed_distractors >= 0:
+            ranked_limit = min(
+                distractor_count,
+                needed_distractors + _FORMAL_TRAIN_INITIAL_DISTRACTOR_RESERVE,
+            )
+            ranked_distractors = _ranked_distractor_ids(
+                example,
+                corpus=corpus,
+                seed=metadata.seed,
+                limit=ranked_limit,
+            )
         pool, facts = _materialize_document_pool(
             example,
             corpus=corpus,
             prefix_document_count=contract.document_count,
             pool_document_count=contract.document_count,
             seed=metadata.seed,
+            ranked_distractor_ids=ranked_distractors,
         )
         pool_hash = ordered_values_sha256(
             tuple(document.document_id for document in pool)
@@ -1152,6 +1431,66 @@ def build_train_records(
             pool_document_count=contract.document_count,
             document_pool_sha256=pool_hash,
         )
+        if (
+            fit_context_window
+            and _distance_to_token_window(record.context_token_count, contract)
+        ):
+            assert ranked_distractors is not None
+            assert ranked_limit is not None
+            while True:
+                failed_trial_count = len(failed_exact_trials)
+                try:
+                    pool, expected_context_token_count = _fit_formal_train_pool(
+                        example,
+                        initial_pool=pool,
+                        initial_context_token_count=record.context_token_count,
+                        ranked_distractor_ids=ranked_distractors,
+                        corpus=corpus,
+                        encode=encode,
+                        contract=contract,
+                        body_token_counts=body_token_counts,
+                        failed_exact_trials=failed_exact_trials,
+                    )
+                except _LengthFitSearchExhausted as exc:
+                    if ranked_limit >= distractor_count:
+                        if len(failed_exact_trials) > failed_trial_count:
+                            continue
+                        raise ManifestValidationError(str(exc)) from exc
+                    reserve_count = max(
+                        1,
+                        ranked_limit - needed_distractors,
+                    )
+                    ranked_limit = min(
+                        distractor_count,
+                        needed_distractors + reserve_count * 2,
+                    )
+                    ranked_distractors = _ranked_distractor_ids(
+                        example,
+                        corpus=corpus,
+                        seed=metadata.seed,
+                        limit=ranked_limit,
+                    )
+                    continue
+                break
+            pool_hash = ordered_values_sha256(
+                tuple(document.document_id for document in pool)
+            )
+            record = build_manifest_record(
+                metadata=metadata,
+                qa_index=qa_index,
+                qa_order_sha256=qa_order_sha256,
+                qa=example.qa,
+                documents=pool,
+                supporting_facts=facts,
+                encode=encode,
+                chunk_size=contract.chunk_size,
+                pool_document_count=contract.document_count,
+                document_pool_sha256=pool_hash,
+            )
+            if record.context_token_count != expected_context_token_count:
+                raise ManifestValidationError(
+                    "formal length-fitting token count changed during final materialization"
+                )
         if not (
             contract.min_context_tokens
             <= record.context_token_count
@@ -1739,6 +2078,7 @@ def _build_in_directory(
             metadata=metadata,
             encode=encode,
             contract=train_contract,
+            fit_context_window=profile == "formal",
         )
         variants = (("train", built),)
         contract_value = train_contract.to_dict()

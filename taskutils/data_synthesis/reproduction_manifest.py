@@ -662,6 +662,14 @@ def _tokenize(encode: Callable[[str], Any], text: str) -> _Tokenized:
     )
 
 
+def count_tokens(encode: Callable[[str], Any], text: str) -> int:
+    """Count tokens with the same strict tokenizer contract used by manifests."""
+
+    if not isinstance(text, str):
+        raise TypeError(f"text must be str, got {type(text).__name__}")
+    return _tokenize(encode, text).count
+
+
 def _block_char_spans(documents: Sequence[DocumentInput]) -> tuple[tuple[int, int], ...]:
     blocks = [
         f"Document {index + 1}:\n{document.title}\n{document.text}"
@@ -1366,6 +1374,7 @@ __all__ = [
     "write_canonical_jsonl",
     "validate_canonical_jsonl",
     "render_context",
+    "count_tokens",
     "seal_manifest_record",
     "build_manifest_record",
     "validate_manifest_record",

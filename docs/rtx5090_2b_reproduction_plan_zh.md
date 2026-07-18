@@ -309,6 +309,14 @@ title 不在 context、10 条为空 context、1 条句子索引越界，即至�
 排除；这会形成明显的结构可验证子集选择限制，必须在报告和简历说明中披露，不能把该子集描述成
 无筛选的完整 dev。精确 accepted/rejected 数仍以正式 sealed ledger 为准。
 
+formal train 的 `25,001-30,000` token 长度窗口采用确定性的可行性拟合，而不是更换不合格 QA：固定
+seed/rank 选出的 QA、core/evidence 文档及 supporting-fact provenance 全程不变，只允许在同一封存源
+语料中按固定 rank 逐个替换 distractor slot。每次候选替换都用固定 revision 的完整 tokenizer
+（`add_special_tokens=False`）重新精确计数，且只有相对合法窗口的距离严格改善才接受；进入窗口即停止，
+候选耗尽仍不满足则整个 bundle fail closed，禁止跳到下一个 QA、复制/合成文档或放宽窗口。该过程是
+确定性的贪心可行性拟合，不能宣称找到全局最优文档组合；formal eval 的 200/800-document pool 不使用
+这套长度拟合。
+
 相对 4B 方案，每步 trajectories 从 32 降为 8。40/80 steps 不再代表相同算力或样本暴露量，报告中
 必须同时给出 prompt groups、trajectories、生成 token、有效 advantage group 数和 wall time。
 

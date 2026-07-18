@@ -918,6 +918,184 @@ def test_train_bundle_emits_memory_dataset_columns_and_enforces_token_window(tmp
     assert loaded[0]["reward_model"]["ground_truth"] == loaded[0]["answers"]
 
 
+def _length_fit_case(*, initial_words, replacement_words):
+    example = parse_source_record(
+        _hotpot_record(0),
+        dataset="hotpotqa",
+        source_index=0,
+    )
+    corpus = builder._canonical_corpus((example,))
+    documents = []
+    for name, word_count in (
+        ("initial", initial_words),
+        ("replacement", replacement_words),
+    ):
+        document = builder.DocumentInput(
+            title=f"{name} distractor",
+            text=" ".join(f"{name}-{index}" for index in range(word_count)),
+            source_document_id=f"fixture:{name}",
+        )
+        corpus[document.document_id] = document
+        documents.append(document)
+    ranked = tuple(document.document_id for document in documents)
+    initial_pool, facts = builder._materialize_document_pool(
+        example,
+        corpus=corpus,
+        prefix_document_count=3,
+        pool_document_count=3,
+        seed=42,
+        ranked_distractor_ids=ranked,
+    )
+    initial_count = builder.count_tokens(
+        _tokenize_with_offsets,
+        builder.render_context(initial_pool),
+    )
+    return example, corpus, ranked, initial_pool, facts, initial_count
+
+
+@pytest.mark.parametrize("direction", ["short", "long"])
+def test_formal_train_length_fit_is_deterministic_and_preserves_core_facts(direction):
+    if direction == "short":
+        values = _length_fit_case(initial_words=1, replacement_words=20)
+    else:
+        values = _length_fit_case(initial_words=20, replacement_words=1)
+    example, corpus, ranked, initial_pool, facts, initial_count = values
+    if direction == "short":
+        minimum, maximum = initial_count + 5, initial_count + 25
+    else:
+        minimum, maximum = 1, initial_count - 5
+    contract = TrainManifestContract(
+        qa_count=1,
+        document_count=3,
+        chunk_size=maximum,
+        max_chunks=1,
+        min_context_tokens=minimum,
+        max_context_tokens=maximum,
+    )
+
+    results = [
+        builder._fit_formal_train_pool(
+            example,
+            initial_pool=initial_pool,
+            initial_context_token_count=initial_count,
+            ranked_distractor_ids=ranked,
+            corpus=corpus,
+            encode=_tokenize_with_offsets,
+            contract=contract,
+            body_token_counts={},
+        )
+        for _ in range(2)
+    ]
+
+    assert results[0] == results[1]
+    fitted_pool, fitted_count = results[0]
+    assert minimum <= fitted_count <= maximum
+    initial_ids = [document.document_id for document in initial_pool]
+    fitted_ids = [document.document_id for document in fitted_pool]
+    changed_slots = [
+        index
+        for index, values in enumerate(zip(initial_ids, fitted_ids))
+        if values[0] != values[1]
+    ]
+    assert len(changed_slots) == 1
+    core_ids = {document.document_id for document in example.documents}
+    assert core_ids.issubset(fitted_ids)
+    assert all(
+        initial_ids[index] == fitted_ids[index]
+        for index, document_id in enumerate(initial_ids)
+        if document_id in core_ids
+    )
+
+    metadata = builder.ManifestMetadata(
+        source_name="hotpotqa",
+        source_revision="source-rev",
+        source_sha256="0" * 64,
+        tokenizer_name="tokenizer",
+        tokenizer_revision="tokenizer-rev",
+        seed=42,
+    )
+    qa_order_sha256 = ordered_values_sha256((example.qa.qa_id,))
+    records = []
+    for pool in (initial_pool, fitted_pool):
+        records.append(
+            builder.build_manifest_record(
+                metadata=metadata,
+                qa_index=0,
+                qa_order_sha256=qa_order_sha256,
+                qa=example.qa,
+                documents=pool,
+                supporting_facts=facts,
+                encode=_tokenize_with_offsets,
+                chunk_size=maximum,
+                pool_document_count=3,
+                document_pool_sha256=ordered_values_sha256(
+                    tuple(document.document_id for document in pool)
+                ),
+            )
+        )
+    assert [
+        (
+            fact.fact_id,
+            fact.document_id,
+            fact.document_position,
+            fact.sentence_index,
+            fact.text,
+        )
+        for fact in records[0].supporting_facts
+    ] == [
+        (
+            fact.fact_id,
+            fact.document_id,
+            fact.document_position,
+            fact.sentence_index,
+            fact.text,
+        )
+        for fact in records[1].supporting_facts
+    ]
+
+
+def test_formal_train_length_fit_fails_closed_without_an_exact_improvement():
+    values = _length_fit_case(initial_words=1, replacement_words=1)
+    example, corpus, ranked, initial_pool, _, initial_count = values
+    contract = TrainManifestContract(
+        qa_count=1,
+        document_count=3,
+        chunk_size=initial_count + 10,
+        max_chunks=1,
+        min_context_tokens=initial_count + 5,
+        max_context_tokens=initial_count + 10,
+    )
+
+    with pytest.raises(ManifestValidationError, match="no exact monotonic"):
+        builder._fit_formal_train_pool(
+            example,
+            initial_pool=initial_pool,
+            initial_context_token_count=initial_count,
+            ranked_distractor_ids=ranked,
+            corpus=corpus,
+            encode=_tokenize_with_offsets,
+            contract=contract,
+            body_token_counts={},
+        )
+
+
+def test_bounded_distractor_ranking_is_the_exact_full_ranking_prefix():
+    examples = tuple(
+        parse_source_record(_hotpot_record(index), dataset="hotpotqa", source_index=index)
+        for index in range(5)
+    )
+    corpus = builder._canonical_corpus(examples)
+    full = builder._ranked_distractor_ids(examples[0], corpus=corpus, seed=42)
+    bounded = builder._ranked_distractor_ids(
+        examples[0],
+        corpus=corpus,
+        seed=42,
+        limit=3,
+    )
+
+    assert bounded == full[:3]
+
+
 def test_cli_fixture_build_runs_end_to_end_without_loading_remote_tokenizer(
     tmp_path,
     capsys,

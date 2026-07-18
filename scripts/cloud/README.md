@@ -101,6 +101,12 @@ supporting facts 重建。BytedTsinghua-SIA 的 32k/dev parquet 仍按 hash 缓�
 句子索引越界；这是源数据的选择限制，不是可自动修复的下载错误。CPU finalize 会把精确数量写入 ledger，
 正式报告必须披露，不能把筛选后的集合称为完整、无筛选 dev。
 
+formal train 的长度拟合不改变固定 QA 选择、core/evidence 或 supporting facts，也不会用失败 QA 的后继
+样本顶替。脚本只在同一封存源语料内按固定 seed/rank 逐个替换 distractor slot；每次都用固定 tokenizer
+完整精确计数，并且只接受到 `25,001-30,000` 合法窗口距离严格缩小的替换。进入窗口后停止，候选耗尽则
+fail closed，不复制/合成文档、不放宽窗口。它只是确定性的贪心可行性拟合，不代表全局最优；formal eval
+保持原 200/800-document pool，不运行该拟合。
+
 ## GPU 门禁与容量语义
 
 GPU admission 在任何 CUDA 编译和权重加载前重验完整 CPU handoff，然后设置 offline 环境。G0 使用
