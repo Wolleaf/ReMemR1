@@ -865,6 +865,12 @@ def test_r1_launch_binds_marker_bytes_and_failure_requires_new_nonce(
     assert terminal["retryable"] is False
     assert "new R1 approval nonce" in terminal["retry_hint"]
     assert "retryable=false" in (launcher / "terminal").read_text(encoding="utf-8")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (
+        launcher / "shutdown-skipped"
+    ).read_text(encoding="ascii").strip() == "training-not-started"
 
 
 def test_bc_failure_requires_new_budget_generation(launcher_tmp_path):
@@ -882,10 +888,17 @@ def test_bc_failure_requires_new_budget_generation(launcher_tmp_path):
         _bash_path(budget),
         expected_returncodes=(0, 23),
     )
-    terminal = _terminal_json(_wait_for_terminal(launcher_root))
+    launcher = _wait_for_terminal(launcher_root)
+    terminal = _terminal_json(launcher)
     assert terminal["retryable"] is False
     assert "new budget projection" in terminal["retry_hint"]
     assert "new immutable generation" in terminal["retry_hint"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (
+        launcher / "shutdown-skipped"
+    ).read_text(encoding="ascii").strip() == "training-not-started"
 
 
 def test_success_publishes_durable_state_before_shutdown_request(launcher_tmp_path):
