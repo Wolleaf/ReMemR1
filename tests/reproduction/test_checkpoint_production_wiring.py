@@ -137,6 +137,25 @@ def test_worker_adapter_export_uses_full_param_context_and_adapter_only_helper()
     assert "export_peft_adapter(self.actor_module" in source
 
 
+def test_worker_full_param_context_avoids_unsupported_single_rank_cpu_offload():
+    for method_name in (
+        "export_reproduction_adapter",
+        "save_checkpoint",
+        "load_checkpoint",
+    ):
+        method = _class_method(
+            WORKER_PATH,
+            "ActorRolloutRefWorker",
+            method_name,
+        )
+        summon_calls = _calls(method, "summon_full_params")
+
+        assert len(summon_calls) == 1
+        keywords = {keyword.arg: keyword.value for keyword in summon_calls[0].keywords}
+        assert ast.unparse(keywords["offload_to_cpu"]) == "self.world_size > 1"
+        assert ast.unparse(keywords["rank0_only"]) == "True"
+
+
 def test_trainer_publishes_whole_global_step_before_updating_tracker():
     method = _class_method(
         TRAINER_PATH,

@@ -1253,7 +1253,9 @@ class ActorRolloutRefWorker(Worker):
             recurse=True,
             writeback=False,
             rank0_only=True,
-            offload_to_cpu=True,
+            # PyTorch converts single-rank FULL_SHARD to NO_SHARD, where
+            # summon_full_params does not support CPU offload.
+            offload_to_cpu=self.world_size > 1,
         ):
             if self.rank == 0:
                 if not hasattr(self.actor_module, "peft_config"):
@@ -1317,7 +1319,7 @@ class ActorRolloutRefWorker(Worker):
                 recurse=True,
                 writeback=False,
                 rank0_only=True,
-                offload_to_cpu=True,
+                offload_to_cpu=self.world_size > 1,
             ):
                 if self.rank == 0:
                     save_metadata.update(self._current_adapter_state_metadata())
@@ -1355,7 +1357,7 @@ class ActorRolloutRefWorker(Worker):
                 recurse=True,
                 writeback=False,
                 rank0_only=True,
-                offload_to_cpu=True,
+                offload_to_cpu=self.world_size > 1,
             ):
                 if self.rank == 0:
                     loaded_metadata = self._current_adapter_state_metadata()
