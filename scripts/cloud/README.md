@@ -233,14 +233,17 @@ bash /root/autodl-tmp/ReMemR1/scripts/cloud/run_gpu.sh --retry-failed-stage --ke
 
 ## 关机安全边界
 
-自动关机顺序固定为：stage/pipeline 终态 -> launcher log sentinel/terminal/original exit code -> durable
-sync -> `shutdown-safe` -> 复验 Linux/root/mount/path/commit/capability/flock/state ->
+GPU launcher 只有在模型和首批训练数据已经就绪、即将进入第一次真实 rollout 时才发布
+`training-started`；此前的 CPU finalize、pytest、config/handoff、GPU preflight、binding 或模型加载失败
+都会留下终态并保持实例运行。解锁后的自动关机顺序固定为：stage/pipeline 终态 -> launcher log
+sentinel/terminal/original exit code -> durable sync -> `shutdown-armed` -> `shutdown-safe` ->
+复验 Linux/root/mount/path/commit/capability/flock/state ->
 `shutdown-backend`/`shutdown-requested` -> 已绑定 SHA-256 的 AutoDL `/usr/bin/shutdown` wrapper。
-成功、普通失败、scientific-stop 42 和 capacity-stop 43 都走同一终态关机路径；wrapper 会结束容器，
+训练解锁后的成功、普通失败、scientific-stop 42 和 capacity-stop 43 都走同一终态关机路径；wrapper 会结束容器，
 因此 `shutdown-dispatched` 可能来不及落盘，`shutdown-requested` 只证明已发出请求，最终仍以控制台为准。
 
 以下情况故意保持实例运行：参数校验失败、锁冲突、终态或日志无法持久化、sync 失败、mount/path/
-symlink/capability/commit/flock 复验失败、test mode、`--keep-running` 或 `--dry-run`。SIGKILL、宿主掉电
+symlink/capability/commit/flock 复验失败、训练尚未开始、test mode、`--keep-running` 或 `--dry-run`。SIGKILL、宿主掉电
 或整机 OOM 无法由 guest 脚本补救，必须同时设置 AutoDL 最长运行时和余额告警。
 
 ## 结果与简历口径

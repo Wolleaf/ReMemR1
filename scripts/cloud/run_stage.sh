@@ -381,6 +381,49 @@ completed_stage_run() {
     printf '%s\n' "${run}"
 }
 
+publish_launcher_training_started() {
+    local source="${RUN_DIR}/training-started.json"
+    local destination="${REMEMR1_TRAINING_STARTED_MARKER:-}"
+    [[ -n "${destination}" ]] || return 0
+    [[ -f "${source}" && ! -L "${source}" ]] || return 74
+    "${PYTHON}" - "${source}" \
+        "${RUN_DIR}/runtime-bound/runtime-bound.yaml" "$(basename -- "${RUN_DIR}")" <<'PY' || return 74
+import json
+import sys
+
+from omegaconf import OmegaConf
+
+marker = json.load(open(sys.argv[1], encoding="utf-8"))
+config = OmegaConf.load(sys.argv[2]).reproduction
+assert set(marker) == {
+    "event", "global_step", "runtime_attempt_id", "runtime_binding_sha256",
+    "schema_version", "sealed_config_id", "sealed_config_sha256",
+}
+assert marker["event"] == "first-rollout-started"
+assert type(marker["global_step"]) is int and marker["global_step"] >= 1
+assert marker["schema_version"] == 1
+assert marker["runtime_attempt_id"] == config.runtime_attempt_id == sys.argv[3]
+assert marker["runtime_binding_sha256"] == config.runtime_binding_sha256
+assert marker["sealed_config_id"] == config.sealed_config_id
+assert marker["sealed_config_sha256"] == config.sealed_config_sha256
+PY
+    [[ "${destination}" == /* && "$(basename -- "${destination}")" == \
+       training-started ]] || return 74
+    local launcher_root destination_parent digest
+    launcher_root="$(rememr1_realpath_existing "${LAUNCHER_ROOT}")" || return 74
+    destination_parent="$(rememr1_realpath_existing \
+        "$(dirname -- "${destination}")")" || return 74
+    [[ "$(dirname -- "${destination_parent}")" == "${launcher_root}" ]] || return 74
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+        [[ -f "${destination}" && ! -L "${destination}" ]] || return 74
+        return 0
+    fi
+    digest="$(sha256sum "${source}" | awk '{print $1}')" || return 74
+    atomic_write "${destination}" \
+        "attempt_dir=${RUN_DIR} training_started_sha256=${digest}" || return 74
+    rememr1_sync_file "${destination}" || return 74
+}
+
 run_bound_training() {
     local config_id="$1"
     local duration="$2"
@@ -419,7 +462,7 @@ run_bound_training() {
         "${PYTHON}" scripts/cloud/run_resolved_training.py verify \
         --attempt-dir "${RUN_DIR}"
 
-    local training_rc cleanup_rc telemetry_rc expected_step="" length_stress=no
+    local training_rc training_started_rc=0 cleanup_rc telemetry_rc expected_step="" length_stress=no
     local expected_train_file="" expected_validation_file=""
     local expected_train_manifest="" expected_validation_manifest=""
     local expected_base_model="" expected_revision=""
@@ -429,9 +472,16 @@ run_bound_training() {
         "${PYTHON}" scripts/cloud/run_resolved_training.py run \
         --attempt-dir "${RUN_DIR}"
     training_rc="$?"
+    if [[ -e "${RUN_DIR}/training-started.json" || \
+          -L "${RUN_DIR}/training-started.json" ]]; then
+        publish_launcher_training_started || training_started_rc="$?"
+    fi
     stop_ray
     cleanup_rc="$?"
     set -e
+    if [[ "${training_started_rc}" -ne 0 ]]; then
+        echo "training started, but the launcher shutdown arm was not published" >&2
+    fi
     if [[ "${cleanup_rc}" -ne 0 ]]; then
         echo "Ray cleanup failed after ${config_id} (exit ${cleanup_rc})" >&2
         [[ "${training_rc}" -eq 0 ]] && return "${cleanup_rc}"

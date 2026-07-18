@@ -240,9 +240,35 @@ verify_guest_shutdown_authorization() {
     verify_cloud_lock_fd "${lock}" || \
         _shutdown_reject "worker does not hold the configured lock on FD 9" || return
 
-    [[ -f "${launcher}/shutdown-safe" && -f "${launcher}/exit-code" && \
-       -f "${launcher}/terminal.json" && -f "${launcher}/lock-acquired" ]] || \
+    [[ -f "${launcher}/shutdown-armed" && \
+       ! -L "${launcher}/shutdown-armed" && \
+       -s "${launcher}/shutdown-armed" && \
+       -f "${launcher}/shutdown-safe" && -f "${launcher}/exit-code" && \
+       -f "${launcher}/terminal.json" && \
+       -f "${launcher}/terminal" && ! -L "${launcher}/terminal" && \
+       -f "${launcher}/lock-acquired" ]] || \
         _shutdown_reject "durable terminal launcher state is incomplete" || return
+    local arm_value terminal_phase="" terminal_training_started="" key value
+    arm_value="$(<"${launcher}/shutdown-armed")"
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            phase) terminal_phase="${value}" ;;
+            training_started) terminal_training_started="${value}" ;;
+        esac
+    done < "${launcher}/terminal"
+    case "${terminal_phase}" in
+        gpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
+            [[ "${arm_value}" == training-started && \
+               "${terminal_training_started}" == yes ]] || \
+                _shutdown_reject "GPU shutdown was not armed by real training" || return
+            ;;
+        cpu)
+            [[ "${arm_value}" == phase-does-not-train && \
+               "${terminal_training_started}" == no ]] || \
+                _shutdown_reject "CPU shutdown arm is inconsistent" || return
+            ;;
+        *) _shutdown_reject "launcher terminal phase is invalid" || return ;;
+    esac
     [[ ! -e "${launcher}/.running" && ! -e "${launcher}/.starting" ]] || \
         _shutdown_reject "launcher still has a nonterminal marker" || return
     local exit_code

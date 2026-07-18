@@ -101,6 +101,8 @@ if [[ -n "${budget_projection}" ]]; then
 fi
 REMEMR1_LAUNCHER_DIR="${launcher_dir}"
 export REMEMR1_LAUNCHER_DIR
+REMEMR1_TRAINING_STARTED_MARKER="${launcher_dir}/training-started"
+export REMEMR1_TRAINING_STARTED_MARKER
 
 started_at="$(rememr1_utc_now)"
 lock_acquired=no
@@ -110,6 +112,14 @@ pipeline_invoked=no
 primary_result_file=""
 composite_active_phase=""
 composite_active_result_file=""
+training_started=no
+training_started_marker_unsafe=no
+shutdown_training_required=no
+case "${phase}" in
+    gpu|gpu-gates|gpu-capacity|gpu-bc40|gpu-bc80|gpu-export)
+        shutdown_training_required=yes
+        ;;
+esac
 
 launcher_test_failure_requested() {
     [[ "${REMEMR1_TEST_MODE:-no}" == "yes" && \
@@ -203,6 +213,51 @@ publish_active_composite_result() {
         "${primary_result_file}.terminal" "composite pipeline terminal"
 }
 
+refresh_training_started() {
+    training_started=no
+    training_started_marker_unsafe=no
+    [[ "${shutdown_training_required}" == yes ]] || return 0
+    local marker="${REMEMR1_TRAINING_STARTED_MARKER}"
+    [[ -e "${marker}" || -L "${marker}" ]] || return 0
+    if [[ ! -f "${marker}" || -L "${marker}" ]]; then
+        training_started_marker_unsafe=yes
+        return 0
+    fi
+    local value attempt digest observed source
+    value="$(<"${marker}")"
+    attempt="${value#attempt_dir=}"
+    attempt="${attempt%% training_started_sha256=*}"
+    digest="${value##* training_started_sha256=}"
+    if [[ "${value}" != "attempt_dir=${attempt} training_started_sha256=${digest}" || \
+          "${attempt}" != /* || ! "${digest}" =~ ^[0-9a-f]{64}$ || \
+          ! -d "${attempt}" || -L "${attempt}" ]]; then
+        training_started_marker_unsafe=yes
+        return 0
+    fi
+    attempt="$(rememr1_realpath_existing "${attempt}")" || {
+        training_started_marker_unsafe=yes
+        return 0
+    }
+    if ! rememr1_path_is_within "${attempt}" "${persist_real}"; then
+        training_started_marker_unsafe=yes
+        return 0
+    fi
+    source="${attempt}/training-started.json"
+    if [[ ! -f "${source}" || -L "${source}" ]]; then
+        training_started_marker_unsafe=yes
+        return 0
+    fi
+    observed="$(sha256sum "${source}" | awk '{print $1}')" || {
+        training_started_marker_unsafe=yes
+        return 0
+    }
+    if [[ "${observed}" != "${digest}" ]]; then
+        training_started_marker_unsafe=yes
+        return 0
+    fi
+    training_started=yes
+}
+
 publish_terminal_state() {
     local rc="$1"
     local final_outcome="$2"
@@ -241,7 +296,7 @@ publish_terminal_state() {
         retry_hint="inspect the failure, then relaunch with --retry-failed-stage"
     fi
     terminal_json="$(printf \
-        '{\n  "schema_version": 1,\n  "phase": "%s",\n  "experiment_profile_id": "%s",\n  "offload_profile": "%s",\n  "budget_projection": "%s",\n  "budget_projection_file_sha256": "%s",\n  "outcome": "%s",\n  "exit_code": %s,\n  "retryable": %s,\n  "retry_hint": "%s",\n  "expected_commit": "%s",\n  "started_at": "%s",\n  "finished_at": "%s",\n  "pipeline_result": "%s",\n  "pipeline_terminal_dir": "%s"\n}' \
+        '{\n  "schema_version": 1,\n  "phase": "%s",\n  "experiment_profile_id": "%s",\n  "offload_profile": "%s",\n  "budget_projection": "%s",\n  "budget_projection_file_sha256": "%s",\n  "outcome": "%s",\n  "exit_code": %s,\n  "retryable": %s,\n  "retry_hint": "%s",\n  "training_started": %s,\n  "expected_commit": "%s",\n  "started_at": "%s",\n  "finished_at": "%s",\n  "pipeline_result": "%s",\n  "pipeline_terminal_dir": "%s"\n}' \
         "$(rememr1_json_escape "${phase}")" \
         "$(rememr1_json_escape "${REMEMR1_EXPERIMENT_PROFILE}")" \
         "$(rememr1_json_escape "${offload_profile}")" \
@@ -249,13 +304,14 @@ publish_terminal_state() {
         "${budget_projection_file_sha256}" \
         "$(rememr1_json_escape "${final_outcome}")" "${rc}" "${retryable}" \
         "$(rememr1_json_escape "${retry_hint}")" \
+        "$([[ "${training_started}" == yes ]] && printf true || printf false)" \
         "${EXPECTED_COMMIT}" \
         "${started_at}" "${finished_at}" "$(rememr1_json_escape "${result_path}")" \
         "$(rememr1_json_escape "${pipeline_terminal_dir}")")"
     terminal_text="$(printf \
-        'phase=%s\noutcome=%s\nexit_code=%s\nretryable=%s\nretry_hint=%s\nstarted_at=%s\nfinished_at=%s\npipeline_result=%s\npipeline_terminal_dir=%s' \
+        'phase=%s\noutcome=%s\nexit_code=%s\nretryable=%s\nretry_hint=%s\ntraining_started=%s\nstarted_at=%s\nfinished_at=%s\npipeline_result=%s\npipeline_terminal_dir=%s' \
         "${phase}" "${final_outcome}" "${rc}" "${retryable}" "${retry_hint}" \
-        "${started_at}" "${finished_at}" "${result_path}" \
+        "${training_started}" "${started_at}" "${finished_at}" "${result_path}" \
         "${pipeline_terminal_dir}")"
     [[ -f "${launcher_dir}/launcher.log" && ! -L "${launcher_dir}/launcher.log" ]] || return
     printf '[launcher] terminal-state-published exit_code=%s outcome=%s\n' \
@@ -291,6 +347,7 @@ finish_worker() {
     trap - EXIT INT TERM
     set +e
     local publish_ok=no reserve sync_rc pipeline_state pipeline_shutdown_inhibited=no
+    refresh_training_started
     if [[ "${phase}" == "gpu" && -n "${composite_active_phase}" ]] && \
        ! publish_active_composite_result; then
         pipeline_shutdown_inhibited=yes
@@ -333,8 +390,13 @@ finish_worker() {
         fi
     fi
     if [[ "${lock_acquired}" == "yes" && "${sync_rc}" -eq 0 && \
-          "${pipeline_shutdown_inhibited}" != yes ]]; then
-        if atomic_write "${launcher_dir}/shutdown-safe" "$(rememr1_utc_now)"; then
+          "${pipeline_shutdown_inhibited}" != yes && \
+          ( "${shutdown_training_required}" != yes || \
+            "${training_started}" == yes ) ]]; then
+        if atomic_write "${launcher_dir}/shutdown-armed" \
+               "$([[ "${training_started}" == yes ]] && \
+                   printf training-started || printf phase-does-not-train)" && \
+           atomic_write "${launcher_dir}/shutdown-safe" "$(rememr1_utc_now)"; then
             rememr1_sync_all
             sync_rc=$?
             if [[ "${sync_rc}" -eq 0 ]]; then
@@ -360,6 +422,17 @@ finish_worker() {
         rememr1_sync_all || true
     elif [[ "${dry_run}" == "yes" ]]; then
         atomic_write "${launcher_dir}/shutdown-skipped" "dry-run" || true
+        rememr1_sync_all || true
+    elif [[ "${shutdown_training_required}" == yes && \
+            "${training_started}" != yes ]]; then
+        rm -f -- "${launcher_dir}/shutdown-safe" "${launcher_dir}/shutdown-armed"
+        if [[ "${training_started_marker_unsafe}" == yes ]]; then
+            atomic_write "${launcher_dir}/shutdown-skipped" \
+                "training-start-marker-unsafe" || true
+        else
+            atomic_write "${launcher_dir}/shutdown-skipped" \
+                "training-not-started" || true
+        fi
         rememr1_sync_all || true
     elif [[ "${REMEMR1_TEST_MODE:-no}" == "yes" ]]; then
         request_guest_shutdown "${launcher_dir}" "${phase}" "${rc}" || true

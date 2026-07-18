@@ -111,6 +111,32 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 WorkerType = Type[Worker]
 
 
+def publish_training_started(reproduction_config, global_step):
+    """Durably mark the first batch immediately before its first rollout."""
+
+    telemetry_path = reproduction_config.get("runtime_telemetry_path")
+    if telemetry_path is None:
+        return None
+    marker = Path(telemetry_path).parent / "training-started.json"
+    if marker.exists() or marker.is_symlink():
+        raise RuntimeError(f"training started marker already exists: {marker}")
+    record = {
+        "event": "first-rollout-started",
+        "global_step": int(global_step),
+        "runtime_attempt_id": reproduction_config.runtime_attempt_id,
+        "runtime_binding_sha256": reproduction_config.runtime_binding_sha256,
+        "schema_version": 1,
+        "sealed_config_id": reproduction_config.sealed_config_id,
+        "sealed_config_sha256": reproduction_config.sealed_config_sha256,
+    }
+    atomic_write_text(
+        marker,
+        json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n",
+    )
+    return marker
+
+
 def _attach_recurrent_rollout_coordinates(
     gen_batch: DataProto,
     *,
@@ -1880,6 +1906,7 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         best_critic_score = -float('inf')
+        training_started_published = False
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -2051,6 +2078,12 @@ class RayPPOTrainer:
                                     trajectories_per_sample=self.config.actor_rollout_ref.rollout.n,
                                 )
 
+                            if not training_started_published:
+                                publish_training_started(
+                                    self.config.reproduction,
+                                    self.global_steps,
+                                )
+                                training_started_published = True
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop_revisit(gen_batch, timing_raw)
 
                             if capture_step_zero:

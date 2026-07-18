@@ -16,6 +16,28 @@ COMMIT = "a" * 40
 SHA256 = "b" * 64
 
 
+def _isolated_cloud_subprocess_env():
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("REMEMR1_") or name in {
+            "PERSIST_ROOT",
+            "EXPECTED_COMMIT",
+            "CAPABILITY_FILE",
+            "LOCK_FILE",
+            "LAUNCHER_ROOT",
+        }:
+            env.pop(name)
+    return env
+
+
+def test_pipeline_fixture_does_not_inherit_host_identity(monkeypatch):
+    monkeypatch.setenv("REMEMR1_PERSIST_ROOT", "/host/persist")
+    monkeypatch.setenv("EXPECTED_COMMIT", "host-commit")
+    env = _isolated_cloud_subprocess_env()
+    assert "REMEMR1_PERSIST_ROOT" not in env
+    assert "EXPECTED_COMMIT" not in env
+
+
 def _bash_path(path: Path) -> str:
     path = path.resolve()
     if os.name != "nt":
@@ -263,7 +285,7 @@ def _write_cloud_fixture(tmp_path: Path):
             f"export {key}={shlex.quote(value)}\n" for key, value in values.items()
         ).encode("ascii")
     )
-    env = os.environ.copy()
+    env = _isolated_cloud_subprocess_env()
     env.update(
         {
             "REMEMR1_CLOUD_ENV": _bash_path(env_file),

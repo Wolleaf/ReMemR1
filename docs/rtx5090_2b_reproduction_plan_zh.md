@@ -172,7 +172,8 @@ RAM 门禁，并在 G2 中证明峰值低于可用内存 80%、无 swap 和无�
 沿用现有云端状态机：
 
 - 公开 CPU 和 GPU 命令各使用一个全局持久锁、`nohup + setsid`、独立 launcher 和原始退出码；
-- 成功、non-retryable scientific-stop 和终态失败均先同步日志、匹配的 terminal marker、checkpoint/evidence，再请求 guest shutdown；
+- GPU launcher 只有在模型和首批数据就绪、即将进入第一次真实 rollout 时才封存 `training-started` 并解锁自动关机；CPU finalize、测试、配置、handoff、GPU preflight、模型加载或训练绑定失败均保持实例运行；
+- 解锁后，成功、non-retryable scientific-stop 和终态失败均先同步日志、匹配的 terminal marker、checkpoint/evidence，再请求 guest shutdown；
 - 锁冲突、状态无法落盘、sync 失败、授权复验失败、`--keep-running` 和 `--dry-run` 不关机；
 - guest shutdown 后仍必须在 AutoDL 控制台确认停止计费；
 - 正常 GPU 命令只跑到 G2/L0；B/C40 和 B/C80 仍需新费用投影与显式决策，不会被自动连跑。

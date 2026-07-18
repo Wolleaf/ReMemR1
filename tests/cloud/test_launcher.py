@@ -19,6 +19,28 @@ STATUS = REPO_ROOT / "scripts" / "cloud" / "status.sh"
 PREPARE_KERNEL_SOURCES = REPO_ROOT / "scripts" / "cloud" / "prepare_kernel_sources.sh"
 
 
+def _isolated_cloud_subprocess_env():
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("REMEMR1_") or name in {
+            "PERSIST_ROOT",
+            "EXPECTED_COMMIT",
+            "CAPABILITY_FILE",
+            "LOCK_FILE",
+            "LAUNCHER_ROOT",
+        }:
+            env.pop(name)
+    return env
+
+
+def test_cloud_fixture_does_not_inherit_host_identity(monkeypatch):
+    monkeypatch.setenv("REMEMR1_EXPECTED_COMMIT", "host-commit")
+    monkeypatch.setenv("PERSIST_ROOT", "/host/persist")
+    env = _isolated_cloud_subprocess_env()
+    assert "REMEMR1_EXPECTED_COMMIT" not in env
+    assert "PERSIST_ROOT" not in env
+
+
 def _bash_path(path: Path) -> str:
     path = path.resolve()
     if os.name != "nt":
@@ -54,7 +76,12 @@ def launcher_tmp_path(tmp_path):
         yield Path(path)
 
 
-def _write_cloud_fixture(tmp_path: Path, pipeline_rc: int = 0):
+def _write_cloud_fixture(
+    tmp_path: Path,
+    pipeline_rc: int = 0,
+    *,
+    training_started: bool = False,
+):
     project = tmp_path / "project"
     persist = tmp_path / "persist"
     launcher_root = persist / "launchers"
@@ -73,6 +100,15 @@ run_dir=\"${{PERSIST_ROOT}}/fake-pipeline-${{FAKE_PIPELINE_RC}}\"
 mkdir -p \"${{run_dir}}\"
 printf '%s\\n' \"$*\" > \"${{run_dir}}/args\"
 printf '%s\\n' \"${{run_dir}}\" > \"${{REMEMR1_RESULT_FILE}}\"
+if [[ \"${{FAKE_TRAINING_STARTED}}\" == yes ]]; then
+    attempt=\"${{PERSIST_ROOT}}/fake-training-attempt\"
+    mkdir -p \"${{attempt}}\"
+    printf '%s\\n' '{{\"event\":\"first-rollout-started\",\"global_step\":1,\"runtime_attempt_id\":\"fake-training-attempt\",\"runtime_binding_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"schema_version\":1,\"sealed_config_id\":\"g0_qwen35_08b\",\"sealed_config_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}' > \
+        \"${{attempt}}/training-started.json\"
+    digest=\"$(sha256sum \"${{attempt}}/training-started.json\" | awk '{{print $1}}')\"
+    printf 'attempt_dir=%s training_started_sha256=%s\\n' \
+        \"${{attempt}}\" \"${{digest}}\" > \"${{REMEMR1_TRAINING_STARTED_MARKER}}\"
+fi
 exit \"${{FAKE_PIPELINE_RC}}\"
 """.encode("ascii")
     )
@@ -95,23 +131,14 @@ exit \"${{FAKE_PIPELINE_RC}}\"
         )
     )
     shutdown_log = persist / "shutdown-events.log"
-    env = os.environ.copy()
-    for name in (
-        "REMEMR1_PROJECT_DIR",
-        "REMEMR1_PERSIST_ROOT",
-        "PERSIST_ROOT",
-        "EXPECTED_COMMIT",
-        "CAPABILITY_FILE",
-        "LOCK_FILE",
-        "LAUNCHER_ROOT",
-    ):
-        env.pop(name, None)
+    env = _isolated_cloud_subprocess_env()
     env.update(
         {
             "REMEMR1_CLOUD_ENV": _bash_path(env_file),
             "REMEMR1_TEST_MODE": "yes",
             "REMEMR1_TEST_SHUTDOWN_LOG": _bash_path(shutdown_log),
             "FAKE_PIPELINE_RC": str(pipeline_rc),
+            "FAKE_TRAINING_STARTED": "yes" if training_started else "no",
         }
     )
     if os.name == "nt":
@@ -121,6 +148,7 @@ exit \"${{FAKE_PIPELINE_RC}}\"
             "REMEMR1_TEST_SHUTDOWN_LOG",
             "REMEMR1_TEST_LAUNCHER_FAIL_AT",
             "FAKE_PIPELINE_RC",
+            "FAKE_TRAINING_STARTED",
         ]
         existing = env.get("WSLENV", "")
         env["WSLENV"] = ":".join(part for part in [existing, *forwarded] if part)
@@ -320,6 +348,7 @@ def _terminal_json(launcher: Path):
         "retryable",
         "schema_version",
         "started_at",
+        "training_started",
     }
     return value
 
@@ -761,6 +790,47 @@ def test_failure_publishes_exit_code_before_shutdown_request(launcher_tmp_path):
         result_dir = launcher_tmp_path / "persist" / "fake-pipeline-23"
     assert "--phase cpu" in (result_dir / "args").read_text(encoding="ascii")
     assert "--retry-failed-stage" in (result_dir / "args").read_text(encoding="ascii")
+
+
+def test_gpu_failure_before_training_keeps_the_instance_running(launcher_tmp_path):
+    env, launcher_root, shutdown_log, _ = _write_cloud_fixture(
+        launcher_tmp_path,
+        pipeline_rc=23,
+    )
+
+    _launch(env, "--phase", "gpu-gates", expected_returncodes=(0, 23))
+    launcher = _wait_for_terminal(launcher_root)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+
+    assert _terminal_json(launcher)["training_started"] is False
+    assert not (launcher / "shutdown-armed").exists()
+    assert not (launcher / "shutdown-safe").exists()
+    assert (
+        launcher / "shutdown-skipped"
+    ).read_text(encoding="ascii").strip() == "training-not-started"
+    assert not any("shutdown-request " in event for event in _events(shutdown_log))
+
+
+def test_gpu_failure_after_first_rollout_keeps_shutdown_enabled(launcher_tmp_path):
+    env, launcher_root, shutdown_log, _ = _write_cloud_fixture(
+        launcher_tmp_path,
+        pipeline_rc=23,
+        training_started=True,
+    )
+
+    _launch(env, "--phase", "gpu-gates", expected_returncodes=(0, 23))
+    launcher = _wait_for_terminal(launcher_root)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+
+    assert _terminal_json(launcher)["training_started"] is True
+    assert (launcher / "shutdown-armed").is_file()
+    assert (launcher / "shutdown-safe").is_file()
+    assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "test-mode"
+    assert any("shutdown-request " in event for event in _events(shutdown_log))
 
 
 def test_r1_launch_binds_marker_bytes_and_failure_requires_new_nonce(

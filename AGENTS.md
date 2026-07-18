@@ -106,6 +106,8 @@ new profile or plan explicit instead of silently weakening the active contract.
 
 ## Development Workflow
 
+不要过度设计。
+
 Do not overdesign. Optimize for the shortest total wall-clock time to a
 trustworthy experiment result; once infrastructure is adequate, prioritize
 training and add machinery only for a demonstrated blocker or required contract.

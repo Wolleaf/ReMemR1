@@ -1,5 +1,6 @@
 import ast
 import builtins
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DP_ACTOR_PATH = REPO_ROOT / "verl" / "workers" / "actor" / "dp_actor.py"
 MAIN_PPO_PATH = REPO_ROOT / "verl" / "trainer" / "main_ppo.py"
+RAY_TRAINER_PATH = REPO_ROOT / "verl" / "trainer" / "ppo" / "ray_trainer.py"
 
 
 def _parse(path):
@@ -176,3 +178,77 @@ def test_ray_tmpdir_uses_ray_default_when_environment_is_unset(monkeypatch):
     assert "_temp_dir" not in init_kwargs
     assert "RAY_TMPDIR" not in init_kwargs["runtime_env"]["env_vars"]
     assert "/tmp/ray" not in MAIN_PPO_PATH.read_text(encoding="utf-8")
+
+
+def test_training_started_marker_binds_the_first_rollout(tmp_path):
+    writes = []
+
+    def atomic_write(path, value):
+        writes.append((Path(path), value))
+
+    publish = _load_isolated_function(
+        RAY_TRAINER_PATH,
+        "publish_training_started",
+        {"Path": Path, "atomic_write_text": atomic_write, "json": json},
+    )
+
+    class ReproductionConfig(dict):
+        __getattr__ = dict.__getitem__
+
+    config = ReproductionConfig(
+        runtime_telemetry_path=str(tmp_path / "telemetry.json"),
+        runtime_attempt_id="attempt-1",
+        runtime_binding_sha256="a" * 64,
+        sealed_config_id="g0_qwen35_08b",
+        sealed_config_sha256="b" * 64,
+    )
+    marker = publish(config, 1)
+
+    assert marker == tmp_path / "training-started.json"
+    assert writes[0][0] == marker
+    assert json.loads(writes[0][1]) == {
+        "event": "first-rollout-started",
+        "global_step": 1,
+        "runtime_attempt_id": "attempt-1",
+        "runtime_binding_sha256": "a" * 64,
+        "schema_version": 1,
+        "sealed_config_id": "g0_qwen35_08b",
+        "sealed_config_sha256": "b" * 64,
+    }
+
+
+def test_training_started_marker_is_published_before_generation():
+    tree = _parse(RAY_TRAINER_PATH)
+    trainer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RayPPOTrainer"
+    )
+    fit = next(
+        node
+        for node in trainer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "fit"
+    )
+    publish_call = next(
+        node
+        for node in ast.walk(fit)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "publish_training_started"
+    )
+    rollout_call = next(
+        node
+        for node in ast.walk(fit)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run_llm_loop_revisit"
+    )
+    coordinate_call = next(
+        node
+        for node in ast.walk(fit)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_attach_recurrent_rollout_coordinates"
+    )
+    assert coordinate_call.lineno < publish_call.lineno < rollout_call.lineno
+    assert rollout_call.lineno - publish_call.lineno <= 6
