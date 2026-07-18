@@ -1299,6 +1299,10 @@ def test_public_gpu_short_circuits_and_preserves_the_failing_subphase(
     assert terminal["pipeline_result"] == expected_result
     if expected_rc in {42, 43}:
         assert terminal["retryable"] is False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not (launcher / "shutdown-skipped").exists():
+        time.sleep(0.05)
+    assert (launcher / "shutdown-skipped").read_text(encoding="ascii").strip() == "keep-running"
 
 
 def test_public_gpu_does_not_reuse_a_stale_terminal_pointer(launcher_tmp_path):
