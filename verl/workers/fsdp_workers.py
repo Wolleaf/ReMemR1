@@ -1237,6 +1237,7 @@ class ActorRolloutRefWorker(Worker):
             canonical_tensor_state_sha256,
             export_peft_adapter,
         )
+        from verl.models.lora_contract import assert_injected_lora_targets
         from peft import get_peft_model_state_dict
 
         if not os.path.isabs(local_path):
@@ -1278,7 +1279,22 @@ class ActorRolloutRefWorker(Worker):
                     tokenizer_revision=tokenizer_revision,
                     template_revision=template_revision,
                 )
-                export_peft_adapter(self.actor_module, local_path, metadata)
+                peft_configs = self.actor_module.peft_config
+                if not isinstance(peft_configs, dict) or len(peft_configs) != 1:
+                    raise CheckpointContractError(
+                        "adapter export requires exactly one PEFT configuration"
+                    )
+                peft_config = next(iter(peft_configs.values()))
+                exact_targets = assert_injected_lora_targets(
+                    self.actor_module,
+                    metadata.lora_target_manifest["target_modules"],
+                )
+                original_targets = peft_config.target_modules
+                peft_config.target_modules = list(exact_targets)
+                try:
+                    export_peft_adapter(self.actor_module, local_path, metadata)
+                finally:
+                    peft_config.target_modules = original_targets
                 exported_metadata = metadata.to_dict()
 
         torch.distributed.barrier()

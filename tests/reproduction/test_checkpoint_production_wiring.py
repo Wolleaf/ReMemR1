@@ -134,7 +134,12 @@ def test_worker_adapter_export_uses_full_param_context_and_adapter_only_helper()
     assert "state.adapter_tensor_keys" in source
     assert "state.adapter_state_sha256" in source
     assert "AdapterExportMetadata.from_checkpoint" in source
+    assert "len(peft_configs) != 1" in source
+    assert "assert_injected_lora_targets(self.actor_module" in source
+    assert "peft_config.target_modules = list(exact_targets)" in source
     assert "export_peft_adapter(self.actor_module" in source
+    assert "finally:" in source
+    assert source.count("peft_config.target_modules = original_targets") == 1
 
 
 def test_worker_full_param_context_avoids_unsupported_single_rank_cpu_offload():

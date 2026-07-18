@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -380,6 +381,46 @@ def test_real_torch_peft_tiny_model_contract_without_downloads():
     assert len(adapter_calls) == 2
     for hook in hooks:
         hook.remove()
+
+
+def test_real_peft_large_manifest_minimization_can_serialize_exact_targets(tmp_path):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    peft = pytest.importorskip("peft")
+
+    config = transformers.LlamaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=24,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+    )
+    base_model = transformers.LlamaForCausalLM(config)
+    manifest = lc.resolve_lora_target_manifest(base_model)
+    peft_model = lc.inject_lora_adapter(base_model, manifest)
+    peft_config = peft_model.peft_config["default"]
+
+    # PEFT condenses a sufficiently large exact manifest into suffix selectors.
+    assert len(manifest.target_modules) > len(peft_config.target_modules)
+    assert lc.assert_injected_lora_targets(peft_model, manifest) == manifest.target_modules
+
+    original_targets = peft_config.target_modules
+    peft_config.target_modules = list(manifest.target_modules)
+    try:
+        peft_model.save_pretrained(tmp_path, safe_serialization=True)
+    finally:
+        peft_config.target_modules = original_targets
+
+    adapter_config = json.loads(
+        (tmp_path / "adapter_config.json").read_text(encoding="utf-8")
+    )
+    assert adapter_config["target_modules"] == list(manifest.target_modules)
+    assert peft_config.target_modules is original_targets
+
+    reloaded_base = transformers.LlamaForCausalLM(config)
+    reloaded = peft.PeftModel.from_pretrained(reloaded_base, tmp_path)
+    assert lc.assert_injected_lora_targets(reloaded, manifest) == manifest.target_modules
 
 
 def test_pinned_qwen35_meta_models_match_target_manifest_snapshots_when_cached():
