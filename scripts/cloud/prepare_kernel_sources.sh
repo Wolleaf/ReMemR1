@@ -36,7 +36,9 @@ prepare_repo() {
         echo "kernel source checkout is dirty: ${destination}" >&2
         return 1
     fi
-    git -C "${destination}" fetch --no-tags --depth=1 origin "${commit}"
+    if ! git -C "${destination}" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+        git -C "${destination}" fetch --no-tags --depth=1 origin "${commit}"
+    fi
     git -C "${destination}" checkout --detach "${commit}"
     [[ "$(git -C "${destination}" rev-parse HEAD)" == "${commit}" ]] || return 1
     if [[ -n "$(git -C "${destination}" status --porcelain --untracked-files=all)" ]]; then
