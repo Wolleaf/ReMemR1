@@ -31,8 +31,8 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
     echo "CUDA 13.0 nvcc is missing at ${CUDA_HOME}/bin/nvcc" >&2
     exit 1
 }
-export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}"
-export MAX_JOBS="${MAX_JOBS:-8}"
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-16}"
+export MAX_JOBS="${MAX_JOBS:-16}"
 export TORCH_CUDA_ARCH_LIST="12.0"
 
 # Pip sees the original pinned HTTPS requirements (and records them in

@@ -428,10 +428,23 @@ PATH={fake_path}
     assert result.returncode == 0, result.stderr
 
 
-def test_kernel_source_prefetch_accepts_only_an_empty_unmaterialized_clone():
+def test_kernel_source_prefetch_materializes_complete_offline_mirrors():
     source = PREPARE_KERNEL_SOURCES.read_text(encoding="utf-8")
 
-    assert 'git clone --filter=blob:none --no-checkout' in source
+    assert 'git init --quiet "${destination}"' in source
+    assert 'remote add origin "${repository}"' in source
+    assert 'git clone --filter=blob:none' not in source
+    assert 'git_fetch_retry()' in source
+    assert 'http.lowSpeedTime=60' in source
+    assert 'remote get-url origin' in source
+    assert 'git_fetch_retry "${destination}" --unshallow --no-filter origin' in source
+    assert 'git_fetch_retry "${destination}" --refetch --no-filter origin' in source
+    assert 'config --unset-all remote.origin.promisor' in source
+    assert 'config remote.origin.promisor "${original_promisor}"' in source
+    assert 'update-ref refs/heads/rememr1-pinned "${commit}"' in source
+    assert 'config uploadpack.allowFilter true' in source
+    assert '--objects "${commit}" --missing=error' in source
+    assert 'fsck --full --no-dangling' in source
     assert '! -e "${destination}/.git/index"' in source
     assert '! -L "${destination}/.git/index"' in source
     assert '! -name .git -print -quit' in source
