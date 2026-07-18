@@ -1,18 +1,29 @@
+import copy
+import hashlib
 import json
 import re
 from pathlib import Path
 
 import pytest
 
+from taskutils.data_synthesis import reproduction_builder as builder
 from taskutils.data_synthesis.reproduction_builder import (
+    BUNDLE_KIND,
+    BUNDLE_SCHEMA_VERSION,
+    CURATION_POLICY,
     FORMAL_TRAIN_CHUNK_SIZE,
     FORMAL_TRAIN_DOCUMENT_COUNT,
     FORMAL_TRAIN_MAX_CHUNKS,
     FORMAL_TRAIN_MAX_CONTEXT_TOKENS,
     FORMAL_TRAIN_MIN_CONTEXT_TOKENS,
     FORMAL_TRAIN_QA_COUNT,
+    FORMAL_BUNDLE_KIND,
+    FORMAL_BUNDLE_SCHEMA_VERSION,
+    REJECTION_LEDGER_NAME,
     TrainManifestContract,
     build_artifact_bundle,
+    curate_source_records,
+    load_local_records,
     main,
     manifest_record_from_dict,
     parse_source_record,
@@ -21,6 +32,8 @@ from taskutils.data_synthesis.reproduction_builder import (
 from taskutils.data_synthesis.reproduction_manifest import (
     EvalManifestContract,
     ManifestValidationError,
+    canonical_json_bytes,
+    ordered_values_sha256,
     stable_document_id,
     stable_supporting_fact_id,
 )
@@ -86,9 +99,581 @@ def _flashrag_2wiki_record(index):
     }
 
 
+def _flashrag_hotpot_record(index):
+    evidence_title = f"FlashRAG evidence {index}"
+    distractor_title = f"FlashRAG distractor {index}"
+    return {
+        "id": f"flashrag-hotpot-{index}",
+        "question": f"Who is entity {index}?",
+        "golden_answers": [f"answer {index}", f"alias {index}"],
+        "metadata": {
+            "context": {
+                "title": [evidence_title, distractor_title],
+                "sentences": [
+                    [
+                        f"Entity {index} has answer {index}. ",
+                        f"A second supporting sentence for {index}.",
+                    ],
+                    [f"Unrelated local text {index}."],
+                ],
+            },
+            "supporting_facts": {
+                "title": [evidence_title, evidence_title],
+                "sent_id": [0, 1],
+            },
+        },
+    }
+
+
 def _write_json(path, records):
     path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def test_explicit_source_format_reads_an_extensionless_hf_cache_blob(tmp_path):
+    blob = tmp_path / "a81274abafa899ec"
+    blob.write_text(json.dumps(_flashrag_hotpot_record(0)) + "\n", encoding="utf-8")
+
+    records = load_local_records(blob, source_format="jsonl")
+
+    assert len(records) == 1
+    assert records[0]["id"] == "flashrag-hotpot-0"
+
+
+def _ambiguous_records_with_oob_overlap():
+    first = _flashrag_hotpot_record(100)
+    second = copy.deepcopy(first)
+    second["id"] = "flashrag-hotpot-100-variant"
+    second["question"] = "Which alternate question uses entity 100?"
+    second["metadata"]["context"]["title"][0] = " FlashRAG   evidence 100 "
+    second["metadata"]["context"]["sentences"][0][0] = (
+        "Entity 100 has  answer 100.\n"
+    )
+    second["metadata"]["supporting_facts"]["title"] = [
+        " FlashRAG   evidence 100 ",
+        " FlashRAG   evidence 100 ",
+    ]
+    first["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    return first, second
+
+
+def test_curation_scans_oob_records_for_raw_variant_collisions_and_keeps_all_reasons():
+    first, second = _ambiguous_records_with_oob_overlap()
+    records = [first, second, *(_flashrag_hotpot_record(index) for index in range(3))]
+
+    result = curate_source_records(records, dataset="hotpotqa")
+
+    assert result.accepted_source_indices == (2, 3, 4)
+    assert len(result.ambiguous_document_ids) == 1
+    assert [value.source_index for value in result.rejections] == [0, 1]
+    assert [reason.code for reason in result.rejections[0].reasons] == [
+        "ambiguous_normalized_document_id",
+        "supporting_fact_sentence_index_out_of_bounds",
+    ]
+    assert [reason.code for reason in result.rejections[1].reasons] == [
+        "ambiguous_normalized_document_id"
+    ]
+    assert result.rejections[0].ambiguous_document_ids == result.ambiguous_document_ids
+    oob = result.rejections[0].reasons[1].evidence[0]
+    assert oob["sentence_index"] == 99
+    assert oob["sentence_count"] == 2
+
+
+def test_curation_does_not_downgrade_unclassified_parse_errors():
+    malformed = _flashrag_hotpot_record(0)
+    del malformed["metadata"]["supporting_facts"]["sent_id"]
+
+    with pytest.raises(ManifestValidationError, match="sent_id"):
+        curate_source_records([malformed], dataset="hotpotqa")
+
+
+def test_curation_classifies_known_flashrag_structural_rejections_without_repair():
+    missing_title = _flashrag_hotpot_record(10)
+    missing_title["metadata"]["supporting_facts"]["title"][0] = (
+        "title absent from context"
+    )
+    empty_context = _flashrag_hotpot_record(11)
+    empty_context["metadata"]["context"] = {"title": [], "sentences": []}
+    duplicate_document = _flashrag_hotpot_record(12)
+    duplicate_document["metadata"]["context"]["title"].append(
+        duplicate_document["metadata"]["context"]["title"][0]
+    )
+    duplicate_document["metadata"]["context"]["sentences"].append(
+        copy.deepcopy(duplicate_document["metadata"]["context"]["sentences"][0])
+    )
+
+    result = curate_source_records(
+        [
+            missing_title,
+            empty_context,
+            duplicate_document,
+            _flashrag_hotpot_record(13),
+        ],
+        dataset="hotpotqa",
+    )
+
+    assert result.accepted_source_indices == (3,)
+    assert [[reason.code for reason in row.reasons] for row in result.rejections] == [
+        ["supporting_title_absent_from_context"],
+        ["empty_context"],
+        ["duplicate_context_document_id"],
+    ]
+    missing_evidence = result.rejections[0].reasons[0].evidence[0]
+    assert set(missing_evidence) == {
+        "available_document_ids",
+        "normalized_title_sha256",
+        "raw_title_sha256",
+        "supporting_fact_index",
+    }
+    assert "title absent" not in json.dumps(missing_evidence)
+    assert result.rejections[1].reasons[0].evidence == ({"document_count": 0},)
+    duplicate_evidence = result.rejections[2].reasons[0].evidence[0]
+    assert duplicate_evidence["occurrence_positions"] == [0, 2]
+    assert len(duplicate_evidence["raw_variant_sha256s"]) == 2
+
+
+def test_single_duplicate_context_row_can_cover_all_ambiguous_raw_variants(tmp_path):
+    record = _flashrag_hotpot_record(20)
+    record["metadata"]["context"]["title"].append(" FlashRAG   evidence 20 ")
+    record["metadata"]["context"]["sentences"].append(
+        [
+            "Entity 20 has  answer 20.\n",
+            "A second supporting sentence for 20.",
+        ]
+    )
+
+    result = curate_source_records([record], dataset="hotpotqa")
+
+    assert not result.examples
+    assert len(result.ambiguous_document_ids) == 1
+    assert [reason.code for reason in result.rejections[0].reasons] == [
+        "ambiguous_normalized_document_id",
+        "duplicate_context_document_id",
+    ]
+    ambiguity = result.rejections[0].reasons[0].evidence[0]
+    assert ambiguity["observed_raw_variant_sha256s"] == ambiguity[
+        "raw_variant_sha256s"
+    ]
+    source_sha256 = "9" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+    assert builder._validate_curation(
+        tmp_path,
+        curation,
+        source=_portable_source_contract(tmp_path, 1, source_sha256),
+        dataset="hotpotqa",
+    ) == ()
+
+
+def test_curation_ledger_binds_accepted_qa_order_and_validates_without_source(tmp_path):
+    rejected = _flashrag_hotpot_record(9)
+    rejected["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    records = [
+        _flashrag_hotpot_record(0),
+        rejected,
+        _flashrag_hotpot_record(1),
+        _flashrag_hotpot_record(2),
+    ]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "a" * 64
+
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+    accepted_ids = tuple(example.qa.qa_id for example in result.examples)
+
+    assert curation["accepted_qa_order_sha256"] == ordered_values_sha256(
+        accepted_ids
+    )
+    assert curation["accepted_source_order_sha256"] == hashlib.sha256(
+        canonical_json_bytes([0, 2, 3])
+    ).hexdigest()
+    assert curation["rejection_reason_counts"] == {
+        "ambiguous_normalized_document_id": 0,
+        "duplicate_context_document_id": 0,
+        "empty_context": 0,
+        "supporting_fact_sentence_index_out_of_bounds": 1,
+        "supporting_title_absent_from_context": 0,
+    }
+    ledger = json.loads((tmp_path / REJECTION_LEDGER_NAME).read_text(encoding="utf-8"))
+    assert ledger["accepted_qa_ids"] == list(accepted_ids)
+    assert builder._validate_curation(
+        tmp_path,
+        curation,
+        source={
+            "format": "jsonl",
+            "path": str(tmp_path / "source-is-deliberately-unavailable"),
+            "record_count": len(records),
+            "revision": "source-rev",
+            "sha256": source_sha256,
+            "split": None,
+        },
+        dataset="hotpotqa",
+    ) == accepted_ids
+
+
+def _rewrite_curation_ledger(tmp_path, curation, mutate):
+    path = tmp_path / REJECTION_LEDGER_NAME
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    mutate(ledger)
+    path.write_bytes(canonical_json_bytes(ledger) + b"\n")
+    updated = copy.deepcopy(curation)
+    updated["rejection_ledger"]["sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    updated["rejection_ledger"]["size_bytes"] = path.stat().st_size
+    return updated
+
+
+def _portable_source_contract(tmp_path, record_count, source_sha256):
+    return {
+        "format": "jsonl",
+        "path": str(tmp_path / "unavailable-source"),
+        "record_count": record_count,
+        "revision": "source-rev",
+        "sha256": source_sha256,
+        "split": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda ledger: ledger["accepted_qa_ids"].__setitem__(
+                0, "otherdataset:qa-0"
+            ),
+            "wrong dataset namespace",
+        ),
+        (
+            lambda ledger: ledger["rejections"][0].__setitem__(
+                "qa_id", ledger["accepted_qa_ids"][0]
+            ),
+            "accepted and rejected QA IDs overlap",
+        ),
+    ],
+)
+def test_curation_validator_rejects_invalid_qa_identity_inventory(
+    tmp_path,
+    mutate,
+    message,
+):
+    rejected = _flashrag_hotpot_record(9)
+    rejected["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    records = [rejected, *(_flashrag_hotpot_record(index) for index in range(3))]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "b" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+    updated = _rewrite_curation_ledger(tmp_path, curation, mutate)
+
+    with pytest.raises(ManifestValidationError, match=message):
+        builder._validate_curation(
+            tmp_path,
+            updated,
+            source=_portable_source_contract(
+                tmp_path,
+                len(records),
+                source_sha256,
+            ),
+            dataset="hotpotqa",
+        )
+
+
+def test_curation_validator_rejects_inconsistent_ambiguous_variant_inventory(tmp_path):
+    first, second = _ambiguous_records_with_oob_overlap()
+    records = [first, second, *(_flashrag_hotpot_record(index) for index in range(3))]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "c" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+
+    def mutate(ledger):
+        evidence = ledger["rejections"][1]["reasons"][0]["evidence"][0]
+        evidence["raw_variant_sha256s"] = sorted(
+            [*evidence["raw_variant_sha256s"], "f" * 64]
+        )
+
+    updated = _rewrite_curation_ledger(tmp_path, curation, mutate)
+
+    with pytest.raises(ManifestValidationError, match="differs across rejections"):
+        builder._validate_curation(
+            tmp_path,
+            updated,
+            source=_portable_source_contract(
+                tmp_path,
+                len(records),
+                source_sha256,
+            ),
+            dataset="hotpotqa",
+        )
+
+
+def test_curation_validator_rejects_nondeterministic_oob_evidence_order(tmp_path):
+    rejected = _flashrag_hotpot_record(9)
+    rejected["metadata"]["supporting_facts"]["sent_id"] = [99, 98]
+    records = [rejected, *(_flashrag_hotpot_record(index) for index in range(3))]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "d" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+
+    def mutate(ledger):
+        ledger["rejections"][0]["reasons"][0]["evidence"].reverse()
+
+    updated = _rewrite_curation_ledger(tmp_path, curation, mutate)
+
+    with pytest.raises(ManifestValidationError, match="strictly increasing"):
+        builder._validate_curation(
+            tmp_path,
+            updated,
+            source=_portable_source_contract(
+                tmp_path,
+                len(records),
+                source_sha256,
+            ),
+            dataset="hotpotqa",
+        )
+
+
+def test_curation_ledger_supports_zero_rejections_and_detects_byte_tampering(tmp_path):
+    records = [_flashrag_hotpot_record(index) for index in range(3)]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "e" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+    assert curation["rejected_record_count"] == 0
+    assert curation["rejection_ledger"]["row_count"] == 0
+    assert builder._validate_curation(
+        tmp_path,
+        curation,
+        source=_portable_source_contract(tmp_path, len(records), source_sha256),
+        dataset="hotpotqa",
+    ) == tuple(example.qa.qa_id for example in result.examples)
+
+    ledger_path = tmp_path / REJECTION_LEDGER_NAME
+    ledger_path.write_bytes(ledger_path.read_bytes() + b" ")
+    with pytest.raises(ManifestValidationError, match="(size|hash) mismatch"):
+        builder._validate_curation(
+            tmp_path,
+            curation,
+            source=_portable_source_contract(tmp_path, len(records), source_sha256),
+            dataset="hotpotqa",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda ledger: ledger["rejections"][0].__setitem__("extra", True),
+            "schema keys differ",
+        ),
+        (
+            lambda ledger: ledger.__setitem__(
+                "input_record_count", ledger["input_record_count"] + 1
+            ),
+            "identity mismatch",
+        ),
+        (
+            lambda ledger: ledger["rejections"][0]["reasons"][0].__setitem__(
+                "code", "unclassified_source_error"
+            ),
+            "reason is not allowed",
+        ),
+        (
+            lambda ledger: ledger["rejections"].reverse(),
+            "source indices are not sorted unique",
+        ),
+        (
+            lambda ledger: ledger["accepted_qa_ids"].reverse(),
+            "differs from its canonical ledger",
+        ),
+    ],
+)
+def test_resealed_curation_ledger_still_fails_closed(
+    tmp_path,
+    mutate,
+    message,
+):
+    first = _flashrag_hotpot_record(8)
+    second = _flashrag_hotpot_record(9)
+    first["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    second["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    records = [
+        first,
+        second,
+        *(_flashrag_hotpot_record(index) for index in range(3)),
+    ]
+    result = curate_source_records(records, dataset="hotpotqa")
+    source_sha256 = "f" * 64
+    curation = builder._write_curation_ledger(
+        tmp_path,
+        result,
+        source_sha256=source_sha256,
+    )
+    updated = _rewrite_curation_ledger(tmp_path, curation, mutate)
+
+    with pytest.raises(ManifestValidationError, match=message):
+        builder._validate_curation(
+            tmp_path,
+            updated,
+            source=_portable_source_contract(
+                tmp_path,
+                len(records),
+                source_sha256,
+            ),
+            dataset="hotpotqa",
+        )
+
+
+def test_strict_source_replay_rejects_resealed_evidence_hash_tampering(tmp_path):
+    rejected = _flashrag_hotpot_record(9)
+    rejected["metadata"]["supporting_facts"]["sent_id"][1] = 99
+    records = [rejected, *(_flashrag_hotpot_record(index) for index in range(3))]
+    source = _write_json(tmp_path / "source.json", records).resolve()
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    output = tmp_path / "formal-bundle"
+    output.mkdir()
+    result = curate_source_records(records, dataset="hotpotqa")
+    curation = builder._write_curation_ledger(
+        output,
+        result,
+        source_sha256=source_sha256,
+    )
+
+    def mutate(ledger):
+        ledger["rejections"][0]["source_record_sha256"] = "0" * 64
+
+    curation = _rewrite_curation_ledger(output, curation, mutate)
+    accepted_ids = tuple(example.qa.qa_id for example in result.examples)
+    assert builder._validate_curation(
+        output,
+        curation,
+        source={
+            "format": "json",
+            "path": str(source),
+            "record_count": len(records),
+            "revision": "source-rev",
+            "sha256": source_sha256,
+            "split": None,
+        },
+        dataset="hotpotqa",
+    ) == accepted_ids
+    payload = builder._manifest_payload(
+        mode="train",
+        profile="formal",
+        dataset="hotpotqa",
+        seed=42,
+        source_path=source,
+        source_revision="source-rev",
+        source_sha256=source_sha256,
+        source_record_count=len(records),
+        source_format="json",
+        source_split=None,
+        tokenizer_name="tokenizer",
+        tokenizer_revision="tokenizer-rev",
+        contract={"qa_count": 2},
+        qa_ids=accepted_ids[:2],
+        artifacts={},
+        curation=curation,
+    )
+    builder._write_top_manifest(output / "manifest.json", payload)
+
+    with pytest.raises(ManifestValidationError, match="strict source replay"):
+        validate_artifact_bundle(output, replay_source_curation=True)
+
+
+def test_bundle_schema_is_profile_scoped_for_v2_fixture_migration():
+    common = {
+        "mode": "train",
+        "dataset": "hotpotqa",
+        "seed": 42,
+        "source_path": Path("source.json").resolve(),
+        "source_revision": "source-rev",
+        "source_sha256": "a" * 64,
+        "source_record_count": 4,
+        "source_format": "json",
+        "source_split": None,
+        "tokenizer_name": "tokenizer",
+        "tokenizer_revision": "tokenizer-rev",
+        "contract": {"qa_count": 2},
+        "qa_ids": ("qa-0", "qa-1"),
+        "artifacts": {},
+    }
+
+    fixture = builder._manifest_payload(profile="fixture", curation=None, **common)
+    formal = builder._manifest_payload(
+        profile="formal",
+        curation={"policy": CURATION_POLICY},
+        **common,
+    )
+
+    assert fixture["kind"] == BUNDLE_KIND
+    assert fixture["schema_version"] == BUNDLE_SCHEMA_VERSION
+    assert "curation" not in fixture
+    assert "format" not in fixture["source"]
+    assert formal["kind"] == FORMAL_BUNDLE_KIND
+    assert formal["schema_version"] == FORMAL_BUNDLE_SCHEMA_VERSION
+    assert formal["curation"] == {"policy": CURATION_POLICY}
+    assert formal["source"]["format"] == "json"
+
+
+def test_top_manifest_rejects_formal_v2_and_fixture_v3_cross_disguises(tmp_path):
+    common = {
+        "mode": "train",
+        "dataset": "hotpotqa",
+        "seed": 42,
+        "source_path": Path("source.json").resolve(),
+        "source_revision": "source-rev",
+        "source_sha256": "a" * 64,
+        "source_record_count": 4,
+        "source_format": "json",
+        "source_split": None,
+        "tokenizer_name": "tokenizer",
+        "tokenizer_revision": "tokenizer-rev",
+        "contract": {"qa_count": 2},
+        "qa_ids": ("hotpotqa:qa-0", "hotpotqa:qa-1"),
+        "artifacts": {},
+    }
+    formal_v2 = builder._manifest_payload(
+        profile="formal",
+        curation={"policy": CURATION_POLICY},
+        **common,
+    )
+    formal_v2["kind"] = BUNDLE_KIND
+    formal_v2["schema_version"] = BUNDLE_SCHEMA_VERSION
+    builder._write_top_manifest(tmp_path / "formal-v2.json", formal_v2)
+    with pytest.raises(ManifestValidationError, match="profile/kind/schema"):
+        builder._read_top_manifest(tmp_path / "formal-v2.json")
+
+    fixture_v3 = builder._manifest_payload(
+        profile="fixture",
+        curation=None,
+        **common,
+    )
+    fixture_v3["kind"] = FORMAL_BUNDLE_KIND
+    fixture_v3["schema_version"] = FORMAL_BUNDLE_SCHEMA_VERSION
+    builder._write_top_manifest(tmp_path / "fixture-v3.json", fixture_v3)
+    with pytest.raises(ManifestValidationError, match="profile/kind/schema"):
+        builder._read_top_manifest(tmp_path / "fixture-v3.json")
 
 
 def test_formal_train_contract_is_locked_to_512_by_200_and_six_chunks():
@@ -112,6 +697,7 @@ def test_formal_train_contract_is_locked_to_512_by_200_and_six_chunks():
     ("dataset", "factory"),
     [
         ("hotpotqa", _hotpot_record),
+        ("hotpotqa", _flashrag_hotpot_record),
         ("2wikimultihopqa", _flashrag_2wiki_record),
     ],
 )

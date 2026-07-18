@@ -268,6 +268,7 @@ hash 和 checkpoint hash，不能把“推理不使用 offload”误写成训练
 | Model | text-only / native thinking | true / 显式 `enable_thinking=False` |
 | LoRA | rank / alpha / dropout / bias | 32 / 64 / 0 / none |
 | Precision | actor / compute / reference | FP32 / BF16 / BF16 |
+| Data | formal structured source | FlashRAG HotpotQA train/dev @ `bcafb8dd07d453be3cbeeeb3f78be1841bddf92c` |
 | Data | formal train documents | 200 |
 | Data | max prompt / response tensor | 30000 / 1024 |
 | Recurrent | chunk / chunks | 5000 / 6 |
@@ -286,6 +287,27 @@ hash 和 checkpoint hash，不能把“推理不使用 offload”误写成训练
 | Runtime | dynamic batch / compile | false / false |
 | Validation | trainer internal | 关闭，使用固定外部 runner |
 | Seed | run | 42，派生 seed 和顺序全部封存 |
+
+正式 train/validation bundle 分别绑定 `hotpotqa/train.jsonl` SHA-256
+`a81274abafa899ec0ee073102edbe6bb694a8a1174201b4e43e2bc6c98964d1a` 和
+`hotpotqa/dev.jsonl` SHA-256
+`434ec155867019396312f3d466ce3406c71fe8a2917f49f63bb646ec5ad2ff52`，从其中的 title、sentences、
+全部合法答案和 supporting facts 重建。上游 32k/dev parquet 作为固定 hash 参考资产保留，但其
+`context` 已扁平化，不能被假装成可恢复的 document/fact provenance。
+
+formal v3 bundle 对 HotpotQA train/dev 和 2WikiMultiHopQA dev 执行同一套与答案结果无关的全源
+结构筛选：只允许明确记录 supporting-fact 句子索引越界、supporting title 不在 context、空 context、
+同一 QA 内重复稳定文档 ID，以及同一归一化文档 ID 对应多个原始 title/text 版本；其它 schema、
+答案或标注错误一律 fail closed。筛选只能排除整条 QA，禁止 clamp 句子索引、静默去重、选择某个文档
+版本或伪造 supporting facts。原始 source hash、accepted QA/source 顺序 hash、raw/accepted/rejected
+计数、原因计数、歧义文档清单及逐条 rejection evidence 写入 canonical curation ledger，并由 bundle
+manifest self-hash、bundle tree 和 CPU handoff 共同绑定。最终接受/拒绝数量只能引用 sealed ledger；
+封存前的全量审计仅用于定位源数据问题，不是实验结果。
+
+2026-07-18 的封存前只读审计显示，FlashRAG HotpotQA dev 7,405 条中有 5,306 条的 supporting
+title 不在 context、10 条为空 context、1 条句子索引越界，即至少约 71.8% 会在 provenance gate 被
+排除；这会形成明显的结构可验证子集选择限制，必须在报告和简历说明中披露，不能把该子集描述成
+无筛选的完整 dev。精确 accepted/rejected 数仍以正式 sealed ledger 为准。
 
 相对 4B 方案，每步 trajectories 从 32 降为 8。40/80 steps 不再代表相同算力或样本暴露量，报告中
 必须同时给出 prompt groups、trajectories、生成 token、有效 advantage group 数和 wall time。

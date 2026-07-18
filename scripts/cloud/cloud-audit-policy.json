@@ -73,6 +73,8 @@
         ]
       }
     ],
-    "additional_invocation_regexes": []
+    "additional_invocation_regexes": [
+      "^\\s*/usr/bin/bash --noprofile --norc /usr/bin/shutdown; then\\s*$"
+    ]
   }
 }

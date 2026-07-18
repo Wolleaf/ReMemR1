@@ -48,7 +48,25 @@ from .reproduction_manifest import (
 )
 
 
+BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_KIND = "rememr1-reproduction-data-bundle-v2"
+FORMAL_BUNDLE_SCHEMA_VERSION = 3
+FORMAL_BUNDLE_KIND = "rememr1-reproduction-data-bundle-v3"
+CURATION_SCHEMA_VERSION = 1
+CURATION_POLICY = "rememr1-source-curation-v1"
+REJECTION_LEDGER_NAME = "source-curation-ledger.json"
+_OUT_OF_BOUNDS_REASON = "supporting_fact_sentence_index_out_of_bounds"
+_AMBIGUOUS_DOCUMENT_REASON = "ambiguous_normalized_document_id"
+_MISSING_SUPPORT_TITLE_REASON = "supporting_title_absent_from_context"
+_EMPTY_CONTEXT_REASON = "empty_context"
+_DUPLICATE_CONTEXT_DOCUMENT_REASON = "duplicate_context_document_id"
+_REJECTION_REASONS = (
+    _AMBIGUOUS_DOCUMENT_REASON,
+    _DUPLICATE_CONTEXT_DOCUMENT_REASON,
+    _EMPTY_CONTEXT_REASON,
+    _OUT_OF_BOUNDS_REASON,
+    _MISSING_SUPPORT_TITLE_REASON,
+)
 FORMAL_TRAIN_QA_COUNT = 512
 FORMAL_TRAIN_DOCUMENT_COUNT = 200
 FORMAL_TRAIN_CHUNK_SIZE = 5000
@@ -172,6 +190,55 @@ class ParsedExample:
     qa: QARecord
     documents: tuple[SourceDocument, ...]
     supporting_facts: tuple[SupportingFactInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRejectionReason:
+    code: str
+    evidence: tuple[Mapping[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "evidence": [dict(value) for value in self.evidence],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRejection:
+    source_index: int
+    qa_id: str
+    source_record_sha256: str
+    reasons: tuple[SourceRejectionReason, ...]
+    ambiguous_document_ids: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ambiguous_document_ids": list(self.ambiguous_document_ids),
+            "qa_id": self.qa_id,
+            "reasons": [value.to_dict() for value in self.reasons],
+            "source_index": self.source_index,
+            "source_record_sha256": self.source_record_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCurationResult:
+    examples: tuple[ParsedExample, ...]
+    accepted_source_indices: tuple[int, ...]
+    rejections: tuple[SourceRejection, ...]
+    ambiguous_document_ids: tuple[str, ...]
+
+
+class _RejectableSourceRecordError(ManifestValidationError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reasons: Sequence[SourceRejectionReason],
+    ) -> None:
+        super().__init__(message)
+        self.reasons = tuple(reasons)
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,20 +525,33 @@ def _extract_supporting_facts(
         normalize_text(document.title): index for index, document in enumerate(documents)
     }
     facts = []
+    out_of_bounds: list[Mapping[str, Any]] = []
+    missing_titles: list[Mapping[str, Any]] = []
+    available_document_ids = sorted(document.document_id for document in documents)
     for fact_index, (title, sentence_index) in enumerate(pairs):
         normalized_title = normalize_text(title)
         if normalized_title not in title_positions:
-            raise _error(
-                f"{path}.supporting_facts[{fact_index}]",
-                f"title {title!r} is absent from context",
+            missing_titles.append(
+                {
+                    "available_document_ids": available_document_ids,
+                    "normalized_title_sha256": normalized_text_sha256(title),
+                    "raw_title_sha256": _sha256_bytes(title.encode("utf-8")),
+                    "supporting_fact_index": fact_index,
+                }
             )
+            continue
         document_index = title_positions[normalized_title]
         document = documents[document_index]
         if sentence_index >= len(document.sentences):
-            raise _error(
-                f"{path}.supporting_facts[{fact_index}]",
-                "sentence index is out of bounds",
+            out_of_bounds.append(
+                {
+                    "document_id": document.document_id,
+                    "sentence_count": len(document.sentences),
+                    "sentence_index": sentence_index,
+                    "supporting_fact_index": fact_index,
+                }
             )
+            continue
         text = document.sentences[sentence_index]
         start = sum(len(sentence) for sentence in document.sentences[:sentence_index])
         facts.append(
@@ -482,6 +562,27 @@ def _extract_supporting_facts(
                 start_char=start,
                 end_char=start + len(text),
             )
+        )
+    reasons = []
+    if out_of_bounds:
+        reasons.append(
+            SourceRejectionReason(
+                code=_OUT_OF_BOUNDS_REASON,
+                evidence=tuple(out_of_bounds),
+            )
+        )
+    if missing_titles:
+        reasons.append(
+            SourceRejectionReason(
+                code=_MISSING_SUPPORT_TITLE_REASON,
+                evidence=tuple(missing_titles),
+            )
+        )
+    if reasons:
+        reasons.sort(key=lambda value: value.code)
+        raise _RejectableSourceRecordError(
+            f"{path}.supporting_facts: source evidence cannot be verified",
+            reasons=reasons,
         )
     return tuple(facts)
 
@@ -546,14 +647,42 @@ def _load_json_records(path: Path, split: str | None) -> list[Mapping[str, Any]]
     ]
 
 
-def load_local_records(path: str | os.PathLike[str], *, split: str | None = None) -> tuple[Mapping[str, Any], ...]:
+def _canonical_source_format(
+    path: str | os.PathLike[str],
+    source_format: str | None,
+) -> str:
+    value = Path(path).suffix if source_format is None else source_format
+    value = value.lower().lstrip(".")
+    aliases = {
+        "json": "json",
+        "jsonl": "jsonl",
+        "ndjson": "jsonl",
+        "parquet": "parquet",
+        "pq": "parquet",
+    }
+    try:
+        return aliases[value]
+    except KeyError as exc:
+        raise _error(
+            "input",
+            "supported formats are json, jsonl, and parquet",
+        ) from exc
+
+
+def load_local_records(
+    path: str | os.PathLike[str],
+    *,
+    split: str | None = None,
+    source_format: str | None = None,
+) -> tuple[Mapping[str, Any], ...]:
     """Read a local JSON, JSONL, or Parquet source without network access."""
 
-    source_path = Path(path).expanduser().resolve(strict=True)
-    suffix = source_path.suffix.lower()
-    if suffix == ".json":
+    requested_path = Path(path).expanduser()
+    source_path = requested_path.resolve(strict=True)
+    source_format = _canonical_source_format(requested_path, source_format)
+    if source_format == "json":
         records = _load_json_records(source_path, split)
-    elif suffix in {".jsonl", ".ndjson"}:
+    elif source_format == "jsonl":
         records = []
         for line_number, line in enumerate(
             source_path.read_text(encoding="utf-8").splitlines(),
@@ -566,7 +695,7 @@ def load_local_records(path: str | os.PathLike[str], *, split: str | None = None
             except json.JSONDecodeError as exc:
                 raise _error("input", f"invalid JSONL line {line_number}") from exc
             records.append(_require_mapping(value, f"input line {line_number}"))
-    elif suffix in {".parquet", ".pq"}:
+    elif source_format == "parquet":
         try:
             import pyarrow.parquet as pq
         except ImportError as exc:
@@ -575,8 +704,6 @@ def load_local_records(path: str | os.PathLike[str], *, split: str | None = None
             _require_mapping(value, f"input[{index}]")
             for index, value in enumerate(pq.read_table(source_path).to_pylist())
         ]
-    else:
-        raise _error("input", "supported suffixes are .json, .jsonl, and .parquet")
     if not records:
         raise _error("input", "contains no QA records")
     return tuple(records)
@@ -624,17 +751,28 @@ def _select_examples(
     seed: int,
 ) -> tuple[ParsedExample, ...]:
     qa_ids = [example.qa.qa_id for example in examples]
+    selected_ids = _select_qa_ids(qa_ids, qa_count=qa_count, seed=seed)
+    by_id = {example.qa.qa_id: example for example in examples}
+    return tuple(by_id[qa_id] for qa_id in selected_ids)
+
+
+def _select_qa_ids(
+    qa_ids: Sequence[str],
+    *,
+    qa_count: int,
+    seed: int,
+) -> tuple[str, ...]:
     if len(set(qa_ids)) != len(qa_ids):
         raise ManifestValidationError("source contains duplicate stable QA IDs")
-    if len(examples) < qa_count:
+    if len(qa_ids) < qa_count:
         raise ManifestValidationError(
-            f"source has {len(examples)} QAs but contract requires {qa_count}"
+            f"source has {len(qa_ids)} QAs but contract requires {qa_count}"
         )
     ordered = sorted(
-        examples,
-        key=lambda example: (
-            _rank(seed, example.qa.qa_id, "qa-selection", example.qa.qa_id),
-            example.qa.qa_id,
+        qa_ids,
+        key=lambda qa_id: (
+            _rank(seed, qa_id, "qa-selection", qa_id),
+            qa_id,
         ),
     )
     return tuple(ordered[:qa_count])
@@ -716,6 +854,262 @@ def _parse_all_examples(
     return tuple(
         parse_source_record(record, dataset=dataset, source_index=index)
         for index, record in enumerate(records)
+    )
+
+
+def _curation_context(
+    record: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    dataset: str,
+    path: str,
+) -> tuple[tuple[SourceDocument, ...], tuple[SourceRejectionReason, ...]]:
+    context = record.get("context")
+    if isinstance(context, str) or context is None:
+        context = metadata.get("context")
+    if isinstance(context, Mapping):
+        documents = _parse_context_mapping(context, dataset, f"{path}.context")
+    else:
+        documents = _parse_context_sequence(
+            _require_sequence(context, f"{path}.context"),
+            dataset,
+            f"{path}.context",
+        )
+    if not documents:
+        return (
+            (),
+            (
+                SourceRejectionReason(
+                    code=_EMPTY_CONTEXT_REASON,
+                    evidence=({"document_count": 0},),
+                ),
+            ),
+        )
+
+    positions_by_id: dict[str, list[int]] = {}
+    for position, document in enumerate(documents):
+        positions_by_id.setdefault(document.document_id, []).append(position)
+    duplicate_ids = tuple(
+        sorted(
+            document_id
+            for document_id, positions in positions_by_id.items()
+            if len(positions) > 1
+        )
+    )
+    normalized_title_ids: dict[str, set[str]] = {}
+    normalized_title_counts: dict[str, int] = {}
+    for document in documents:
+        title = normalize_text(document.title)
+        normalized_title_ids.setdefault(title, set()).add(document.document_id)
+        normalized_title_counts[title] = normalized_title_counts.get(title, 0) + 1
+    unexplained_title_duplicates = [
+        title
+        for title, count in normalized_title_counts.items()
+        if count > 1 and len(normalized_title_ids[title]) > 1
+    ]
+    if unexplained_title_duplicates:
+        raise _error(
+            f"{path}.context",
+            "contains ambiguous duplicate normalized titles",
+        )
+    if not duplicate_ids:
+        return documents, ()
+    evidence = tuple(
+        {
+            "document_id": document_id,
+            "occurrence_positions": positions_by_id[document_id],
+            "raw_variant_sha256s": [
+                _raw_document_variant_sha256(documents[position])
+                for position in positions_by_id[document_id]
+            ],
+        }
+        for document_id in duplicate_ids
+    )
+    return (
+        documents,
+        (
+            SourceRejectionReason(
+                code=_DUPLICATE_CONTEXT_DOCUMENT_REASON,
+                evidence=evidence,
+            ),
+        ),
+    )
+
+
+def _source_record_identity(
+    record: Mapping[str, Any],
+    *,
+    dataset: str,
+    source_index: int,
+) -> tuple[
+    str,
+    tuple[SourceDocument, ...],
+    tuple[SourceRejectionReason, ...],
+]:
+    path = f"source[{source_index}]"
+    metadata = _require_mapping(record.get("metadata", {}), f"{path}.metadata")
+    source_id_value = _first_present(record, ("_id", "id", "qa_id"))
+    source_qa_id = None if source_id_value is None else str(source_id_value)
+    question = _extract_question(record, path)
+    _extract_answers(record, path)
+    value = record.get("supporting_facts")
+    if value is None:
+        value = metadata.get("supporting_facts")
+    _supporting_pairs(value, f"{path}.supporting_facts")
+    qa_id = stable_qa_id(dataset, source_qa_id, question)
+    documents, reasons = _curation_context(
+        record,
+        metadata,
+        dataset=dataset,
+        path=path,
+    )
+    return qa_id, documents, reasons
+
+
+def _source_record_sha256(record: Mapping[str, Any]) -> str:
+    return _sha256_bytes(canonical_json_bytes(record))
+
+
+def _raw_document_variant_sha256(document: SourceDocument) -> str:
+    return _sha256_bytes(
+        canonical_json_bytes(
+            {
+                "text": document.text,
+                "title": document.title,
+            }
+        )
+    )
+
+
+def _source_indices_sha256(indices: Sequence[int]) -> str:
+    return _sha256_bytes(canonical_json_bytes(list(indices)))
+
+
+def curate_source_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    dataset: str,
+) -> SourceCurationResult:
+    """Apply the fixed, label-independent source rejection policy."""
+
+    dataset = _canonical_dataset_name(dataset)
+    structured: dict[
+        int,
+        tuple[Mapping[str, Any], str, tuple[SourceDocument, ...]],
+    ] = {}
+    parsed_by_index: dict[int, ParsedExample] = {}
+    reasons_by_index: dict[int, tuple[SourceRejectionReason, ...]] = {}
+    for source_index, raw_record in enumerate(records):
+        record = _require_mapping(raw_record, f"source[{source_index}]")
+        qa_id, documents, structural_reasons = _source_record_identity(
+            record,
+            dataset=dataset,
+            source_index=source_index,
+        )
+        structured[source_index] = (record, qa_id, documents)
+        if structural_reasons:
+            reasons_by_index[source_index] = structural_reasons
+            continue
+        try:
+            example = parse_source_record(
+                record,
+                dataset=dataset,
+                source_index=source_index,
+            )
+        except _RejectableSourceRecordError as exc:
+            if any(
+                reason.code
+                not in {_OUT_OF_BOUNDS_REASON, _MISSING_SUPPORT_TITLE_REASON}
+                for reason in exc.reasons
+            ):
+                raise
+            reasons_by_index[source_index] = exc.reasons
+        else:
+            if example.qa.qa_id != qa_id or example.documents != documents:
+                raise ManifestValidationError(
+                    "source identity extraction differs from full parsing"
+                )
+            parsed_by_index[source_index] = example
+
+    variants_by_document: dict[str, set[str]] = {}
+    for _, _, documents in structured.values():
+        for document in documents:
+            variants_by_document.setdefault(document.document_id, set()).add(
+                _raw_document_variant_sha256(document)
+            )
+    ambiguous_document_ids = tuple(
+        sorted(
+            document_id
+            for document_id, variants in variants_by_document.items()
+            if len(variants) > 1
+        )
+    )
+    ambiguous_set = set(ambiguous_document_ids)
+
+    accepted: list[ParsedExample] = []
+    accepted_source_indices: list[int] = []
+    rejections: list[SourceRejection] = []
+    for source_index in range(len(records)):
+        record, qa_id, documents = structured[source_index]
+        reasons = list(reasons_by_index.get(source_index, ()))
+        affected = tuple(
+            sorted(
+                {
+                    document.document_id
+                    for document in documents
+                    if document.document_id in ambiguous_set
+                }
+            )
+        )
+        if affected:
+            evidence = tuple(
+                {
+                    "document_id": document_id,
+                    "observed_raw_variant_sha256s": sorted(
+                        {
+                            _raw_document_variant_sha256(document)
+                            for document in documents
+                            if document.document_id == document_id
+                        }
+                    ),
+                    "raw_variant_sha256s": sorted(
+                        variants_by_document[document_id]
+                    ),
+                }
+                for document_id in affected
+            )
+            reasons.append(
+                SourceRejectionReason(
+                    code=_AMBIGUOUS_DOCUMENT_REASON,
+                    evidence=evidence,
+                )
+            )
+        if reasons:
+            reasons.sort(key=lambda value: value.code)
+            rejections.append(
+                SourceRejection(
+                    source_index=source_index,
+                    qa_id=qa_id,
+                    source_record_sha256=_source_record_sha256(record),
+                    reasons=tuple(reasons),
+                    ambiguous_document_ids=affected,
+                )
+            )
+            continue
+        accepted.append(parsed_by_index[source_index])
+        accepted_source_indices.append(source_index)
+
+    rejections.sort(key=lambda value: value.source_index)
+    if len(accepted) + len(rejections) != len(records):
+        raise ManifestValidationError("source curation did not account for every record")
+    if len({value.source_index for value in rejections}) != len(rejections):
+        raise ManifestValidationError("source curation rejected one record more than once")
+    _canonical_corpus(accepted)
+    return SourceCurationResult(
+        examples=tuple(accepted),
+        accepted_source_indices=tuple(accepted_source_indices),
+        rejections=tuple(rejections),
+        ambiguous_document_ids=ambiguous_document_ids,
     )
 
 
@@ -1138,6 +1532,79 @@ def _artifact_entry(path: Path, *, kind: str, row_count: int, variant: str) -> d
     }
 
 
+def _curation_payload(
+    curation: SourceCurationResult,
+    *,
+    source_sha256: str,
+    ledger: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    accepted_qa_ids = tuple(example.qa.qa_id for example in curation.examples)
+    reason_counts = {
+        reason: sum(
+            any(item.code == reason for item in value.reasons)
+            for value in curation.rejections
+        )
+        for reason in _REJECTION_REASONS
+    }
+    return {
+        "accepted_qa_order_sha256": ordered_values_sha256(accepted_qa_ids),
+        "accepted_record_count": len(curation.examples),
+        "accepted_source_order_sha256": _source_indices_sha256(
+            curation.accepted_source_indices
+        ),
+        "ambiguous_document_ids": list(curation.ambiguous_document_ids),
+        "input_record_count": len(curation.examples) + len(curation.rejections),
+        "policy": CURATION_POLICY,
+        "rejected_record_count": len(curation.rejections),
+        "rejection_ledger": dict(ledger),
+        "rejection_reason_counts": reason_counts,
+        "schema_version": CURATION_SCHEMA_VERSION,
+        "source_sha256": source_sha256,
+    }
+
+
+def _write_curation_ledger(
+    output_dir: Path,
+    curation: SourceCurationResult,
+    *,
+    source_sha256: str,
+) -> Mapping[str, Any]:
+    path = output_dir / REJECTION_LEDGER_NAME
+    ledger_payload = _curation_ledger_payload(
+        curation,
+        source_sha256=source_sha256,
+    )
+    path.write_bytes(canonical_json_bytes(ledger_payload) + b"\n")
+    digest = _sha256_file(path)
+    return _curation_payload(
+        curation,
+        source_sha256=source_sha256,
+        ledger={
+            "path": path.name,
+            "row_count": len(curation.rejections),
+            "sha256": digest,
+            "size_bytes": path.stat().st_size,
+        },
+    )
+
+
+def _curation_ledger_payload(
+    curation: SourceCurationResult,
+    *,
+    source_sha256: str,
+) -> Mapping[str, Any]:
+    accepted_qa_ids = tuple(example.qa.qa_id for example in curation.examples)
+    return {
+        "accepted_qa_ids": list(accepted_qa_ids),
+        "ambiguous_document_ids": list(curation.ambiguous_document_ids),
+        "input_record_count": len(curation.examples) + len(curation.rejections),
+        "policy": CURATION_POLICY,
+        "rejections": [value.to_dict() for value in curation.rejections],
+        "schema_version": CURATION_SCHEMA_VERSION,
+        "source_sha256": source_sha256,
+    }
+
+
 def _manifest_payload(
     *,
     mode: str,
@@ -1148,31 +1615,38 @@ def _manifest_payload(
     source_revision: str,
     source_sha256: str,
     source_record_count: int,
+    source_format: str,
     source_split: str | None,
     tokenizer_name: str,
     tokenizer_revision: str,
     contract: Mapping[str, Any],
     qa_ids: Sequence[str],
     artifacts: Mapping[str, Mapping[str, Any]],
+    curation: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    return {
+    source = {
+        "path": str(source_path),
+        "record_count": source_record_count,
+        "revision": source_revision,
+        "sha256": source_sha256,
+        "split": source_split,
+    }
+    payload = {
         "artifacts": dict(artifacts),
         "contract": dict(contract),
         "dataset": dataset,
-        "kind": BUNDLE_KIND,
+        "kind": FORMAL_BUNDLE_KIND if profile == "formal" else BUNDLE_KIND,
         "mode": mode,
         "profile": profile,
         "qa_ids": list(qa_ids),
         "qa_order_sha256": ordered_values_sha256(tuple(qa_ids)),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": (
+            FORMAL_BUNDLE_SCHEMA_VERSION
+            if profile == "formal"
+            else BUNDLE_SCHEMA_VERSION
+        ),
         "seed": seed,
-        "source": {
-            "path": str(source_path),
-            "record_count": source_record_count,
-            "revision": source_revision,
-            "sha256": source_sha256,
-            "split": source_split,
-        },
+        "source": source,
         "tokenizer": {
             "add_special_tokens": False,
             "local_files_only": True,
@@ -1181,6 +1655,14 @@ def _manifest_payload(
             "return_offsets_mapping": True,
         },
     }
+    if profile == "formal":
+        if curation is None:
+            raise ManifestValidationError("formal bundle is missing source curation")
+        source["format"] = source_format
+        payload["curation"] = dict(curation)
+    elif curation is not None:
+        raise ManifestValidationError("fixture bundle cannot publish source curation")
+    return payload
 
 
 def _write_top_manifest(path: Path, payload: Mapping[str, Any]) -> str:
@@ -1222,10 +1704,26 @@ def _build_in_directory(
     train_contract: TrainManifestContract,
     eval_contract: EvalManifestContract,
     split: str | None,
+    source_format: str | None,
 ) -> None:
-    records = load_local_records(source_path, split=split)
-    parsed = _parse_all_examples(records, dataset=dataset)
+    canonical_source_format = _canonical_source_format(source_path, source_format)
+    records = load_local_records(
+        source_path,
+        split=split,
+        source_format=canonical_source_format,
+    )
     source_sha256 = _sha256_file(source_path)
+    if profile == "formal":
+        curation = curate_source_records(records, dataset=dataset)
+        parsed = curation.examples
+        curation_value: Mapping[str, Any] | None = _write_curation_ledger(
+            output_dir,
+            curation,
+            source_sha256=source_sha256,
+        )
+    else:
+        parsed = _parse_all_examples(records, dataset=dataset)
+        curation_value = None
     metadata = ManifestMetadata(
         source_name=dataset,
         source_revision=source_revision,
@@ -1308,12 +1806,14 @@ def _build_in_directory(
         source_revision=source_revision,
         source_sha256=source_sha256,
         source_record_count=len(records),
+        source_format=canonical_source_format,
         source_split=split,
         tokenizer_name=tokenizer_name,
         tokenizer_revision=tokenizer_revision,
         contract=contract_value,
         qa_ids=qa_ids,
         artifacts=artifact_entries,
+        curation=curation_value,
     )
     _write_top_manifest(output_dir / "manifest.json", payload)
 
@@ -1327,23 +1827,35 @@ def _read_top_manifest(path: Path) -> Mapping[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestValidationError("manifest.json is invalid UTF-8 JSON") from exc
     value = _require_mapping(value, "manifest")
+    base_keys = {
+        "artifacts",
+        "contract",
+        "dataset",
+        "kind",
+        "manifest_sha256",
+        "mode",
+        "profile",
+        "qa_ids",
+        "qa_order_sha256",
+        "schema_version",
+        "seed",
+        "source",
+        "tokenizer",
+    }
+    profile = value.get("profile")
+    if profile == "formal":
+        expected_keys = base_keys | {"curation"}
+        expected_kind = FORMAL_BUNDLE_KIND
+        expected_schema = FORMAL_BUNDLE_SCHEMA_VERSION
+    elif profile == "fixture":
+        expected_keys = base_keys
+        expected_kind = BUNDLE_KIND
+        expected_schema = BUNDLE_SCHEMA_VERSION
+    else:
+        raise ManifestValidationError("manifest profile must be formal or fixture")
     _exact_keys(
         value,
-        {
-            "artifacts",
-            "contract",
-            "dataset",
-            "kind",
-            "manifest_sha256",
-            "mode",
-            "profile",
-            "qa_ids",
-            "qa_order_sha256",
-            "schema_version",
-            "seed",
-            "source",
-            "tokenizer",
-        },
+        expected_keys,
         "manifest",
     )
     if canonical_json_bytes(value) + b"\n" != payload:
@@ -1352,8 +1864,8 @@ def _read_top_manifest(path: Path) -> Mapping[str, Any]:
     without_hash = {key: item for key, item in value.items() if key != "manifest_sha256"}
     if expected_hash != _sha256_bytes(canonical_json_bytes(without_hash)):
         raise ManifestValidationError("manifest self-hash mismatch")
-    if value["kind"] != BUNDLE_KIND or value["schema_version"] != SCHEMA_VERSION:
-        raise ManifestValidationError("unsupported bundle kind/schema")
+    if value["kind"] != expected_kind or value["schema_version"] != expected_schema:
+        raise ManifestValidationError("bundle profile/kind/schema mismatch")
     return value
 
 
@@ -1377,15 +1889,406 @@ def _validate_row(
         )
 
 
-def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str, Any]:
+def _validate_curation(
+    output_path: Path,
+    raw_curation: Any,
+    *,
+    source: Mapping[str, Any],
+    dataset: str,
+) -> tuple[str, ...]:
+    curation = _require_mapping(raw_curation, "manifest.curation")
+    _exact_keys(
+        curation,
+        {
+            "accepted_qa_order_sha256",
+            "accepted_record_count",
+            "accepted_source_order_sha256",
+            "ambiguous_document_ids",
+            "input_record_count",
+            "policy",
+            "rejected_record_count",
+            "rejection_ledger",
+            "rejection_reason_counts",
+            "schema_version",
+            "source_sha256",
+        },
+        "manifest.curation",
+    )
+    ledger = _require_mapping(
+        curation["rejection_ledger"],
+        "manifest.curation.rejection_ledger",
+    )
+    _exact_keys(
+        ledger,
+        {"path", "row_count", "sha256", "size_bytes"},
+        "manifest.curation.rejection_ledger",
+    )
+    if ledger["path"] != REJECTION_LEDGER_NAME:
+        raise ManifestValidationError("curation ledger path changed")
+    _require_int(ledger["row_count"], "manifest.curation.rejection_ledger.row_count")
+    _require_int(ledger["size_bytes"], "manifest.curation.rejection_ledger.size_bytes")
+    _require_sha256(ledger["sha256"], "manifest.curation.rejection_ledger.sha256")
+    ledger_path = output_path / REJECTION_LEDGER_NAME
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        raise ManifestValidationError("curation ledger is missing or is a symlink")
+    if ledger_path.stat().st_size != ledger["size_bytes"]:
+        raise ManifestValidationError("curation ledger size mismatch")
+    payload = ledger_path.read_bytes()
+    if _sha256_bytes(payload) != ledger["sha256"]:
+        raise ManifestValidationError("curation ledger hash mismatch")
+    if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        raise ManifestValidationError("curation ledger must be one canonical JSON line")
+    try:
+        ledger_value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManifestValidationError("curation ledger is invalid UTF-8 JSON") from exc
+    ledger_value = _require_mapping(ledger_value, "curation_ledger")
+    _exact_keys(
+        ledger_value,
+        {
+            "accepted_qa_ids",
+            "ambiguous_document_ids",
+            "input_record_count",
+            "policy",
+            "rejections",
+            "schema_version",
+            "source_sha256",
+        },
+        "curation_ledger",
+    )
+    if canonical_json_bytes(ledger_value) + b"\n" != payload:
+        raise ManifestValidationError("curation ledger is not canonical")
+    if (
+        ledger_value["schema_version"] != CURATION_SCHEMA_VERSION
+        or ledger_value["policy"] != CURATION_POLICY
+        or ledger_value["source_sha256"] != source["sha256"]
+        or ledger_value["input_record_count"] != source["record_count"]
+    ):
+        raise ManifestValidationError("curation ledger identity mismatch")
+
+    accepted_qa_ids = _tuple_of_strings(
+        ledger_value["accepted_qa_ids"],
+        "curation_ledger.accepted_qa_ids",
+    )
+    if len(set(accepted_qa_ids)) != len(accepted_qa_ids):
+        raise ManifestValidationError("curation ledger accepted QA IDs contain duplicates")
+    qa_namespace = f"{dataset}:"
+    if any(not qa_id.startswith(qa_namespace) for qa_id in accepted_qa_ids):
+        raise ManifestValidationError("accepted QA ID has the wrong dataset namespace")
+    ambiguous_ids = _tuple_of_strings(
+        ledger_value["ambiguous_document_ids"],
+        "curation_ledger.ambiguous_document_ids",
+    )
+    if ambiguous_ids != tuple(sorted(set(ambiguous_ids))):
+        raise ManifestValidationError("curation ledger ambiguous IDs are not sorted unique")
+
+    raw_rejections = _require_sequence(
+        ledger_value["rejections"],
+        "curation_ledger.rejections",
+    )
+    rejected_indices: list[int] = []
+    rejected_qa_ids: list[str] = []
+    observed_ambiguous: set[str] = set()
+    declared_variants: dict[str, tuple[str, ...]] = {}
+    observed_current_variants: dict[str, set[str]] = {}
+    reason_counts = {reason: 0 for reason in _REJECTION_REASONS}
+    for row_index, raw_rejection in enumerate(raw_rejections):
+        path = f"curation_ledger.rejections[{row_index}]"
+        rejection = _require_mapping(raw_rejection, path)
+        _exact_keys(
+            rejection,
+            {
+                "ambiguous_document_ids",
+                "qa_id",
+                "reasons",
+                "source_index",
+                "source_record_sha256",
+            },
+            path,
+        )
+        source_index = _require_int(rejection["source_index"], f"{path}.source_index")
+        if source_index >= source["record_count"]:
+            raise ManifestValidationError("curation rejection source index is out of range")
+        rejected_indices.append(source_index)
+        rejected_qa_id = _require_nonempty(rejection["qa_id"], f"{path}.qa_id")
+        if not rejected_qa_id.startswith(qa_namespace):
+            raise ManifestValidationError("rejected QA ID has the wrong dataset namespace")
+        rejected_qa_ids.append(rejected_qa_id)
+        _require_sha256(rejection["source_record_sha256"], f"{path}.source_record_sha256")
+        row_ambiguous = _tuple_of_strings(
+            rejection["ambiguous_document_ids"],
+            f"{path}.ambiguous_document_ids",
+        )
+        if row_ambiguous != tuple(sorted(set(row_ambiguous))):
+            raise ManifestValidationError("rejection ambiguous IDs are not sorted unique")
+        raw_reasons = _require_sequence(rejection["reasons"], f"{path}.reasons")
+        if not raw_reasons:
+            raise ManifestValidationError("curation rejection must contain reasons")
+        reason_codes: list[str] = []
+        ambiguity_evidence_ids: list[str] = []
+        for reason_index, raw_reason in enumerate(raw_reasons):
+            reason_path = f"{path}.reasons[{reason_index}]"
+            reason = _require_mapping(raw_reason, reason_path)
+            _exact_keys(reason, {"code", "evidence"}, reason_path)
+            code = _require_nonempty(reason["code"], f"{reason_path}.code")
+            if code not in _REJECTION_REASONS:
+                raise ManifestValidationError("curation rejection reason is not allowed")
+            reason_codes.append(code)
+            reason_counts[code] += 1
+            evidence = _require_sequence(reason["evidence"], f"{reason_path}.evidence")
+            if not evidence:
+                raise ManifestValidationError("curation rejection evidence is empty")
+            supporting_fact_indices: list[int] = []
+            duplicate_evidence_ids: list[str] = []
+            for evidence_index, raw_item in enumerate(evidence):
+                evidence_path = f"{reason_path}.evidence[{evidence_index}]"
+                item = _require_mapping(raw_item, evidence_path)
+                if code == _AMBIGUOUS_DOCUMENT_REASON:
+                    _exact_keys(
+                        item,
+                        {
+                            "document_id",
+                            "observed_raw_variant_sha256s",
+                            "raw_variant_sha256s",
+                        },
+                        evidence_path,
+                    )
+                    document_id = _require_nonempty(item["document_id"], f"{evidence_path}.document_id")
+                    observed = _tuple_of_strings(
+                        item["observed_raw_variant_sha256s"],
+                        f"{evidence_path}.observed_raw_variant_sha256s",
+                    )
+                    variants = _tuple_of_strings(
+                        item["raw_variant_sha256s"],
+                        f"{evidence_path}.raw_variant_sha256s",
+                    )
+                    if variants != tuple(sorted(set(variants))) or len(variants) < 2:
+                        raise ManifestValidationError("ambiguous raw variants are not sorted unique")
+                    for variant_index, variant in enumerate(variants):
+                        _require_sha256(variant, f"{evidence_path}.raw_variant_sha256s[{variant_index}]")
+                    if observed != tuple(sorted(set(observed))) or not observed:
+                        raise ManifestValidationError("observed raw variants are not sorted unique")
+                    for variant_index, variant in enumerate(observed):
+                        _require_sha256(
+                            variant,
+                            f"{evidence_path}.observed_raw_variant_sha256s[{variant_index}]",
+                        )
+                    if not set(observed).issubset(variants):
+                        raise ManifestValidationError("observed raw variant is absent from inventory")
+                    previous_variants = declared_variants.setdefault(document_id, variants)
+                    if previous_variants != variants:
+                        raise ManifestValidationError(
+                            "ambiguous raw variant inventory differs across rejections"
+                        )
+                    observed_current_variants.setdefault(document_id, set()).update(observed)
+                    ambiguity_evidence_ids.append(document_id)
+                    observed_ambiguous.add(document_id)
+                elif code == _OUT_OF_BOUNDS_REASON:
+                    _exact_keys(
+                        item,
+                        {"document_id", "sentence_count", "sentence_index", "supporting_fact_index"},
+                        evidence_path,
+                    )
+                    _require_nonempty(item["document_id"], f"{evidence_path}.document_id")
+                    sentence_count = _require_int(item["sentence_count"], f"{evidence_path}.sentence_count", 1)
+                    sentence_index = _require_int(item["sentence_index"], f"{evidence_path}.sentence_index")
+                    supporting_fact_indices.append(
+                        _require_int(
+                            item["supporting_fact_index"],
+                            f"{evidence_path}.supporting_fact_index",
+                        )
+                    )
+                    if sentence_index < sentence_count:
+                        raise ManifestValidationError("out-of-bounds evidence is actually in bounds")
+                elif code == _MISSING_SUPPORT_TITLE_REASON:
+                    _exact_keys(
+                        item,
+                        {
+                            "available_document_ids",
+                            "normalized_title_sha256",
+                            "raw_title_sha256",
+                            "supporting_fact_index",
+                        },
+                        evidence_path,
+                    )
+                    available_ids = _tuple_of_strings(
+                        item["available_document_ids"],
+                        f"{evidence_path}.available_document_ids",
+                    )
+                    if available_ids != tuple(sorted(set(available_ids))):
+                        raise ManifestValidationError("available document IDs are not sorted unique")
+                    _require_sha256(
+                        item["normalized_title_sha256"],
+                        f"{evidence_path}.normalized_title_sha256",
+                    )
+                    _require_sha256(
+                        item["raw_title_sha256"],
+                        f"{evidence_path}.raw_title_sha256",
+                    )
+                    supporting_fact_indices.append(
+                        _require_int(
+                            item["supporting_fact_index"],
+                            f"{evidence_path}.supporting_fact_index",
+                        )
+                    )
+                elif code == _EMPTY_CONTEXT_REASON:
+                    _exact_keys(item, {"document_count"}, evidence_path)
+                    if item["document_count"] != 0:
+                        raise ManifestValidationError("empty context evidence is not empty")
+                else:
+                    _exact_keys(
+                        item,
+                        {
+                            "document_id",
+                            "occurrence_positions",
+                            "raw_variant_sha256s",
+                        },
+                        evidence_path,
+                    )
+                    duplicate_evidence_ids.append(
+                        _require_nonempty(
+                            item["document_id"],
+                            f"{evidence_path}.document_id",
+                        )
+                    )
+                    positions = tuple(
+                        _require_int(value, f"{evidence_path}.occurrence_positions[{index}]")
+                        for index, value in enumerate(
+                            _require_sequence(
+                                item["occurrence_positions"],
+                                f"{evidence_path}.occurrence_positions",
+                            )
+                        )
+                    )
+                    if positions != tuple(sorted(set(positions))) or len(positions) < 2:
+                        raise ManifestValidationError("duplicate occurrence positions are invalid")
+                    duplicate_variants = _tuple_of_strings(
+                        item["raw_variant_sha256s"],
+                        f"{evidence_path}.raw_variant_sha256s",
+                    )
+                    if len(duplicate_variants) != len(positions):
+                        raise ManifestValidationError("duplicate variants do not align with positions")
+                    for variant_index, variant in enumerate(duplicate_variants):
+                        _require_sha256(
+                            variant,
+                            f"{evidence_path}.raw_variant_sha256s[{variant_index}]",
+                        )
+            if code in {
+                _OUT_OF_BOUNDS_REASON,
+                _MISSING_SUPPORT_TITLE_REASON,
+            } and supporting_fact_indices != sorted(set(supporting_fact_indices)):
+                raise ManifestValidationError(
+                    "supporting fact indices are not strictly increasing"
+                )
+            if code == _EMPTY_CONTEXT_REASON and len(evidence) != 1:
+                raise ManifestValidationError("empty context evidence must have one item")
+            if code == _DUPLICATE_CONTEXT_DOCUMENT_REASON and duplicate_evidence_ids != sorted(
+                set(duplicate_evidence_ids)
+            ):
+                raise ManifestValidationError(
+                    "duplicate context document IDs are not sorted unique"
+                )
+        if reason_codes != sorted(set(reason_codes)):
+            raise ManifestValidationError("curation rejection reasons are not sorted unique")
+        if tuple(ambiguity_evidence_ids) != row_ambiguous:
+            raise ManifestValidationError("ambiguous IDs differ from rejection evidence")
+    if rejected_indices != sorted(set(rejected_indices)):
+        raise ManifestValidationError("curation rejection source indices are not sorted unique")
+    if len(set(rejected_qa_ids)) != len(rejected_qa_ids):
+        raise ManifestValidationError("curation ledger rejected QA IDs contain duplicates")
+    if set(accepted_qa_ids) & set(rejected_qa_ids):
+        raise ManifestValidationError("accepted and rejected QA IDs overlap")
+    if len(raw_rejections) != ledger["row_count"]:
+        raise ManifestValidationError("curation ledger row count mismatch")
+    if tuple(sorted(observed_ambiguous)) != ambiguous_ids:
+        raise ManifestValidationError("curation ambiguous ID inventory mismatch")
+    for document_id in ambiguous_ids:
+        if observed_current_variants.get(document_id, set()) != set(
+            declared_variants[document_id]
+        ):
+            raise ManifestValidationError(
+                "observed raw variants do not cover the ambiguous inventory"
+            )
+
+    rejected_set = set(rejected_indices)
+    accepted_indices = tuple(
+        index for index in range(source["record_count"]) if index not in rejected_set
+    )
+    if len(accepted_qa_ids) != len(accepted_indices):
+        raise ManifestValidationError("curation accepted QA count mismatch")
+    if len(accepted_qa_ids) + len(rejected_qa_ids) != source["record_count"]:
+        raise ManifestValidationError("curation QA inventory does not cover the source")
+    expected = {
+        "accepted_qa_order_sha256": ordered_values_sha256(accepted_qa_ids),
+        "accepted_record_count": len(accepted_indices),
+        "accepted_source_order_sha256": _source_indices_sha256(accepted_indices),
+        "ambiguous_document_ids": list(ambiguous_ids),
+        "input_record_count": source["record_count"],
+        "policy": CURATION_POLICY,
+        "rejected_record_count": len(rejected_indices),
+        "rejection_ledger": dict(ledger),
+        "rejection_reason_counts": reason_counts,
+        "schema_version": CURATION_SCHEMA_VERSION,
+        "source_sha256": source["sha256"],
+    }
+    if curation != expected:
+        raise ManifestValidationError(
+            "curation manifest differs from its canonical ledger"
+        )
+    return accepted_qa_ids
+
+
+def _replay_source_curation(
+    output_path: Path,
+    *,
+    source: Mapping[str, Any],
+    dataset: str,
+) -> tuple[str, ...]:
+    source_path = Path(str(source["path"]))
+    if not source_path.is_file():
+        raise ManifestValidationError("strict curation replay requires the source file")
+    if _sha256_file(source_path) != source["sha256"]:
+        raise ManifestValidationError("local source hash changed before curation replay")
+    records = load_local_records(
+        source_path,
+        split=source["split"],
+        source_format=source["format"],
+    )
+    if len(records) != source["record_count"]:
+        raise ManifestValidationError("source record count changed before curation replay")
+    replayed = curate_source_records(records, dataset=dataset)
+    expected_payload = _curation_ledger_payload(
+        replayed,
+        source_sha256=source["sha256"],
+    )
+    expected_bytes = canonical_json_bytes(expected_payload) + b"\n"
+    ledger_path = output_path / REJECTION_LEDGER_NAME
+    if ledger_path.read_bytes() != expected_bytes:
+        raise ManifestValidationError(
+            "curation ledger differs from strict source replay"
+        )
+    return tuple(example.qa.qa_id for example in replayed.examples)
+
+
+def validate_artifact_bundle(
+    output_dir: str | os.PathLike[str],
+    *,
+    replay_source_curation: bool = False,
+) -> Mapping[str, Any]:
     """Read every published byte back and cross-check Parquet against sidecars."""
 
+    if type(replay_source_curation) is not bool:
+        raise TypeError("replay_source_curation must be a bool")
     output_path = Path(output_dir).expanduser().resolve(strict=True)
     manifest = _read_top_manifest(output_path / "manifest.json")
+    is_formal = manifest["profile"] == "formal"
     source = _require_mapping(manifest["source"], "manifest.source")
+    source_keys = {"path", "record_count", "revision", "sha256", "split"}
+    if is_formal:
+        source_keys.add("format")
     _exact_keys(
         source,
-        {"path", "record_count", "revision", "sha256", "split"},
+        source_keys,
         "manifest.source",
     )
     tokenizer = _require_mapping(manifest["tokenizer"], "manifest.tokenizer")
@@ -1402,6 +2305,9 @@ def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str,
     )
     _require_int(source["record_count"], "manifest.source.record_count", 1)
     _require_sha256(source["sha256"], "manifest.source.sha256")
+    _require_nonempty(source["path"], "manifest.source.path")
+    if is_formal and source["format"] not in {"json", "jsonl", "parquet"}:
+        raise ManifestValidationError("manifest source format is unsupported")
     if source["split"] is not None:
         _require_nonempty(source["split"], "manifest.source.split")
     if (
@@ -1412,6 +2318,36 @@ def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str,
         raise ManifestValidationError("tokenizer execution contract changed")
     _require_fixed_revision(source["revision"], "manifest.source.revision")
     _require_fixed_revision(tokenizer["revision"], "manifest.tokenizer.revision")
+    source_path = Path(str(source["path"]))
+    if source_path.is_file() and _sha256_file(source_path) != source["sha256"]:
+        raise ManifestValidationError("local source hash changed after build")
+    dataset = _canonical_dataset_name(manifest["dataset"])
+    if dataset != manifest["dataset"]:
+        raise ManifestValidationError("manifest dataset name is not canonical")
+    curated = (
+        _validate_curation(
+            output_path,
+            manifest["curation"],
+            source=source,
+            dataset=dataset,
+        )
+        if is_formal
+        else None
+    )
+    if replay_source_curation:
+        if not is_formal:
+            raise ManifestValidationError(
+                "strict curation replay is only valid for formal bundles"
+            )
+        replayed_qa_ids = _replay_source_curation(
+            output_path,
+            source=source,
+            dataset=dataset,
+        )
+        if replayed_qa_ids != curated:
+            raise ManifestValidationError(
+                "accepted QA order differs from strict source replay"
+            )
     qa_ids = _tuple_of_strings(manifest["qa_ids"], "manifest.qa_ids")
     if len(set(qa_ids)) != len(qa_ids):
         raise ManifestValidationError("top-level QA IDs contain duplicates")
@@ -1419,6 +2355,8 @@ def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str,
         raise ManifestValidationError("top-level QA order hash mismatch")
     artifacts = _require_mapping(manifest["artifacts"], "manifest.artifacts")
     expected_files = {"manifest.json"}
+    if is_formal:
+        expected_files.add(REJECTION_LEDGER_NAME)
     by_variant: dict[str, dict[str, tuple[Path, Mapping[str, Any]]]] = {}
     for name, raw_entry in artifacts.items():
         entry = _require_mapping(raw_entry, f"manifest.artifacts.{name}")
@@ -1461,9 +2399,6 @@ def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str,
     except ImportError as exc:
         raise RuntimeError("pyarrow is required to validate reproduction Parquet") from exc
     mode = manifest["mode"]
-    dataset = _canonical_dataset_name(manifest["dataset"])
-    if dataset != manifest["dataset"]:
-        raise ManifestValidationError("manifest dataset name is not canonical")
     _require_int(manifest["seed"], "manifest.seed")
     expected_metadata = ManifestMetadata(
         source_name=dataset,
@@ -1533,10 +2468,17 @@ def validate_artifact_bundle(output_dir: str | os.PathLike[str]) -> Mapping[str,
         )
     else:
         raise ManifestValidationError("manifest mode must be train or eval")
+    if curated is not None:
+        selected = _select_qa_ids(
+            curated,
+            qa_count=contract.qa_count,
+            seed=manifest["seed"],
+        )
+        if selected != qa_ids:
+            raise ManifestValidationError(
+                "QA order differs from deterministic source selection"
+            )
     _check_profile(mode, manifest["profile"], contract)
-    source_path = Path(source["path"])
-    if source_path.is_file() and _sha256_file(source_path) != source["sha256"]:
-        raise ManifestValidationError("local source hash changed after build")
     return manifest
 
 
@@ -1555,6 +2497,7 @@ def build_artifact_bundle(
     train_contract: TrainManifestContract = TrainManifestContract(),
     eval_contract: EvalManifestContract = EvalManifestContract(),
     split: str | None = None,
+    source_format: str | None = None,
 ) -> Mapping[str, Any]:
     """Build, atomically publish, then independently read back one bundle."""
 
@@ -1600,6 +2543,7 @@ def build_artifact_bundle(
             train_contract=train_contract,
             eval_contract=eval_contract,
             split=split,
+            source_format=source_format,
         )
         validate_artifact_bundle(staging)
         os.replace(staging, destination)
@@ -1743,7 +2687,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "BUNDLE_SCHEMA_VERSION",
     "BUNDLE_KIND",
+    "CURATION_SCHEMA_VERSION",
+    "CURATION_POLICY",
+    "REJECTION_LEDGER_NAME",
     "FORMAL_TRAIN_QA_COUNT",
     "FORMAL_TRAIN_DOCUMENT_COUNT",
     "FORMAL_TRAIN_CHUNK_SIZE",
@@ -1752,10 +2700,13 @@ __all__ = [
     "FORMAL_TRAIN_MAX_CONTEXT_TOKENS",
     "SourceDocument",
     "ParsedExample",
+    "SourceRejection",
+    "SourceCurationResult",
     "TrainManifestContract",
     "stable_qa_id",
     "parse_source_record",
     "load_local_records",
+    "curate_source_records",
     "build_train_records",
     "validate_train_records",
     "build_eval_pair",

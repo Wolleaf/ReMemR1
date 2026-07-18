@@ -264,6 +264,7 @@ publish_terminal_state() {
     atomic_write "${launcher_dir}/terminal" "${terminal_text}" || return
     atomic_write "${launcher_dir}/exit-code" "${rc}" || return
     atomic_write "${launcher_dir}/status" "${final_outcome}" || return
+    atomic_write "${launcher_dir}/retryable" "${retryable}" || return
     if [[ "${rc}" -eq 0 ]]; then
         atomic_write "${launcher_dir}/.success" "0" || return
     elif [[ "${rc}" -eq 42 ]]; then
@@ -273,7 +274,6 @@ publish_terminal_state() {
     else
         atomic_write "${launcher_dir}/.failed" "${rc}" || return
     fi
-    atomic_write "${launcher_dir}/retryable" "${retryable}" || return
     rememr1_test_event \
         "terminal-state-written exit_code=${rc} launcher_dir=${launcher_dir}" || return
     terminal_publish_failure=terminal-state-sync

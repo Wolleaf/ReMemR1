@@ -220,8 +220,8 @@ _BUNDLE_SPECS = (
         "train",
         "formal",
         "hotpotqa",
-        "byted-hotpotqa-formal",
-        "hotpotqa_train_32k.parquet",
+        "hotpotqa-source",
+        "hotpotqa/train.jsonl",
         None,
         "qwen35-2b-model-tokenizer",
     ),
@@ -231,8 +231,8 @@ _BUNDLE_SPECS = (
         "train",
         "formal",
         "hotpotqa",
-        "byted-hotpotqa-formal",
-        "hotpotqa_dev.parquet",
+        "hotpotqa-source",
+        "hotpotqa/dev.jsonl",
         None,
         "qwen35-2b-model-tokenizer",
     ),
@@ -1062,6 +1062,11 @@ def _validate_bundle_identity(
         raise CloudStateError(f"bundle {spec.relative_path} source path mismatch")
     if source.get("split") != spec.source_split:
         raise CloudStateError(f"bundle {spec.relative_path} source split mismatch")
+    if spec.profile == "formal":
+        assert spec.source_file is not None
+        expected_format = PurePosixPath(spec.source_file).suffix.lstrip(".").lower()
+        if source.get("format") != expected_format:
+            raise CloudStateError(f"bundle {spec.relative_path} source format mismatch")
     if tokenizer.get("name") != tokenizer_name or tokenizer.get("revision") != tokenizer_revision:
         raise CloudStateError(f"bundle {spec.relative_path} tokenizer identity mismatch")
 
@@ -1089,7 +1094,7 @@ def build_data(
     downloader: Callable[..., str] | None = None,
     tokenizer_loader: Callable[[str, str], Callable[[str], Any]] = _local_tokenizer_loader,
     builder: Callable[..., Mapping[str, Any]] = build_artifact_bundle,
-    validator: Callable[[str | os.PathLike[str]], Mapping[str, Any]] = validate_artifact_bundle,
+    validator: Callable[..., Mapping[str, Any]] = validate_artifact_bundle,
     tracked_manifest_path: str | Path | None = _TRACKED_ASSET_MANIFEST,
 ) -> dict[str, Any]:
     """Build or strictly validate all gate, capacity, and formal bundles offline."""
@@ -1156,8 +1161,6 @@ def build_data(
                 )
             source_path = local_sources[source_key]
             source_revision = source_asset["revision"]
-            if spec.source_asset == "byted-hotpotqa-formal":
-                _probe_formal_parquet(source_path, dataset=spec.dataset)
         destination = _resolve_without_symlinks(
             root / Path(*PurePosixPath(spec.relative_path).parts),
             f"bundle {spec.relative_path}",
@@ -1166,7 +1169,10 @@ def build_data(
         _require_within(destination, root, f"bundle {spec.relative_path}")
         if destination.exists():
             try:
-                bundle_manifest = validator(destination)
+                bundle_manifest = validator(
+                    destination,
+                    replay_source_curation=spec.profile == "formal",
+                )
             except Exception as exc:
                 raise CloudStateError(
                     f"existing bundle is invalid and will not be overwritten: {destination}: {exc}"
@@ -1197,6 +1203,8 @@ def build_data(
                     kwargs["train_contract"] = _GATE_CONTRACT
                 else:
                     kwargs["eval_contract"] = _G1_EVAL_CONTRACT
+            if spec.source_file is not None:
+                kwargs["source_format"] = PurePosixPath(spec.source_file).suffix
             try:
                 builder(**kwargs)
                 destination = _resolve_without_symlinks(
@@ -1204,7 +1212,10 @@ def build_data(
                     f"bundle {spec.relative_path}",
                 )
                 _require_within(destination, root, f"bundle {spec.relative_path}")
-                bundle_manifest = validator(destination)
+                bundle_manifest = validator(
+                    destination,
+                    replay_source_curation=spec.profile == "formal",
+                )
             except Exception as exc:
                 raise CloudStateError(
                     f"failed to build bundle {spec.relative_path}: {type(exc).__name__}: {exc}"
@@ -1639,7 +1650,10 @@ def _load_and_record_bundles(
         )
         _require_within(path, data_root, f"bundle {spec.relative_path}")
         try:
-            manifest = validate_artifact_bundle(path)
+            manifest = validate_artifact_bundle(
+                path,
+                replay_source_curation=spec.profile == "formal",
+            )
         except Exception as exc:
             raise CloudStateError(f"bundle validation failed for {path}: {exc}") from exc
         source_path = _resolve_without_symlinks(
@@ -1891,7 +1905,10 @@ def _verify_bundle_record(
         f"bundles.{'.'.join(spec.keys)}.source_file",
     )
     try:
-        manifest = validate_artifact_bundle(path)
+        manifest = validate_artifact_bundle(
+            path,
+            replay_source_curation=spec.profile == "formal",
+        )
     except Exception as exc:
         raise CloudStateError(f"bundle validation failed for {path}: {exc}") from exc
     if spec.gate_split is not None:

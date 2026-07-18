@@ -396,6 +396,7 @@ def _build_data_manifest(tmp_path: Path):
     source_payloads = {
         ("owner/formal", "hotpotqa_train_32k.parquet"): b"formal train",
         ("owner/formal", "hotpotqa_dev.parquet"): b"formal validation",
+        ("owner/hotpot", "hotpotqa/train.jsonl"): b"hotpot train",
         ("owner/hotpot", "hotpotqa/dev.jsonl"): b"hotpot eval",
         ("owner/2wiki", "2wikimultihopqa/dev.jsonl"): b"2wiki eval",
     }
@@ -422,7 +423,12 @@ def _build_data_manifest(tmp_path: Path):
             ("hotpotqa_train_32k.parquet", "hotpotqa_dev.parquet"),
             "formal_training_source",
         ),
-        ("hotpotqa-source", "owner/hotpot", ("hotpotqa/dev.jsonl",), "dataset_source"),
+        (
+            "hotpotqa-source",
+            "owner/hotpot",
+            ("hotpotqa/train.jsonl", "hotpotqa/dev.jsonl"),
+            "dataset_source",
+        ),
         (
             "2wikimultihopqa-source",
             "owner/2wiki",
@@ -480,6 +486,14 @@ def _fake_bundle_manifest(kwargs):
             "qa_count": value.qa_count,
         }
     source = Path(kwargs["input_path"]).resolve()
+    source_record = {
+        "path": str(source),
+        "revision": kwargs["source_revision"],
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "split": kwargs["split"],
+    }
+    if kwargs["profile"] == "formal":
+        source_record["format"] = kwargs["source_format"].lstrip(".").lower()
     return {
         "contract": contract,
         "dataset": kwargs["dataset"],
@@ -487,12 +501,7 @@ def _fake_bundle_manifest(kwargs):
         "mode": kwargs["mode"],
         "profile": kwargs["profile"],
         "seed": kwargs["seed"],
-        "source": {
-            "path": str(source),
-            "revision": kwargs["source_revision"],
-            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "split": kwargs["split"],
-        },
+        "source": source_record,
         "tokenizer": {
             "name": kwargs["tokenizer_name"],
             "revision": kwargs["tokenizer_revision"],
@@ -507,7 +516,7 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     data_root = tmp_path / "data"
-    calls = {"build": [], "download": []}
+    calls = {"build": [], "build_kwargs": [], "download": [], "validate": []}
     manifests = {}
 
     gate_payloads = {
@@ -542,9 +551,12 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
         (destination / "placeholder").write_text("bundle", encoding="ascii")
         manifests[destination.resolve()] = _fake_bundle_manifest(kwargs)
         calls["build"].append(destination.resolve())
+        calls["build_kwargs"].append(kwargs.copy())
 
-    def validator(path):
-        return manifests[Path(path).resolve()]
+    def validator(path, **kwargs):
+        resolved = Path(path).resolve()
+        calls["validate"].append((resolved, kwargs.copy()))
+        return manifests[resolved]
 
     result = cloud_state.build_data(
         manifest_path,
@@ -557,8 +569,31 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
         tracked_manifest_path=manifest_path,
     )
     assert len(calls["build"]) == 11
-    assert len(calls["download"]) == 4
+    assert len(calls["validate"]) == 11
+    assert all(
+        kwargs == {
+            "replay_source_curation": manifests[path]["profile"] == "formal"
+        }
+        for path, kwargs in calls["validate"]
+    )
+    assert len(calls["download"]) == 3
     assert all(call["local_files_only"] is True for call in calls["download"])
+    assert all(call["repo_id"] != "owner/formal" for call in calls["download"])
+    assert all(
+        call["source_format"] == ".jsonl"
+        for call in calls["build_kwargs"]
+        if call["profile"] == "formal"
+    )
+    formal_train = Path(result["bundles"]["formal"]["train"]["path"]).resolve()
+    formal_validation = Path(
+        result["bundles"]["formal"]["validation"]["path"]
+    ).resolve()
+    assert manifests[formal_train]["source"]["path"] == str(
+        source_files[("owner/hotpot", "hotpotqa/train.jsonl")].resolve()
+    )
+    assert manifests[formal_validation]["source"]["path"] == str(
+        source_files[("owner/hotpot", "hotpotqa/dev.jsonl")].resolve()
+    )
     assert result["bundles"]["gates"]["g0"]["train"]["action"] == "built"
     assert result["gate_source"]["repeat_count"] == 64
     assert result["length_stress_source"]["non_scientific"] is True
@@ -585,6 +620,39 @@ def test_build_data_is_local_only_and_idempotently_validates_existing_bundles(
     )
     assert len(calls["build"]) == 11
     assert second["bundles"]["formal"]["train"]["action"] == "verified"
+
+
+def test_formal_bundle_identity_rejects_wrong_source_format(tmp_path):
+    source = tmp_path / "train.jsonl"
+    source.write_text("{}\n", encoding="ascii")
+    spec = next(
+        item for item in cloud_state._BUNDLE_SPECS if item.keys == ("formal", "train")
+    )
+    kwargs = {
+        "dataset": spec.dataset,
+        "input_path": source,
+        "mode": spec.mode,
+        "output_dir": tmp_path / "bundle",
+        "profile": spec.profile,
+        "seed": cloud_state.SEED,
+        "source_format": ".jsonl",
+        "source_revision": "source-revision",
+        "split": spec.source_split,
+        "tokenizer_name": "tokenizer",
+        "tokenizer_revision": "tokenizer-revision",
+    }
+    manifest = _fake_bundle_manifest(kwargs)
+    manifest["source"]["format"] = "json"
+
+    with pytest.raises(cloud_state.CloudStateError, match="source format mismatch"):
+        cloud_state._validate_bundle_identity(
+            manifest,
+            spec,
+            source_path=source.resolve(),
+            source_revision="source-revision",
+            tokenizer_name="tokenizer",
+            tokenizer_revision="tokenizer-revision",
+        )
 
 
 def test_build_data_cli_atomically_writes_same_summary_it_prints(tmp_path, monkeypatch, capsys):
@@ -816,7 +884,7 @@ def test_asset_report_is_bound_to_every_file_digest(tmp_path):
         cloud_state._validate_asset_report(report, manifest)
 
 
-def test_formal_parquet_probe_rejects_flat_context(tmp_path):
+def test_formal_parquet_probe_rejects_actual_flattened_upstream_schema(tmp_path):
     pyarrow = pytest.importorskip("pyarrow")
     parquet = pytest.importorskip("pyarrow.parquet")
     path = tmp_path / "flat.parquet"
@@ -824,13 +892,18 @@ def test_formal_parquet_probe_rejects_flat_context(tmp_path):
         pyarrow.Table.from_pylist(
             [
                 {
-                    "_id": "flat-1",
-                    "answers": ["answer"],
+                    "data_source": "hotpotqa",
+                    "prompt": [{"content": "question?", "role": "user"}],
                     "context": "already concatenated and no longer auditable",
-                    "question": "question?",
-                    "supporting_facts": [
-                        {"title": "missing title", "sent_id": 0}
-                    ],
+                    "reward_model": {
+                        "ground_truth": ["answer"],
+                        "style": "rule",
+                    },
+                    "extra_info": {
+                        "index": 0,
+                        "num_docs": 200,
+                        "question": "question?",
+                    },
                 }
             ]
         ),
@@ -839,6 +912,20 @@ def test_formal_parquet_probe_rejects_flat_context(tmp_path):
 
     with pytest.raises(cloud_state.CloudStateError, match="lacks structured"):
         cloud_state._probe_formal_parquet(path, dataset="hotpotqa")
+
+
+def test_formal_bundles_rebuild_from_structured_raw_hotpotqa_sources():
+    formal_specs = {
+        spec.keys: (spec.source_asset, spec.source_file)
+        for spec in cloud_state._BUNDLE_SPECS
+        if spec.keys in {("formal", "train"), ("formal", "validation")}
+    }
+
+    assert formal_specs == {
+        ("formal", "train"): ("hotpotqa-source", "hotpotqa/train.jsonl"),
+        ("formal", "validation"): ("hotpotqa-source", "hotpotqa/dev.jsonl"),
+    }
+    assert "byted-hotpotqa-formal" in cloud_state._ACTIVE_ASSET_IDS
 
 
 def test_publish_handoff_writes_canonical_self_hashed_json(tmp_path, monkeypatch):

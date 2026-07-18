@@ -87,6 +87,20 @@ B/C40、B/C80、费用投影、R1 一次性批准和结果导出仍保留在内�
 任何资产 revision、LFS digest、数据 schema、配置 inventory 或路径不完整都会 fail closed，不会用占位
 SHA、未验证缓存或 4B 历史资产继续。
 
+正式 train/validation 使用固定 FlashRAG HotpotQA `train.jsonl`/`dev.jsonl` 的结构化 context 和
+supporting facts 重建。BytedTsinghua-SIA 的 32k/dev parquet 仍按 hash 缓存为上游参考，但其 context
+已经扁平化，不能直接生成可审计的 document/fact provenance。
+
+所有 formal train/eval bundle 使用 v3 curation ledger：全源扫描并仅按固定的结构/provenance 原因
+排除整条 QA，包括越界 supporting-fact、缺失 supporting title、空 context、QA 内重复稳定文档和
+归一化文档的多个原始版本。脚本不会修补索引、静默去重、选择有利版本或伪造 supporting facts；
+任何未列入策略的解析错误立即停止。ledger 的 source hash、顺序 hash、计数、reason/evidence 与
+歧义文档清单进入 bundle 和 handoff，最终筛选数量以 sealed ledger 为准。
+
+封存前审计已经发现 HotpotQA dev 约 71.8% 的记录缺少可验证 supporting title、为空 context 或
+句子索引越界；这是源数据的选择限制，不是可自动修复的下载错误。CPU finalize 会把精确数量写入 ledger，
+正式报告必须披露，不能把筛选后的集合称为完整、无筛选 dev。
+
 ## GPU 门禁与容量语义
 
 GPU admission 在任何 CUDA 编译和权重加载前重验完整 CPU handoff，然后设置 offline 环境。G0 使用
