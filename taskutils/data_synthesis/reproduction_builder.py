@@ -13,6 +13,7 @@ import bisect
 import hashlib
 import heapq
 import json
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -79,6 +80,7 @@ FORMAL_TRAIN_MIN_CONTEXT_TOKENS = 25_001
 FORMAL_TRAIN_MAX_CONTEXT_TOKENS = 30_000
 _FORMAL_TRAIN_INITIAL_DISTRACTOR_RESERVE = 64
 _FORMAL_TRAIN_EXACT_TRIALS_PER_RESERVE = 32
+_FORMAL_TRAIN_MAX_RANK_WORKERS = 16
 _FLOATING_REVISIONS = {"", "main", "master", "latest", "head"}
 _DATASET_ALIASES = {
     "hotpot": "hotpotqa",
@@ -818,6 +820,108 @@ def _ranked_distractor_ids(
     )
 
 
+_FORK_RANK_DOCUMENT_IDS: tuple[str, ...] | None = None
+
+
+def _init_fork_rank_worker(document_ids: tuple[str, ...]) -> None:
+    global _FORK_RANK_DOCUMENT_IDS
+    _FORK_RANK_DOCUMENT_IDS = document_ids
+
+
+def _fork_rank_distractors(
+    task: tuple[str, tuple[str, ...], int, int],
+) -> tuple[str, ...]:
+    document_ids = _FORK_RANK_DOCUMENT_IDS
+    if document_ids is None:
+        raise RuntimeError("fork ranking worker was not initialized")
+    qa_id, core_ids, seed, limit = task
+    core_set = set(core_ids)
+    key = lambda document_id: (
+        _rank(seed, qa_id, "distractor-selection", document_id),
+        document_id,
+    )
+    return tuple(
+        heapq.nsmallest(
+            limit,
+            (
+                document_id
+                for document_id in document_ids
+                if document_id not in core_set
+            ),
+            key=key,
+        )
+    )
+
+
+def _effective_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def _rank_initial_train_distractors(
+    examples: Sequence[ParsedExample],
+    *,
+    corpus: Mapping[str, DocumentInput],
+    seed: int,
+    limits: Sequence[int | None],
+) -> tuple[tuple[str, ...] | None, ...]:
+    """Rank independent train QA pools in forked workers on the Linux host."""
+
+    if len(examples) != len(limits):
+        raise ValueError("distractor rank limits must match the selected examples")
+    jobs = [
+        (
+            index,
+            (
+                example.qa.qa_id,
+                tuple(document.document_id for document in example.documents),
+                seed,
+                limit,
+            ),
+        )
+        for index, (example, limit) in enumerate(zip(examples, limits))
+        if limit is not None
+    ]
+    results: list[tuple[str, ...] | None] = [None] * len(examples)
+    worker_count = min(
+        _FORMAL_TRAIN_MAX_RANK_WORKERS,
+        _effective_cpu_count(),
+        len(jobs),
+    )
+    can_fork = (
+        os.name == "posix"
+        and "fork" in multiprocessing.get_all_start_methods()
+        and not multiprocessing.current_process().daemon
+    )
+    if worker_count < 2 or not can_fork:
+        for index, _ in jobs:
+            results[index] = _ranked_distractor_ids(
+                examples[index],
+                corpus=corpus,
+                seed=seed,
+                limit=limits[index],
+            )
+        return tuple(results)
+
+    document_ids = tuple(corpus)
+    context = multiprocessing.get_context("fork")
+    with context.Pool(
+        processes=worker_count,
+        initializer=_init_fork_rank_worker,
+        initargs=(document_ids,),
+    ) as pool:
+        ranked = pool.map(
+            _fork_rank_distractors,
+            (task for _, task in jobs),
+            chunksize=1,
+        )
+    for (index, _), value in zip(jobs, ranked):
+        results[index] = value
+    return tuple(results)
+
+
 def _materialize_document_pool(
     example: ParsedExample,
     *,
@@ -1391,23 +1495,30 @@ def build_train_records(
     qa_order_sha256 = ordered_values_sha256(qa_ids)
     records = []
     body_token_counts: dict[str, int] = {}
-    for qa_index, example in enumerate(selected):
-        ranked_distractors: tuple[str, ...] | None = None
+    initial_rank_limits: list[int | None] = []
+    for example in selected:
         distractor_count = len(corpus) - len(example.documents)
         needed_distractors = contract.document_count - len(example.documents)
-        ranked_limit: int | None = None
-        failed_exact_trials: set[tuple[str, int, int, str]] = set()
-        if fit_context_window and needed_distractors >= 0:
-            ranked_limit = min(
+        initial_rank_limits.append(
+            min(
                 distractor_count,
                 needed_distractors + _FORMAL_TRAIN_INITIAL_DISTRACTOR_RESERVE,
             )
-            ranked_distractors = _ranked_distractor_ids(
-                example,
-                corpus=corpus,
-                seed=metadata.seed,
-                limit=ranked_limit,
-            )
+            if fit_context_window and needed_distractors >= 0
+            else None
+        )
+    initial_rankings = _rank_initial_train_distractors(
+        selected,
+        corpus=corpus,
+        seed=metadata.seed,
+        limits=initial_rank_limits,
+    )
+    for qa_index, example in enumerate(selected):
+        ranked_distractors = initial_rankings[qa_index]
+        distractor_count = len(corpus) - len(example.documents)
+        needed_distractors = contract.document_count - len(example.documents)
+        ranked_limit = initial_rank_limits[qa_index]
+        failed_exact_trials: set[tuple[str, int, int, str]] = set()
         pool, facts = _materialize_document_pool(
             example,
             corpus=corpus,

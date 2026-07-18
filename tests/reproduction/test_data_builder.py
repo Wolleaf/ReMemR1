@@ -1096,6 +1096,36 @@ def test_bounded_distractor_ranking_is_the_exact_full_ranking_prefix():
     assert bounded == full[:3]
 
 
+def test_parallel_initial_distractor_ranking_matches_individual_prefixes(monkeypatch):
+    examples = tuple(
+        parse_source_record(_hotpot_record(index), dataset="hotpotqa", source_index=index)
+        for index in range(8)
+    )
+    corpus = builder._canonical_corpus(examples)
+    limits = (3, None, 4, 5, 6, 3, 4, 5)
+    monkeypatch.setattr(builder, "_effective_cpu_count", lambda: 4)
+
+    ranked = builder._rank_initial_train_distractors(
+        examples,
+        corpus=corpus,
+        seed=42,
+        limits=limits,
+    )
+
+    expected = tuple(
+        builder._ranked_distractor_ids(
+            example,
+            corpus=corpus,
+            seed=42,
+            limit=limit,
+        )
+        if limit is not None
+        else None
+        for example, limit in zip(examples, limits)
+    )
+    assert ranked == expected
+
+
 def test_cli_fixture_build_runs_end_to_end_without_loading_remote_tokenizer(
     tmp_path,
     capsys,
