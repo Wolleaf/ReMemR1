@@ -65,6 +65,45 @@ class ManifestProvenanceError(ValueError):
     """Raised when a training row cannot be bound to its sealed sidecar."""
 
 
+def _right_pad_recalled_memory_tokens(
+    token_rows: Sequence[torch.Tensor],
+    *,
+    max_length: int,
+    pad_token_id: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length <= 0:
+        raise ValueError("max recalled-memory length must be a positive integer")
+    if isinstance(pad_token_id, bool) or not isinstance(pad_token_id, int) or pad_token_id < 0:
+        raise ValueError("recalled-memory pad token ID must be a non-negative integer")
+    if not isinstance(device, torch.device):
+        raise TypeError("recalled-memory output device must be a torch.device")
+
+    padded = torch.full(
+        (len(token_rows), max_length),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    for row_index, token_ids in enumerate(token_rows):
+        if not isinstance(token_ids, torch.Tensor):
+            raise TypeError(f"recalled-memory row {row_index} must be a tensor")
+        if token_ids.ndim != 1:
+            raise ValueError(f"recalled-memory row {row_index} must be one-dimensional")
+        if token_ids.dtype != torch.long:
+            raise TypeError(f"recalled-memory row {row_index} must use torch.long")
+        if token_ids.numel() > max_length:
+            raise ValueError(
+                f"recalled-memory row {row_index} has {token_ids.numel()} tokens; "
+                f"maximum is {max_length}"
+            )
+        padded[row_index, : token_ids.numel()] = token_ids.to(device=device)
+
+    if padded.device != device:
+        raise RuntimeError("recalled-memory tensor was created on the wrong device")
+    return padded
+
+
 _REMOTE_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 
 
@@ -802,7 +841,13 @@ class MemoryAgent(RAgent):
         ]
         recalled_memories_arr = np.empty(len(recalled_memories_values), dtype=object)
         recalled_memories_arr[:] = recalled_memories_values
-        gen_output.batch['recalled_memories'] = recalled_memories_arr
+        recalled_memories_tensor = _right_pad_recalled_memory_tokens(
+            recalled_memories_values,
+            max_length=self.config.max_memorization_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            device=gen_output.batch['responses'].device,
+        )
+        gen_output.batch['recalled_memories'] = recalled_memories_tensor
         gen_output.batch['recalled_step_ids'] = torch.tensor(
             [result.record.step_id if result is not None else -1 for result in retrievals],
             dtype=torch.long,

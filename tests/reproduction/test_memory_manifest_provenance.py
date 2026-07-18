@@ -30,6 +30,7 @@ from recurrent.impls.memory_revisit import (
     MemoryConfig,
     MemoryDataset,
     TEMPLATE,
+    _right_pad_recalled_memory_tokens,
 )
 from taskutils.data_synthesis.reproduction_builder import (
     TrainManifestContract,
@@ -147,6 +148,38 @@ def _config(tmp_path, require_manifest=True):
         }
     )
     return recurrent, data
+
+
+def test_recalled_memory_tokens_are_dense_and_right_padded():
+    padded = _right_pad_recalled_memory_tokens(
+        [torch.tensor([11, 12]), torch.tensor([13])],
+        max_length=4,
+        pad_token_id=0,
+        device=torch.device("cpu"),
+    )
+
+    assert padded.dtype == torch.long
+    assert padded.device == torch.device("cpu")
+    assert padded.shape == (2, 4)
+    assert padded.tolist() == [[11, 12, 0, 0], [13, 0, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    ("row", "error", "message"),
+    [
+        (torch.tensor([[11, 12]]), ValueError, "one-dimensional"),
+        (torch.tensor([11, 12, 13]), ValueError, "maximum is 2"),
+        (torch.tensor([11.0]), TypeError, "torch.long"),
+    ],
+)
+def test_recalled_memory_token_contract_fails_closed(row, error, message):
+    with pytest.raises(error, match=message):
+        _right_pad_recalled_memory_tokens(
+            [row],
+            max_length=2,
+            pad_token_id=0,
+            device=torch.device("cpu"),
+        )
 
 
 def test_memory_dataset_binds_sealed_bundle_and_emits_chunk_provenance(tmp_path):
