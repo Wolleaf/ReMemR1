@@ -244,12 +244,13 @@ def td_split(td: TensorDict, sections: int) -> list[TensorDict]:
     split TensorDict in dim0, allows different sections, like torch.tensor_split and np.array_split
     used in workers/dp_actor to support variable length of batch size
     """
+    if isinstance(sections, bool) or not isinstance(sections, int) or sections <= 0:
+        raise ValueError(f"sections must be a positive integer, got {sections!r}")
     if len(td) < sections:
         print(f"error occurred when trying to split {td}")
         raise ValueError(f"len(proto)={len(td)} < sections={sections}")        
-    
-    tensors_splitted = {k: torch.tensor_split(v, sections) for k, v in td.items()}
-    return [TensorDict.from_dict({k: v[i] for k, v in tensors_splitted.items()}) for i in range(sections)]
+
+    return list(td.tensor_split(sections, dim=0))
 
 def reverse_indices(tensor):
     """

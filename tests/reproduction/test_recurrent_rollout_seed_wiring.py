@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from typing import Dict, Tuple
 
 import numpy as np
+import pytest
 import torch
+from tensordict import TensorDict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -130,6 +132,37 @@ def test_trainer_coordinates_follow_interleaved_repeat_and_resume_step():
         2,
         3,
     ]
+
+
+def test_td_split_preserves_tensordict_batch_metadata():
+    td_split = _compile_function(
+        RECURRENT_UTILS_PATH,
+        _function(RECURRENT_UTILS_PATH, "td_split"),
+        {"TensorDict": TensorDict},
+    )
+    batch = TensorDict.from_dict(
+        {
+            "tokens": torch.arange(10).reshape(5, 2),
+            "mask": torch.ones((5, 2), dtype=torch.bool),
+        },
+        batch_size=[5],
+    )
+
+    single_split = td_split(batch, 1)
+    assert [split.batch_size for split in single_split] == [torch.Size([5])]
+    assert [len(split) for split in single_split] == [5]
+    assert torch.equal(single_split[0]["tokens"], batch["tokens"])
+
+    splits = td_split(batch, 2)
+    assert [split.batch_size for split in splits] == [torch.Size([3]), torch.Size([2])]
+    assert [len(split) for split in splits] == [3, 2]
+    assert torch.equal(splits[0]["tokens"], batch["tokens"][:3])
+    assert torch.equal(splits[1]["tokens"], batch["tokens"][3:])
+
+    with pytest.raises(ValueError, match="positive integer"):
+        td_split(batch, 0)
+    with pytest.raises(ValueError, match=r"len\(proto\)=5 < sections=6"):
+        td_split(batch, 6)
 
 
 def test_graceful_padding_keeps_seed_coordinates_aligned():
